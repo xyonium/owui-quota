@@ -117,6 +117,48 @@ def qk_merge_config(cfg: dict) -> dict:
     return base
 
 
+def qk_deep_merge(base, patch):
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            qk_deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+_QK_NUM = lambda v: not isinstance(v, bool) and isinstance(v, (int, float))
+
+
+def qk_validate_config(cfg) -> list:
+    errs = []
+    if not isinstance(cfg, dict):
+        return ["config must be an object"]
+    if "credits_per_usd" in cfg and not (_QK_NUM(cfg["credits_per_usd"]) and cfg["credits_per_usd"] > 0):
+        errs.append("credits_per_usd must be a positive number")
+    if "quota_period" in cfg and cfg["quota_period"] not in (None, "daily", "monthly"):
+        errs.append("quota_period must be daily|monthly")
+    for key in ("user_quotas", "group_quotas"):
+        if key in cfg and not isinstance(cfg[key], dict):
+            errs.append(f"{key} must be an object")
+    sch = cfg.get("schedule")
+    if sch is not None and not isinstance(sch, dict):
+        errs.append("schedule must be an object")
+    if isinstance(sch, dict):
+        for k in ("night_start_hour", "night_end_hour"):
+            if k in sch and not (isinstance(sch[k], int) and not isinstance(sch[k], bool) and 0 <= sch[k] <= 23):
+                errs.append(f"schedule.{k} must be int 0-23")
+        for k in ("night_multiplier", "weekend_multiplier"):
+            if k in sch and not (_QK_NUM(sch[k]) and sch[k] >= 0):
+                errs.append(f"schedule.{k} must be number >= 0")
+    pri = cfg.get("pricing")
+    if pri is not None and not isinstance(pri, dict):
+        errs.append("pricing must be an object")
+    tou = cfg.get("tou")
+    if tou is not None and not isinstance(tou, dict):
+        errs.append("tou must be an object")
+    return errs
+
+
 def qk_get_config() -> dict:
     return qk_merge_config(qk_load_json(QK_CONFIG_PATH, {}))
 
@@ -623,16 +665,18 @@ function renderUsage(){
  if(!rows.length)tb.innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No usage this month yet — send a chat through the filter first.</td></tr>';
 }
 async function saveConfig(){
+ // num: parse a numeric field; 0 survives, empty/NaN falls back to def
+ const num=(id,def)=>{const v=parseFloat($(id).value);return isNaN(v)?def:v};
  const gq={},uq={};
  document.querySelectorAll('[data-gq]').forEach(i=>{const v=parseFloat(i.value);if(!isNaN(v)&&v>0)gq[i.dataset.gq]=v});
  document.querySelectorAll('[data-uq]').forEach(i=>{const v=parseFloat(i.value);if(!isNaN(v)&&v>0)uq[i.dataset.uq]=v});
  let dp=null;try{dp=$('default_pricing').value.trim()?JSON.parse($('default_pricing').value):null}catch(e){toast('Fallback pricing is not valid JSON');return}
  const body={
-  credits_per_usd:parseFloat($('credits_per_usd').value)||1000,
+  credits_per_usd:num('credits_per_usd',1000),
   quota_period:$('quota_period').value,
   default_quota_credits:$('default_quota_credits').value===''?null:parseFloat($('default_quota_credits').value),
-  schedule:{timezone:$('schedule_timezone').value.trim()||null,night_start_hour:parseInt($('night_start_hour').value)||22,night_end_hour:parseInt($('night_end_hour').value)||8,night_multiplier:parseFloat($('night_multiplier').value)||1,weekend_multiplier:parseFloat($('weekend_multiplier').value)||1},
-  pricing:{url:$('pricing_url').value.trim(),refresh_hours:parseFloat($('refresh_hours').value)||24,default_pricing:dp,overrides:(CFG.pricing||{}).overrides||{}},
+  schedule:{timezone:$('schedule_timezone').value.trim()||null,night_start_hour:num('night_start_hour',22),night_end_hour:num('night_end_hour',8),night_multiplier:num('night_multiplier',1),weekend_multiplier:num('weekend_multiplier',1)},
+  pricing:{url:$('pricing_url').value.trim(),refresh_hours:num('refresh_hours',24),default_pricing:dp,overrides:(CFG.pricing||{}).overrides||{}},
   group_quotas:gq,user_quotas:uq,
  };
  try{await api('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Config saved');loadAll()}catch(e){toast('Save failed: '+e.message)}
@@ -681,8 +725,13 @@ async def api_config(request: Request):
 @qk_router.post("/config")
 async def api_save_config(request: Request):
     body = await request.json()
-    cfg = qk_merge_config(body)
+    errs = qk_validate_config(body)
+    if errs:
+        return JSONResponse({"errors": errs}, status_code=400)
     with qk_lock():
+        cur = qk_load_json(QK_CONFIG_PATH, {})
+        qk_deep_merge(cur, body)
+        cfg = qk_merge_config(cur)
         qk_atomic_write(QK_CONFIG_PATH, cfg)
     return JSONResponse({"ok": True})
 

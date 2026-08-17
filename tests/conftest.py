@@ -68,6 +68,52 @@ def load_admin(tmp_path, monkeypatch):
     return _
 
 
+def _stub_webui_auth(monkeypatch):
+    """Make `open_webui.utils.auth.get_verified_user` resolve to a stub admin
+    user. The admin module imports it lazily at request time, so stubbing the
+    modules in sys.modules is enough (real open_webui is not installed in the
+    test env; see CLAUDE.md "no dependency manifest")."""
+    ow = types.ModuleType("open_webui")
+    utils = types.ModuleType("open_webui.utils")
+    auth = types.ModuleType("open_webui.utils.auth")
+
+    class AdminUser:
+        id = "stub-admin"
+        name = "Stub Admin"
+        email = "admin@stub"
+        role = "admin"
+        group_ids = []
+
+    async def get_verified_user(request):
+        return AdminUser()
+
+    auth.get_verified_user = get_verified_user
+    utils.auth = auth
+    ow.utils = utils
+    monkeypatch.setitem(sys.modules, "open_webui", ow)
+    monkeypatch.setitem(sys.modules, "open_webui.utils", utils)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.auth", auth)
+
+
+@pytest.fixture
+def admin_client(load_admin, monkeypatch):
+    """TestClient for the qk_router with auth stubbed to a (role=admin) user.
+    Task 2 made auth a hard 401 dependency; without this stub every request
+    would fail auth before reaching the handler."""
+    _stub_webui_auth(monkeypatch)
+
+    def _():
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+
+        adm = load_admin()
+        app = FastAPI()
+        app.include_router(adm.qk_router, prefix="/api/v1/quota-keeper")
+        return TestClient(app), adm
+
+    return _
+
+
 @pytest.fixture
 def qk(tmp_path, load_filter):
     return load_filter()

@@ -141,6 +141,48 @@ def qk_merge_config(cfg: dict) -> dict:
     return base
 
 
+def qk_deep_merge(base, patch):
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            qk_deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+_QK_NUM = lambda v: not isinstance(v, bool) and isinstance(v, (int, float))
+
+
+def qk_validate_config(cfg) -> list:
+    errs = []
+    if not isinstance(cfg, dict):
+        return ["config must be an object"]
+    if "credits_per_usd" in cfg and not (_QK_NUM(cfg["credits_per_usd"]) and cfg["credits_per_usd"] > 0):
+        errs.append("credits_per_usd must be a positive number")
+    if "quota_period" in cfg and cfg["quota_period"] not in (None, "daily", "monthly"):
+        errs.append("quota_period must be daily|monthly")
+    for key in ("user_quotas", "group_quotas"):
+        if key in cfg and not isinstance(cfg[key], dict):
+            errs.append(f"{key} must be an object")
+    sch = cfg.get("schedule")
+    if sch is not None and not isinstance(sch, dict):
+        errs.append("schedule must be an object")
+    if isinstance(sch, dict):
+        for k in ("night_start_hour", "night_end_hour"):
+            if k in sch and not (isinstance(sch[k], int) and not isinstance(sch[k], bool) and 0 <= sch[k] <= 23):
+                errs.append(f"schedule.{k} must be int 0-23")
+        for k in ("night_multiplier", "weekend_multiplier"):
+            if k in sch and not (_QK_NUM(sch[k]) and sch[k] >= 0):
+                errs.append(f"schedule.{k} must be number >= 0")
+    pri = cfg.get("pricing")
+    if pri is not None and not isinstance(pri, dict):
+        errs.append("pricing must be an object")
+    tou = cfg.get("tou")
+    if tou is not None and not isinstance(tou, dict):
+        errs.append("tou must be an object")
+    return errs
+
+
 def qk_get_config() -> dict:
     return qk_merge_config(JC.get(QK_CONFIG_PATH, {}))
 
