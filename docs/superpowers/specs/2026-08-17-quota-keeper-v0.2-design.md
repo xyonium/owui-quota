@@ -63,7 +63,7 @@ v0.1.1 core algorithms (usage normalization, price matching, quota resolution, t
 1. **KPI cards ×6** with 7-day sparklines (hand-written SVG, no external chart lib, following Open WebUI's own analytics approach): requests / tokens / cost $ / credits / cache rate `cached/(cached+input)` / unpriced requests.
 2. **Time span selector**: 24h · 7d · 30d · 90d · custom (persisted in localStorage); ≤24h uses hour granularity when present, else falls back to day totals.
 3. **Trend chart**: stacked cost/tokens per bucket, by model, ≤8 colors + "Others".
-4. **Users ranking table** (Open WebUI analytics style): search by username/email, sortable columns (requests/tokens/cost/credits/quota %) - ranking by requests, tokens, or cost at the admin's click; (requests/tokens/cost/credits/quota %), quota progress bar computed **server-side** ; quota progress bar computed **server-side** (resolved quota × current multiplier vs used — eliminates the browser-TZ and multiplier drift), row click drills into that user's per-model detail.
+4. **Users ranking table** (Open WebUI analytics style): search by username/email, sortable and re-rankable columns (requests/tokens/cost/credits/quota %) - ranking by requests, by tokens, or by cost at the admin's click; quota progress bar computed **server-side** (resolved quota × current multiplier vs used - eliminates the browser-TZ and multiplier drift), row click drills into that user's per-model detail.
 5. **Models table**: model / requests / users / token split / cost / blended $/M / unpriced flag / **fuzzy-match target name** (from `how`).
 6. **Filters**: user / model / date range, linked; **CSV export** generated client-side from the aggregated stats response.
 
