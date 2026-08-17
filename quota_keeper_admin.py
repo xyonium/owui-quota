@@ -66,6 +66,20 @@ DEFAULT_CONFIG = {
         "night_multiplier": 1.0,
         "weekend_multiplier": 1.0,
     },
+    "tou": {
+        "enabled": False,
+        "timezone": None,               # None -> schedule.timezone
+        "tiers": {
+            "peak": {"rate": 2.0, "windows": [{"days": [1, 2, 3, 4, 5], "start": "09:00", "end": "12:00"},
+                                               {"days": [1, 2, 3, 4, 5], "start": "14:00", "end": "18:00"}]},
+            "offpeak": {"rate": 0.5, "windows": [{"days": [0, 1, 2, 3, 4, 5, 6], "start": "00:30", "end": "08:30"}]},
+            "normal": {"rate": 1.0},
+        },
+        "holidays": [],                  # "YYYY-MM-DD" -> whole day offpeak
+        "default_policy": "off",         # off | normal
+        "providers": {},                 # "<first path segment>": {"enabled": bool, "tiers": {name: {"rate": x}}}
+        "models": {},                    # exact model id: {"enabled": bool, "tiers": {...}}
+    },
 }
 
 
@@ -156,6 +170,41 @@ def qk_validate_config(cfg) -> list:
     tou = cfg.get("tou")
     if tou is not None and not isinstance(tou, dict):
         errs.append("tou must be an object")
+    if isinstance(tou, dict):
+        dp = tou.get("default_policy")
+        if dp is not None and dp not in ("off", "normal"):
+            errs.append("tou.default_policy must be off|normal")
+        hol = tou.get("holidays")
+        if hol is not None:
+            if not isinstance(hol, list):
+                errs.append("tou.holidays must be a list of YYYY-MM-DD")
+            elif any(not isinstance(h, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", h) for h in hol):
+                errs.append("tou.holidays entries must be YYYY-MM-DD")
+        tiers = tou.get("tiers")
+        if tiers is not None and not isinstance(tiers, dict):
+            errs.append("tou.tiers must be an object")
+        elif isinstance(tiers, dict):
+            for tname, tconf in tiers.items():
+                if not isinstance(tconf, dict):
+                    errs.append(f"tou.tiers.{tname} must be an object")
+                    continue
+                rate = tconf.get("rate")
+                if rate is not None and not (_QK_NUM(rate) and rate > 0):
+                    errs.append(f"tou.tiers.{tname}.rate must be a positive number")
+                for wi, w in enumerate(tconf.get("windows") or []):
+                    if not isinstance(w, dict):
+                        errs.append(f"tou.tiers.{tname}.windows[{wi}] must be an object")
+                        continue
+                    days = w.get("days")
+                    if days is not None and (
+                        not isinstance(days, list)
+                        or not all(isinstance(dx, int) and not isinstance(dx, bool) and 0 <= dx <= 6 for dx in days)
+                    ):
+                        errs.append(f"tou.tiers.{tname}.windows[{wi}].days must be a list of ints 0-6")
+                    for hh in ("start", "end"):
+                        v = w.get(hh)
+                        if v is not None and (not isinstance(v, str) or not re.match(r"^\d{2}:\d{2}$", v)):
+                            errs.append(f"tou.tiers.{tname}.windows[{wi}].{hh} must be HH:MM")
     return errs
 
 
@@ -174,6 +223,85 @@ def qk_local_now(cfg: dict) -> datetime:
             return datetime.now(_dt_timezone.utc)
     except Exception:
         return datetime.now(_dt_timezone.utc)
+
+
+def qk_tou_local_now(cfg: dict) -> datetime:
+    """Now in the TOU timezone (tou.timezone > schedule.timezone > TZ > UTC)."""
+    tou = cfg.get("tou") or {}
+    tz = tou.get("timezone") or (cfg.get("schedule") or {}).get("timezone")
+    if tz:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return datetime.now(ZoneInfo(tz))
+        except Exception:
+            pass
+    return qk_local_now(cfg)
+
+
+def qk_tou_resolve_policy(cfg: dict, model_id: str):
+    """models[exact] -> providers[first segment] -> default_policy. Returns policy dict or None (off)."""
+    tou = cfg.get("tou") or {}
+    if not tou.get("enabled"):
+        return None
+    mid = str(model_id or "").strip().lower()
+    mpol = (tou.get("models") or {}).get(mid)
+    if isinstance(mpol, dict):
+        return mpol if mpol.get("enabled", True) else None
+    prov = mid.split("/")[0] if "/" in mid else "_default"
+    ppol = (tou.get("providers") or {}).get(prov)
+    if isinstance(ppol, dict):
+        return ppol if ppol.get("enabled", True) else None
+    if (tou.get("providers") or {}).get(prov) is None and tou.get("default_policy") == "normal":
+        return {}
+    return None
+
+
+def qk_tou_rate(cfg: dict, model_id: str, now) -> tuple:
+    """Returns (rate, tier). Tier 'off' means TOU does not apply (rate 1.0).
+    Window days use JS-style numbering (0=Sunday .. 6=Saturday) so the
+    default offpeak `days: [0..6]` covers every day of the week."""
+    tou = cfg.get("tou") or {}
+    pol = qk_tou_resolve_policy(cfg, model_id)
+    if pol is None:
+        return 1.0, "off"
+    tiers = dict(tou.get("tiers") or {})
+
+    def _merge(tname):
+        base = dict(tiers.get(tname) or {})
+        over = ((pol.get("tiers") or {}).get(tname)) or {}
+        base.update(over)
+        return base
+
+    peak, offpeak, normal = _merge("peak"), _merge("offpeak"), _merge("normal")
+    dstr = now.strftime("%Y-%m-%d")
+    if dstr in (tou.get("holidays") or []) and offpeak:
+        return float(offpeak.get("rate", 1.0)), "offpeak"
+
+    def _hit(tier):
+        for w in tier.get("windows") or []:
+            days = w.get("days") or list(range(7))
+            if (now.weekday() + 1) % 7 not in days:
+                continue
+            try:
+                sh, sm = map(int, str(w.get("start", "00:00")).split(":"))
+                eh, em = map(int, str(w.get("end", "00:00")).split(":"))
+            except Exception:
+                continue
+            s, e, cur = sh * 60 + sm, eh * 60 + em, now.hour * 60 + now.minute
+            if s <= e:
+                if s <= cur < e:
+                    return True
+            else:  # spans midnight
+                if cur >= s or cur < e:
+                    return True
+        return False
+
+    if peak and _hit(peak):
+        return float(peak.get("rate", 1.0)), "peak"
+    if offpeak and _hit(offpeak):
+        return float(offpeak.get("rate", 1.0)), "offpeak"
+    return float(normal.get("rate", 1.0)), "normal"
 
 
 # ==== pricing fetch (same logic as filter; filter reads the cached table) ====
