@@ -570,9 +570,6 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day"):
                     tk = (mm.get("tokens") or {}).get(k, 0) or 0
                     row["tokens"][k] += tk
                     kpi["tokens"][k] += tk
-                if granularity != "hour":
-                    sb = series.setdefault(day, {})
-                    sb[model] = sb.get(model, 0) + (mm.get("cost_usd", 0) or 0)
                 day_ms = {model: mm}
             else:
                 row["requests"] += drec.get("requests", 0)

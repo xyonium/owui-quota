@@ -199,6 +199,9 @@ def test_stats_filters(qk, load_admin):
     out = adm.qk_stats(model="m/x")
     assert [m["model"] for m in out["models"]] == ["m/x"]
     assert out["kpi"]["requests"] == 1
+    # regression: model-filtered day series must match kpi cost (was 2x before)
+    s = out["series"][0]["by_model"]["m/x"]
+    assert abs(s - out["kpi"]["cost_usd"]) < 1e-12
     out = adm.qk_stats(from_="2026-08-15", to="2026-08-15")
     assert out["kpi"]["requests"] == 1
     out = adm.qk_stats(user="Alice")       # matches by name
