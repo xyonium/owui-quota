@@ -46,15 +46,18 @@ def test_block_message_bad_template_still_blocks(qk):
         asyncio.run(f.inlet({"model": "gpt-4o"}, __user__=_user(), __metadata__={}))
 
 
-def test_eff_zero_blocks_not_unlimited(qk):
+def test_eff_zero_blocks_not_unlimited(qk, monkeypatch):
+    from datetime import datetime
+
     cfg = qk.qk_get_config()
     cfg["user_quotas"]["u1"] = 100
     cfg["schedule"]["night_multiplier"] = 0.0
-    # Pin a timezone whose local hour is inside the night window (22:00-08:00)
-    # so the test is deterministic regardless of when it runs (the brief's
-    # literal only triggers at real night hours).
-    cfg["schedule"]["timezone"] = "Etc/GMT-9"  # UTC+9 -> local 22:00+ at 13:00 UTC
     qk.qk_atomic_write(qk.QK_CONFIG_PATH, cfg)
+    # Pin the clock to a fixed local time inside the night window (22:00-08:00)
+    # so the eff==0 block is deterministic regardless of when the suite runs.
+    # Naive datetime is fine: qk_time_multiplier only uses .hour/.weekday().
+    fixed = datetime(2026, 8, 17, 23, 30)  # Monday 23:30, in night window
+    monkeypatch.setattr(qk, "qk_local_now", lambda cfg: fixed)
     f = qk.Filter()
     import asyncio
     with pytest.raises(qk.QuotaBlocked):
