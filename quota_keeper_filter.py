@@ -1,0 +1,583 @@
+"""
+title: Quota Keeper - Filter
+author: quota-keeper
+version: 0.1.1
+required_open_webui_version: 0.6.0
+description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
+"""
+
+import os
+import re
+import json
+import time
+import logging
+import threading
+from contextlib import contextmanager
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone as _dt_timezone
+from typing import Optional
+
+from pydantic import BaseModel, Field
+
+log = logging.getLogger(__name__)
+
+
+def qk_data_dir() -> str:
+    base = os.environ.get("DATA_DIR") or "/app/backend/data"
+    d = os.path.join(base, "quota_keeper")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        d = os.path.join(os.getcwd(), "quota_keeper")
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+QK_DIR = qk_data_dir()
+QK_CONFIG_PATH = os.path.join(QK_DIR, "config.json")
+QK_LEDGER_PATH = os.path.join(QK_DIR, "ledger.json")
+QK_PRICING_PATH = os.path.join(QK_DIR, "pricing_cache.json")
+
+DEFAULT_PRICING_URL = (
+    "https://raw.githubusercontent.com/BerriAI/litellm/"
+    "main/model_prices_and_context_window.json"
+)
+
+DEFAULT_CONFIG = {
+    "credits_per_usd": 1000.0,          # 1000 credits = 1 USD
+    "quota_period": "daily",            # daily | monthly
+    "default_quota_credits": None,      # None = unlimited
+    "user_quotas": {},                  # user_id -> credits (highest priority)
+    "group_quotas": {},                 # group_id -> credits (max wins among groups)
+    "ledger_retention_days": 400,
+    "pricing": {
+        "url": DEFAULT_PRICING_URL,
+        "refresh_hours": 24,
+        "default_pricing": None,        # {"input":..,"cached":..,"output":..} per 1M tokens
+        "overrides": {},                # model -> same shape, absolute priority
+    },
+    "schedule": {
+        "timezone": None,               # None -> $TZ -> UTC
+        "night_start_hour": 22,
+        "night_end_hour": 8,
+        "night_multiplier": 1.0,        # quota * multiplier at night (e.g. 0.5)
+        "weekend_multiplier": 1.0,      # quota * multiplier on Sat/Sun
+    },
+}
+
+
+def qk_load_json(path: str, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def qk_atomic_write(path: str, obj) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+try:
+    import fcntl
+
+    @contextmanager
+    def qk_lock():
+        p = os.path.join(QK_DIR, ".lock")
+        with open(p, "a+") as fh:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+except Exception:  # windows / exotic fs
+    _tlock = threading.Lock()
+
+    @contextmanager
+    def qk_lock():
+        with _tlock:
+            yield
+
+
+class _JsonCache:
+    """mtime-keyed in-memory cache; refreshes automatically after any write."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._store = {}
+
+    def get(self, path: str, default):
+        try:
+            mtime = os.stat(path).st_mtime
+        except Exception:
+            return default
+        with self._lock:
+            ent = self._store.get(path)
+            if ent and ent[0] == mtime:
+                return ent[1]
+        data = qk_load_json(path, default)
+        with self._lock:
+            self._store[path] = (mtime, data)
+        return data
+
+
+JC = _JsonCache()
+
+
+def qk_merge_config(cfg: dict) -> dict:
+    base = json.loads(json.dumps(DEFAULT_CONFIG))
+    for k, v in (cfg or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            base[k].update(v)
+        else:
+            base[k] = v
+    return base
+
+
+def qk_get_config() -> dict:
+    return qk_merge_config(JC.get(QK_CONFIG_PATH, {}))
+
+
+def qk_local_now(cfg: dict) -> datetime:
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = (cfg.get("schedule") or {}).get("timezone") or os.environ.get("TZ") or "UTC"
+        try:
+            return datetime.now(ZoneInfo(tz))
+        except Exception:
+            return datetime.now(_dt_timezone.utc)
+    except Exception:
+        return datetime.now(_dt_timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Pricing: fetch (LiteLLM flat format or models.dev nested format) + fuzzy match
+# ---------------------------------------------------------------------------
+
+QK_DATE_RE = re.compile(r"[-:_.](20\d{2}[-_.]?\d{2}[-_.]?\d{2}|\d{6})$")
+
+
+def _qk_variants(m: str):
+    """Model-id variants: raw, dash-normalized, date-stripped, both."""
+    stripped = QK_DATE_RE.sub("", m).strip("-:_. ")
+    out = []
+    for v in (m, m.replace(".", "-"), stripped, stripped.replace(".", "-")):
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None):
+    """override -> exact -> path-suffix -> tail-segment -> contains (all on
+    raw and date-stripped variants). Returns (price|None, how|None)."""
+    m = (model_id or "").strip().lower()
+    if not m:
+        return None, None
+    vs = _qk_variants(m)
+    ov = {str(k).strip().lower(): v for k, v in (overrides or {}).items()}
+    for cand in vs:
+        if cand in ov:
+            return ov[cand], "override:" + cand
+    if table:
+        for cand in vs:
+            if cand in table:
+                return table[cand], "exact:" + cand
+        best = None
+        for cand in vs:
+            for k in table:
+                if cand.endswith("/" + k) and (best is None or len(k) > len(best[1])):
+                    best = ("suffix", k)
+        if best:
+            return table[best[1]], best[0] + ":" + best[1]
+        for cand in vs:
+            segs = cand.split("/")
+            for i in range(len(segs)):
+                tail = "/".join(segs[i:])
+                if tail in table:
+                    return table[tail], "segment:" + tail
+        best = None
+        for cand in vs:
+            for k in table:
+                if len(k) >= 4 and k in cand and (best is None or len(k) > len(best[1])):
+                    best = ("contains", k)
+        if best:
+            return table[best[1]], best[0] + ":" + best[1]
+    return None, None
+
+
+def qk_normalize_usage(u) -> Optional[dict]:
+    """Normalize OpenAI / Anthropic / generic usage into cached/input/output(+write)."""
+    if not isinstance(u, dict):
+        return None
+
+    def g(*keys):
+        for k in keys:
+            v = u.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+        return None
+
+    pt = g("prompt_tokens")
+    ct = g("completion_tokens")
+    ai = g("input_tokens")
+    ao = g("output_tokens")
+    cr = g("cache_read_input_tokens")
+    cw = g("cache_creation_input_tokens")
+    cached_oai = None
+    ptd = u.get("prompt_tokens_details")
+    if isinstance(ptd, dict) and isinstance(ptd.get("cached_tokens"), (int, float)):
+        cached_oai = float(ptd["cached_tokens"])
+
+    if pt is not None:
+        cached = (cached_oai or 0.0) + (cr or 0.0)
+        inp = max(0.0, pt - cached)
+        out = ct if ct is not None else (ao or 0.0)
+    elif ai is not None:
+        cached = cr or 0.0
+        inp = ai
+        out = ao or 0.0
+    else:
+        return None
+    if inp == 0 and out == 0 and cached == 0 and not cw:
+        return None
+    return {"cached": cached, "input": inp, "output": out, "cache_write": cw or 0.0}
+
+
+def qk_cost_usd(tok: dict, price) -> float:
+    if not price:
+        return 0.0
+    c = 0.0
+    for field in ("input", "cached", "cache_write", "output"):
+        p = price.get(field)
+        if isinstance(p, (int, float)):
+            c += (tok.get(field) or 0.0) * float(p) / 1e6
+    return c
+
+
+# ---------------------------------------------------------------------------
+# Ledger
+# ---------------------------------------------------------------------------
+
+
+def qk_prune_ledger(led: dict, cfg: dict) -> None:
+    try:
+        days = int(cfg.get("ledger_retention_days") or 0)
+    except Exception:
+        days = 0
+    if days <= 0:
+        return
+    cutoff = (datetime.now(_dt_timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    for uid in list((led.get("users") or {}).keys()):
+        udays = (led["users"].get(uid) or {}).get("days") or {}
+        for k in [k for k in udays if k < cutoff]:
+            udays.pop(k, None)
+
+
+def qk_record_usage(user: dict, model: str, tok: dict) -> None:
+    uid = (user or {}).get("id")
+    if not uid:
+        return
+    cfg = qk_get_config()
+    cache = JC.get(QK_PRICING_PATH, {}) or {}
+    table = cache.get("table") or {}
+    pconf = cfg.get("pricing") or {}
+    price, _how = qk_find_pricing(model, table, pconf.get("overrides"))
+    priced = price is not None
+    if price is None:
+        price = pconf.get("default_pricing")
+        priced = price is not None
+    cost = qk_cost_usd(tok, price)
+    day = qk_local_now(cfg).strftime("%Y-%m-%d")
+    model = str(model or "unknown")[:200]
+
+    with qk_lock():
+        led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
+        users = led.setdefault("users", {})
+        u = users.setdefault(uid, {"name": "", "email": "", "days": {}})
+        u["name"] = (user.get("name") or u.get("name") or "")[:200]
+        u["email"] = (user.get("email") or u.get("email") or "")[:200]
+        d = u["days"].setdefault(
+            day,
+            {
+                "requests": 0,
+                "cost_usd": 0.0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "models": {},
+            },
+        )
+        d["requests"] = d.get("requests", 0) + 1
+        d["cost_usd"] = round(d.get("cost_usd", 0.0) + cost, 8)
+        for k in ("cached", "input", "output"):
+            d["tokens"][k] = d["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        mm = d["models"].setdefault(
+            model,
+            {
+                "requests": 0,
+                "cost_usd": 0.0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "priced": True,
+            },
+        )
+        mm["requests"] = mm.get("requests", 0) + 1
+        mm["cost_usd"] = round(mm.get("cost_usd", 0.0) + cost, 8)
+        for k in ("cached", "input", "output"):
+            mm["tokens"][k] = mm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        mm["priced"] = bool(mm.get("priced", True)) and priced
+        qk_prune_ledger(led, cfg)
+        qk_atomic_write(QK_LEDGER_PATH, led)
+
+
+def qk_period_used_usd(uid: str, cfg: dict) -> float:
+    led = JC.get(QK_LEDGER_PATH, {"users": {}}) or {}
+    days = ((led.get("users") or {}).get(uid) or {}).get("days") or {}
+    now = qk_local_now(cfg)
+    if (cfg.get("quota_period") or "daily") == "monthly":
+        pref = now.strftime("%Y-%m-")
+        return sum(
+            (d or {}).get("cost_usd", 0) or 0
+            for k, d in days.items()
+            if k.startswith(pref)
+        )
+    return ((days.get(now.strftime("%Y-%m-%d")) or {}).get("cost_usd", 0)) or 0
+
+
+# ---------------------------------------------------------------------------
+# Quota resolution & time schedule
+# ---------------------------------------------------------------------------
+
+
+def qk_user_group_ids(user: dict):
+    gids = (user or {}).get("group_ids")
+    if isinstance(gids, list) and gids:
+        return [str(g) for g in gids]
+    try:
+        from open_webui.models.groups import Groups
+
+        return [g.id for g in Groups.get_groups_by_member_id(user.get("id"))]
+    except Exception:
+        return []
+
+
+def qk_resolve_quota(cfg: dict, user: dict):
+    """user quota (if set) wins; otherwise the highest group quota; else default."""
+    uq = (cfg.get("user_quotas") or {}).get((user or {}).get("id"))
+    if isinstance(uq, (int, float)) and uq > 0:
+        return float(uq), "user"
+    gq = cfg.get("group_quotas") or {}
+    vals = [
+        float(gq[str(g)])
+        for g in qk_user_group_ids(user or {})
+        if isinstance(gq.get(str(g)), (int, float)) and gq.get(str(g)) > 0
+    ]
+    if vals:
+        return max(vals), "group"
+    dq = cfg.get("default_quota_credits")
+    if isinstance(dq, (int, float)) and dq > 0:
+        return float(dq), "default"
+    return None, "none"
+
+
+def qk_time_multiplier(cfg: dict) -> float:
+    sch = cfg.get("schedule") or {}
+    now = qk_local_now(cfg)
+    mult = 1.0
+    try:
+        wm = float(sch.get("weekend_multiplier", 1.0))
+    except Exception:
+        wm = 1.0
+    try:
+        nm = float(sch.get("night_multiplier", 1.0))
+    except Exception:
+        nm = 1.0
+    if now.weekday() >= 5 and wm != 1.0:
+        mult *= wm
+    try:
+        ns = int(sch.get("night_start_hour", 22))
+        ne = int(sch.get("night_end_hour", 8))
+    except Exception:
+        ns, ne = 22, 8
+    h = now.hour
+    in_night = (h >= ns or h < ne) if ns > ne else (ns <= h < ne)
+    if in_night and nm != 1.0:
+        mult *= nm
+    return mult
+
+
+# ---------------------------------------------------------------------------
+# The Filter
+# ---------------------------------------------------------------------------
+
+
+class QuotaBlocked(Exception):
+    pass
+
+
+class Filter:
+    class Valves(BaseModel):
+        enable_enforcement: bool = Field(
+            default=True, description="Enable quota enforcement (usage is always recorded)"
+        )
+        admins_bypass: bool = Field(default=True, description="Admins skip quota checks")
+        allow_background_tasks: bool = Field(
+            default=True,
+            description="Never block background tasks (title/tag generation); their cost is still metered",
+        )
+        estimate_unreported_tokens: bool = Field(
+            default=False,
+            description="If provider reports no usage, estimate tokens from text length (not billing-grade)",
+        )
+        block_message: str = Field(
+            default=(
+                "Quota exceeded: used {used} / {quota} credits this period "
+                "(source={source}, time multiplier={mult}). Resets with the period; contact admin for more."
+            )
+        )
+
+    def __init__(self):
+        self.valves = self.Valves()
+        self._seen = OrderedDict()  # dedup usage by response id
+        self._orphan = OrderedDict()  # usage seen in stream without user info
+
+    # -- helpers ------------------------------------------------------------
+
+    def _mark_seen(self, key: str) -> bool:
+        if key in self._seen:
+            return False
+        self._seen[key] = True
+        while len(self._seen) > 4096:
+            self._seen.popitem(last=False)
+        return True
+
+    def _record(self, user: dict, model: str, tok: dict, rid: str = "") -> None:
+        rid = rid or f"{time.time_ns()}"
+        if not self._mark_seen(rid):
+            return
+        if not (user or {}).get("id"):
+            self._orphan[rid] = {"model": model, "tok": tok, "ts": time.time()}
+            while len(self._orphan) > 256:
+                self._orphan.popitem(last=False)
+            return
+        qk_record_usage(user, model, tok)
+
+    @staticmethod
+    def _estimate_from_body(body: dict) -> dict:
+        msgs = body.get("messages") or []
+        inp_chars = sum(len(str(m.get("content") or "")) for m in msgs[:-1] or [])
+        out_chars = len(str(msgs[-1].get("content") or "")) if msgs else 0
+        return {
+            "cached": 0.0,
+            "input": max(0.0, inp_chars / 4.0),
+            "output": max(0.0, out_chars / 4.0),
+            "cache_write": 0.0,
+        }
+
+    # -- enforcement ----------------------------------------------------------
+
+    async def inlet(
+        self, body: dict, __user__: dict = None, __metadata__: dict = None
+    ) -> dict:
+        if not self.valves.enable_enforcement:
+            return body
+        try:
+            user = __user__ or {}
+            uid = user.get("id")
+            if not uid:
+                return body
+            if self.valves.admins_bypass and user.get("role") == "admin":
+                return body
+            if (__metadata__ or {}).get("task") and self.valves.allow_background_tasks:
+                return body
+            cfg = qk_get_config()
+            quota, source = qk_resolve_quota(cfg, user)
+            if quota is None:
+                return body
+            mult = qk_time_multiplier(cfg)
+            eff = quota * mult
+            if eff <= 0:
+                return body
+            try:
+                cpu_ = float(cfg.get("credits_per_usd") or 1000.0)
+            except Exception:
+                cpu_ = 1000.0
+            used = qk_period_used_usd(uid, cfg) * cpu_
+            if used >= eff:
+                raise QuotaBlocked(
+                    self.valves.block_message.format(
+                        used=round(used, 1),
+                        quota=round(eff, 1),
+                        source=source,
+                        mult=round(mult, 3),
+                    )
+                )
+            return body
+        except QuotaBlocked:
+            raise
+        except Exception as e:  # fail-open on unexpected errors
+            log.warning("quota-keeper inlet error: %s", e)
+            return body
+
+    # -- metering: streaming terminal chunk -----------------------------------
+
+    async def stream(
+        self, event, __user__: dict = None, __metadata__: dict = None
+    ):
+        try:
+            ev = event
+            if isinstance(ev, str):
+                s = ev.strip()
+                if s.startswith("data:"):
+                    s = s[5:].strip()
+                if not s or s == "[DONE]":
+                    return event
+                try:
+                    ev = json.loads(s)
+                except Exception:
+                    return event
+            if not isinstance(ev, dict):
+                return event
+            u = ev.get("usage")
+            tok = qk_normalize_usage(u)
+            if tok is None:
+                return event
+            rid = str(ev.get("id") or f"stream-{time.time_ns()}")
+            model = str(ev.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+            self._record(__user__ or {}, model, tok, rid)
+        except Exception as e:
+            log.warning("quota-keeper stream error: %s", e)
+        return event
+
+    # -- metering: non-streaming (and orphan adoption) --------------------------
+
+    async def outlet(
+        self, body: dict, __user__: dict = None, __metadata__: dict = None
+    ) -> dict:
+        try:
+            if not isinstance(body, dict):
+                return body
+            tok = qk_normalize_usage(body.get("usage"))
+            choices = body.get("choices") or []
+            if tok is None and isinstance(choices, list) and choices:
+                tok = qk_normalize_usage((choices[0] or {}).get("usage"))
+            rid = str(body.get("id") or "")
+            if tok is not None:
+                model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+                self._record(__user__ or {}, model, tok, rid or f"outlet-{time.time_ns()}")
+            elif self.valves.estimate_unreported_tokens and rid:
+                # adopt usage stashed by stream() when user info was missing there
+                if rid in self._orphan and (__user__ or {}).get("id"):
+                    ent = self._orphan.pop(rid)
+                    qk_record_usage(__user__, ent["model"], ent["tok"])
+                elif (__user__ or {}).get("id") and body.get("messages"):
+                    est = self._estimate_from_body(body)
+                    model = str(body.get("model") or "unknown")
+                    if self._mark_seen(rid or f"est-{time.time_ns()}"):
+                        qk_record_usage(__user__, model, est)
+        except Exception as e:
+            log.warning("quota-keeper outlet error: %s", e)
+        return body

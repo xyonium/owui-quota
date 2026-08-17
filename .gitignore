@@ -1,0 +1,23 @@
+# CodeGraph local runtime files
+.codegraph/*
+!.codegraph/.gitignore
+
+# Byte-compiled / Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment files
+.env
+.env.local
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Local settings & temporary files
+.claude/settings.local.json*
+
+# Quota Keeper runtime data (ledger/config/pricing caches)
+quota_keeper/
