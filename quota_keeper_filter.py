@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 
+# ==== shared helpers: keep in sync with quota_keeper_admin.py (same code) ====
+
 def qk_data_dir() -> str:
     base = os.environ.get("DATA_DIR") or "/app/backend/data"
     d = os.path.join(base, "quota_keeper")

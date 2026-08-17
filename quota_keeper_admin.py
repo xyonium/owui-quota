@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from typing import Optional
 
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 log = logging.getLogger(__name__)
@@ -327,16 +327,21 @@ def qk_resolve_quota(cfg: dict, user: dict):
 # ==== Open WebUI integration ====
 
 
-async def _require_admin(request: Request):
+async def _require_user(request: Request):
     try:
         from open_webui.utils.auth import get_verified_user
 
         user = await get_verified_user(request)
-        if (getattr(user, "role", "") or "") != "admin":
-            return JSONResponse({"error": "admin only"}, status_code=403)
-        return user
     except Exception as e:
-        return JSONResponse({"error": f"auth failed: {e}"}, status_code=401)
+        raise HTTPException(status_code=401, detail=f"auth failed: {e}")
+    return user
+
+
+async def _require_admin(request: Request):
+    user = await _require_user(request)
+    if (getattr(user, "role", "") or "") != "admin":
+        raise HTTPException(status_code=403, detail="admin only")
+    return user
 
 
 async def _users_table():
@@ -501,7 +506,7 @@ let CFG=null, USERS=[], GROUPS=[], LEDGER=null, PRICING=null;
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(msg,ms=2200){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),ms)}
-async function api(path,opts){const r=await fetch('/api/v1/quota-keeper'+path,opts);if(!r.ok){throw new Error(await r.text()||r.status)}return r.json()}
+async function api(path,opts){const r=await fetch('__QK_API_PREFIX__'+path,opts);if(!r.ok){throw new Error(await r.text()||r.status)}return r.json()}
 function fmt(n,d=0){if(n===null||n===undefined||isNaN(n))return '–';return Number(n).toLocaleString(undefined,{maximumFractionDigits:d})}
 async function loadAll(){
  [CFG,USERS,GROUPS,LEDGER,PRICING]=await Promise.all([api('/config'),api('/users'),api('/groups'),api('/ledger'),api('/pricing')]);
@@ -640,19 +645,31 @@ loadAll().catch(e=>toast('Load failed: '+e.message));
 </html>"""
 
 
+def qk_build_page(api_prefix: str) -> str:
+    return QK_PAGE.replace("__QK_API_PREFIX__", api_prefix)
+
+
+def _mount_guard(app, prefix: str) -> bool:
+    """Idempotently attach the API router; True when already mounted."""
+    if any(getattr(r, "path", None) == f"{prefix}/config" for r in app.routes):
+        return True
+    app.include_router(qk_router, prefix=prefix)
+    return False
+
+
 # ==== Router ====
 
 qk_router = APIRouter(dependencies=[Depends(_require_admin)])
 
 
-@qk_router.get("/quota-keeper/config")
+@qk_router.get("/config")
 async def api_config(request: Request):
     cfg = qk_get_config()
     cfg["_time_multiplier"] = qk_time_multiplier(cfg)
     return JSONResponse(cfg)
 
 
-@qk_router.post("/quota-keeper/config")
+@qk_router.post("/config")
 async def api_save_config(request: Request):
     body = await request.json()
     cfg = qk_merge_config(body)
@@ -661,27 +678,27 @@ async def api_save_config(request: Request):
     return JSONResponse({"ok": True})
 
 
-@qk_router.get("/quota-keeper/users")
+@qk_router.get("/users")
 async def api_users(request: Request):
     return JSONResponse(await _users_table())
 
 
-@qk_router.get("/quota-keeper/groups")
+@qk_router.get("/groups")
 async def api_groups(request: Request):
     return JSONResponse(await _groups_table())
 
 
-@qk_router.get("/quota-keeper/ledger")
+@qk_router.get("/ledger")
 async def api_ledger(request: Request):
     return JSONResponse(qk_load_json(QK_LEDGER_PATH, {"users": {}}))
 
 
-@qk_router.get("/quota-keeper/pricing")
+@qk_router.get("/pricing")
 async def api_pricing(request: Request):
     return JSONResponse(qk_load_json(QK_PRICING_PATH, {}))
 
 
-@qk_router.post("/quota-keeper/pricing/refresh")
+@qk_router.post("/pricing/refresh")
 async def api_refresh(request: Request):
     body = {}
     try:
@@ -694,7 +711,7 @@ async def api_refresh(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@qk_router.get("/quota-keeper/pricing/match")
+@qk_router.get("/pricing/match")
 async def api_match(request: Request):
     model = request.query_params.get("model", "")
     cfg = qk_get_config()
@@ -755,7 +772,7 @@ class Event:
         if __app__ is None or self._installed:
             return
         try:
-            __app__.include_router(qk_router, prefix=self.valves.api_prefix)
+            _mount_guard(__app__, self.valves.api_prefix)
             self._installed = True
             log.info("quota-keeper API mounted at %s", self.valves.api_prefix)
 
@@ -764,16 +781,15 @@ class Event:
                 page_path = "/" + page_path
 
             async def _page(request: Request):
-                guard = await _require_admin(request)
-                if isinstance(guard, JSONResponse):
-                    return guard
-                return HTMLResponse(QK_PAGE)
+                return HTMLResponse(qk_build_page(self.valves.api_prefix))
 
             # avoid duplicate page routes across reloads
             if not any(
                 getattr(r, "path", None) == page_path for r in __app__.routes
             ):
-                __app__.get(page_path)(_page)
+                __app__.get(
+                    page_path, dependencies=[Depends(_require_admin)]
+                )(_page)
             log.info("quota-keeper admin page at %s", page_path)
 
             if self.valves.enable_background_pricing_refresh:
