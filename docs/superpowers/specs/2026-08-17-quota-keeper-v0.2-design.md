@@ -63,13 +63,27 @@ v0.1.1 core algorithms (usage normalization, price matching, quota resolution, t
 1. **KPI cards ×6** with 7-day sparklines (hand-written SVG, no external chart lib, following Open WebUI's own analytics approach): requests / tokens / cost $ / credits / cache rate `cached/(cached+input)` / unpriced requests.
 2. **Time span selector**: 24h · 7d · 30d · 90d · custom (persisted in localStorage); ≤24h uses hour granularity when present, else falls back to day totals.
 3. **Trend chart**: stacked cost/tokens per bucket, by model, ≤8 colors + "Others".
-4. **Users table**: search by username/email, sortable columns (requests/tokens/cost/credits/quota %), quota progress bar computed **server-side** (resolved quota × current multiplier vs used — eliminates the browser-TZ and multiplier drift), row click drills into that user's per-model detail.
+4. **Users ranking table** (Open WebUI analytics style): search by username/email, sortable columns (requests/tokens/cost/credits/quota %) - ranking by requests, tokens, or cost at the admin's click; (requests/tokens/cost/credits/quota %), quota progress bar computed **server-side** ; quota progress bar computed **server-side** (resolved quota × current multiplier vs used — eliminates the browser-TZ and multiplier drift), row click drills into that user's per-model detail.
 5. **Models table**: model / requests / users / token split / cost / blended $/M / unpriced flag / **fuzzy-match target name** (from `how`).
 6. **Filters**: user / model / date range, linked; **CSV export** generated client-side from the aggregated stats response.
 
-### 2.3 Ledger schema additions
+### 2.4 Recent activity log (admin)
+
+- New rolling record file `$DATA_DIR/quota_keeper/recent.json`: a bounded ring buffer of the **last 200 metered responses**, appended at metering time under the existing lock: `{ts, user_id, name, email, model, tokens{cached,input,output}, cost_usd, tou_tier, priced}`. Oldest entries are dropped; file stays in the KB range; no indexing, no per-request history beyond 200.
+- `GET /recent` (admin): returns the buffer newest-first. Page section "Recent activity" renders username + model + input/output/cached + cache% + cost + tier; manual refresh only.
+- Normal users' `/me` does **not** expose this (their view shows only their own aggregates).
+
+### 2.5 Resource policy (server is already heavily loaded)
+
+- **No auto-refresh anywhere**: no `setInterval`/polling in the page. All dashboard data loads on page open and on explicit manual refresh (button) or filter change. The 10s-auto-refresh pattern of cpa-usage-keeper is explicitly rejected.
+- Aggregation happens **server-side in `/stats`** on demand (only when an admin asks); the page never downloads the raw ledger or the raw pricing table (pricing editor uses `?full=1` explicitly).
+- `recent.json` is capped (200 entries) so per-response writes stay O(1) small-file writes; ledger day/hour aggregates remain bounded by retention pruning.
+- The pricing background loop keeps its 600s idle check (no work when cache is fresh); pricing fetch runs in a worker thread (`asyncio.to_thread`) so it never blocks the event loop.
+- No new long-lived in-memory caches beyond the existing `_JsonCache` (which gains size-keyed invalidation only); no chart library (hand-written SVG); CSV export is generated client-side.
 
 - `days.<d>.hours.<H>` = `{requests, cost_usd, tokens{cached,input,output}}` (per user only, not per model — bounded size).
+
+_This is the “2.3 Ledger schema additions” block (renumbered: 2.3 recent-activity, 2.4 resource policy)._
 - Day/model records gain `unpriced_requests`, `tou_tier` counters (`peak/offpeak/normal` request counts), `cost_saved_usd` (discount vs normal rate).
 - Old ledgers without these fields keep working (all readers treat missing keys as 0/absent).
 
