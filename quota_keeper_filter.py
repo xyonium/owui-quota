@@ -299,8 +299,13 @@ def qk_tou_rate(cfg: dict, model_id: str, now) -> tuple:
 
     peak, offpeak, normal = _merge("peak"), _merge("offpeak"), _merge("normal")
     dstr = now.strftime("%Y-%m-%d")
-    if dstr in (tou.get("holidays") or []) and offpeak:
-        return float(offpeak.get("rate", 1.0)), "offpeak"
+    if dstr in (tou.get("holidays") or []):
+        if offpeak:
+            return float(offpeak.get("rate", 1.0)), "offpeak"
+        cands = [(float(t.get("rate", 1.0)), n) for n, t in (("peak", peak), ("normal", normal)) if t]
+        if cands:
+            return min(cands, key=lambda x: x[0])
+        return 1.0, "normal"
 
     def _hit(tier):
         for w in tier.get("windows") or []:

@@ -68,6 +68,15 @@ def test_holiday_forces_offpeak(qk):
     assert tier == "offpeak"
 
 
+def test_holiday_without_offpeak_falls_back_to_lowest_tier(qk):
+    cfg = _cfg(qk, holidays=["2026-08-17"])
+    del cfg["tou"]["tiers"]["offpeak"]
+    # 10:00 Monday would be peak (2.0) via window; holiday must fall back to
+    # the lowest-rate tier among peak/normal -> normal (1.0)
+    rate, tier = qk.qk_tou_rate(cfg, "deepseek/deepseek-v4", datetime(2026, 8, 17, 10, 0))
+    assert (rate, tier) == (1.0, "normal")
+
+
 def test_midnight_spanning_window(qk):
     cfg = _cfg(qk)
     cfg["tou"]["tiers"]["offpeak"]["windows"] = [{"days": [0, 1, 2, 3, 4, 5, 6], "start": "22:00", "end": "06:00"}]
