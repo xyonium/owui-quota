@@ -13,7 +13,7 @@ import time
 import asyncio
 import logging
 import threading
-from datetime import datetime, timezone as _dt_timezone
+from datetime import datetime, timedelta, timezone as _dt_timezone
 from contextlib import contextmanager
 from typing import Optional
 
@@ -40,6 +40,7 @@ QK_DIR = qk_data_dir()
 QK_CONFIG_PATH = os.path.join(QK_DIR, "config.json")
 QK_LEDGER_PATH = os.path.join(QK_DIR, "ledger.json")
 QK_PRICING_PATH = os.path.join(QK_DIR, "pricing_cache.json")
+QK_RECENT_PATH = os.path.join(QK_DIR, "recent.json")
 
 DEFAULT_PRICING_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/"
@@ -508,6 +509,137 @@ def qk_resolve_quota(cfg: dict, user: dict):
     return None, "none"
 
 
+# ==== stats aggregation (reads the ledger for serving; filter never calls it) ====
+
+
+def qk_stats(from_=None, to=None, user=None, model=None, granularity="day"):
+    """Aggregate ledger usage into KPI/series/users/models views.
+
+    Filters: `from_`/`to` are inclusive "YYYY-MM-DD" day bounds, `user` matches
+    user id/name/email, `model` matches the exact model id. granularity "hour"
+    buckets the series by "YYYY-MM-DDTHH" with cost summed under model key "_";
+    anything else buckets per day with cost under the model id. A `model`
+    filter restricts KPI, per-user and series day buckets to that model's
+    contribution (hour buckets are per-day-per-hour across models and are
+    skipped under a model filter).
+    """
+    led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
+    users = led.get("users") or {}
+    kpi = {
+        "requests": 0,
+        "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+        "cost_usd": 0.0,
+        "unpriced_requests": 0,
+    }
+    series, users_rows, models_rows = {}, [], {}
+    cfg = qk_get_config()
+    from_s = from_ or "0000-00-00"
+    to_s = to or "9999-99-99"
+    for uid, u in users.items():
+        if user and user not in (uid, (u.get("name") or ""), (u.get("email") or "")):
+            continue
+        row = {
+            "user_id": uid,
+            "name": u.get("name", ""),
+            "email": u.get("email", ""),
+            "requests": 0,
+            "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+            "cost_usd": 0.0,
+            "models": set(),
+            "unpriced_requests": 0,
+        }
+        quota, source = qk_resolve_quota(cfg, {"id": uid})
+        row["quota"], row["quota_source"] = quota, source
+        row["multiplier"] = qk_time_multiplier(cfg)
+        for day, drec in sorted((u.get("days") or {}).items()):
+            if not (from_s <= day <= to_s):
+                continue
+            drec = drec or {}
+            day_ms = drec.get("models") or {}
+            if model:
+                # filtered: only the matching model's contribution counts for
+                # this day (KPI and per-user rows); hours buckets aggregate
+                # across models so they are skipped under a model filter
+                mm = day_ms.get(model)
+                if not mm:
+                    continue
+                row["requests"] += mm.get("requests", 0)
+                row["cost_usd"] += mm.get("cost_usd", 0) or 0
+                row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
+                for k in ("cached", "input", "output"):
+                    tk = (mm.get("tokens") or {}).get(k, 0) or 0
+                    row["tokens"][k] += tk
+                    kpi["tokens"][k] += tk
+                if granularity != "hour":
+                    sb = series.setdefault(day, {})
+                    sb[model] = sb.get(model, 0) + (mm.get("cost_usd", 0) or 0)
+                day_ms = {model: mm}
+            else:
+                row["requests"] += drec.get("requests", 0)
+                row["cost_usd"] += drec.get("cost_usd", 0) or 0
+                row["unpriced_requests"] += sum(
+                    (m2.get("unpriced_requests") or 0) for m2 in day_ms.values()
+                )
+                for k in ("cached", "input", "output"):
+                    tk = (drec.get("tokens") or {}).get(k, 0) or 0
+                    row["tokens"][k] += tk
+                    kpi["tokens"][k] += tk
+            for m, mm in day_ms.items():
+                row["models"].add(m)
+                mk = models_rows.setdefault(
+                    m,
+                    {
+                        "model": m,
+                        "requests": 0,
+                        "cost_usd": 0.0,
+                        "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                        "users": set(),
+                        "unpriced_requests": 0,
+                        "tou": {"peak": 0, "offpeak": 0, "normal": 0},
+                        "cost_saved_usd": 0.0,
+                    },
+                )
+                mk["requests"] += mm.get("requests", 0)
+                mk["cost_usd"] += mm.get("cost_usd", 0) or 0
+                mk["users"].add(uid)
+                mk["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
+                mk["cost_saved_usd"] += mm.get("cost_saved_usd", 0) or 0
+                for k in ("cached", "input", "output"):
+                    mk["tokens"][k] += (mm.get("tokens") or {}).get(k, 0) or 0
+                for tname, tv in ((mm.get("tou") or {})).items():
+                    mk["tou"][tname] = mk["tou"].get(tname, 0) + (tv or 0)
+                if granularity != "hour":
+                    sb = series.setdefault(day, {})
+                    sb[m] = sb.get(m, 0) + (mm.get("cost_usd", 0) or 0)
+            for h, hrec in ((drec.get("hours") or {}).items()):
+                if granularity == "hour" and not model:
+                    try:
+                        bkey = f"{day}T{int(h):02d}"
+                    except Exception:
+                        continue
+                    series.setdefault(bkey, {})
+                    series[bkey]["_"] = series[bkey].get("_", 0) + (
+                        (hrec.get("cost_usd") or 0) if isinstance(hrec, dict) else 0
+                    )
+        kpi["requests"] += row["requests"]
+        kpi["cost_usd"] += row["cost_usd"]
+        kpi["unpriced_requests"] += row["unpriced_requests"]
+        row["models"] = len(row["models"])
+        users_rows.append(row)
+    ci = kpi["tokens"]["cached"] + kpi["tokens"]["input"]
+    kpi["cache_rate"] = (kpi["tokens"]["cached"] / ci) if ci else 0.0
+    for mk in models_rows.values():
+        mk["users"] = len(mk["users"])
+        tot = sum(mk["tokens"].values())
+        mk["blended_per_m"] = (mk["cost_usd"] * 1e6 / tot) if tot else 0.0
+    return {
+        "kpi": kpi,
+        "series": [{"bucket": b, "by_model": v} for b, v in sorted(series.items())],
+        "users": users_rows,
+        "models": sorted(models_rows.values(), key=lambda x: -x["cost_usd"]),
+    }
+
+
 # ==== Open WebUI integration ====
 
 
@@ -844,18 +976,20 @@ def _mount_guard(app, prefix: str) -> bool:
 
 
 # ==== Router ====
+# Admin-only routes carry Depends(_require_admin) per route; /me is
+# self-service and only requires an authenticated user (_require_user).
 
-qk_router = APIRouter(dependencies=[Depends(_require_admin)])
+qk_router = APIRouter()
 
 
-@qk_router.get("/config")
+@qk_router.get("/config", dependencies=[Depends(_require_admin)])
 async def api_config(request: Request):
     cfg = qk_get_config()
     cfg["_time_multiplier"] = qk_time_multiplier(cfg)
     return JSONResponse(cfg)
 
 
-@qk_router.post("/config")
+@qk_router.post("/config", dependencies=[Depends(_require_admin)])
 async def api_save_config(request: Request):
     body = await request.json()
     errs = qk_validate_config(body)
@@ -869,27 +1003,79 @@ async def api_save_config(request: Request):
     return JSONResponse({"ok": True})
 
 
-@qk_router.get("/users")
+@qk_router.get("/users", dependencies=[Depends(_require_admin)])
 async def api_users(request: Request):
     return JSONResponse(await _users_table())
 
 
-@qk_router.get("/groups")
+@qk_router.get("/groups", dependencies=[Depends(_require_admin)])
 async def api_groups(request: Request):
     return JSONResponse(await _groups_table())
 
 
-@qk_router.get("/ledger")
+@qk_router.get("/ledger", dependencies=[Depends(_require_admin)])
 async def api_ledger(request: Request):
     return JSONResponse(qk_load_json(QK_LEDGER_PATH, {"users": {}}))
 
 
-@qk_router.get("/pricing")
+@qk_router.get("/pricing", dependencies=[Depends(_require_admin)])
 async def api_pricing(request: Request):
-    return JSONResponse(qk_load_json(QK_PRICING_PATH, {}))
+    cache = qk_load_json(QK_PRICING_PATH, {}) or {}
+    if request.query_params.get("full") == "1":
+        return JSONResponse(cache)
+    return JSONResponse({k: cache.get(k) for k in ("url", "fetched_at_iso", "models")})
 
 
-@qk_router.post("/pricing/refresh")
+@qk_router.get("/recent", dependencies=[Depends(_require_admin)])
+async def api_recent(request: Request):
+    rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+    return JSONResponse({"items": list(reversed(rec.get("items") or []))})
+
+
+@qk_router.get("/stats", dependencies=[Depends(_require_admin)])
+async def api_stats(request: Request):
+    q = request.query_params
+    return JSONResponse(
+        qk_stats(q.get("from"), q.get("to"), q.get("user"), q.get("model"),
+                 q.get("granularity", "day"))
+    )
+
+
+@qk_router.get("/me")
+async def api_me(request: Request, user=Depends(_require_user)):
+    cfg = qk_get_config()
+    quota, source = qk_resolve_quota(cfg, {"id": user.id})
+    mult = qk_time_multiplier(cfg)
+    led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}).get(user.id) or {}
+    days = led.get("days") or {}
+    now = qk_local_now(cfg)
+    pref = now.strftime("%Y-%m-")
+    used_month = sum((d or {}).get("cost_usd", 0) or 0 for k, d in days.items() if k.startswith(pref))
+    used_day = ((days.get(now.strftime("%Y-%m-%d")) or {}).get("cost_usd", 0)) or 0
+    cpu_ = float(cfg.get("credits_per_usd") or 1000.0)
+    trend = []
+    for i in range(6, -1, -1):
+        kd = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        dd = days.get(kd) or {}
+        trend.append({"day": kd, "requests": dd.get("requests", 0),
+                      "cost_usd": dd.get("cost_usd", 0) or 0})
+    return JSONResponse(
+        {
+            "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role},
+            "quota": quota,
+            "quota_source": source,
+            "multiplier": mult,
+            "effective_quota": (quota * mult) if quota is not None else None,
+            "used_credits": used_month * cpu_ if (cfg.get("quota_period") == "monthly") else used_day * cpu_,
+            "today": {"cost_usd": used_day,
+                      "requests": (days.get(now.strftime("%Y-%m-%d")) or {}).get("requests", 0)},
+            "trend": trend,
+            "tou": {"current_tier": None},  # UI contract field; wired once the page has a per-user model list
+        }
+    )
+
+
+@qk_router.post("/pricing/refresh", dependencies=[Depends(_require_admin)])
 async def api_refresh(request: Request):
     body = {}
     try:
@@ -902,7 +1088,7 @@ async def api_refresh(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@qk_router.get("/pricing/match")
+@qk_router.get("/pricing/match", dependencies=[Depends(_require_admin)])
 async def api_match(request: Request):
     model = request.query_params.get("model", "")
     cfg = qk_get_config()

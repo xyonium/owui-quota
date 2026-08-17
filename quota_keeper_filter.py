@@ -39,6 +39,7 @@ QK_DIR = qk_data_dir()
 QK_CONFIG_PATH = os.path.join(QK_DIR, "config.json")
 QK_LEDGER_PATH = os.path.join(QK_DIR, "ledger.json")
 QK_PRICING_PATH = os.path.join(QK_DIR, "pricing_cache.json")
+QK_RECENT_PATH = os.path.join(QK_DIR, "recent.json")
 
 DEFAULT_PRICING_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/"
@@ -554,6 +555,25 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         mm["priced"] = mm.get("unpriced_requests", 0) == 0
         qk_prune_ledger(led, cfg)
         qk_atomic_write(QK_LEDGER_PATH, led)
+        # recent.json ring buffer (dashboard "recent activity" feed), capped
+        # at 200 newest-last; same lock so it stays consistent with the ledger
+        rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+        items = rec.setdefault("items", [])
+        items.append(
+            {
+                "ts": time.time(),
+                "user_id": uid,
+                "name": u.get("name", ""),
+                "email": u.get("email", ""),
+                "model": model,
+                "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
+                "cost_usd": cost,
+                "tou_tier": tier,
+                "priced": priced,
+            }
+        )
+        del items[:-200]
+        qk_atomic_write(QK_RECENT_PATH, rec)
 
 
 def qk_period_used_usd(uid: str, cfg: dict) -> float:
