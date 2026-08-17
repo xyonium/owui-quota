@@ -1080,7 +1080,10 @@ async def api_refresh(request: Request):
     except Exception:
         pass
     try:
-        return JSONResponse(qk_refresh_pricing(bool(body.get("force"))))
+        result = await asyncio.to_thread(
+            qk_refresh_pricing, bool(body.get("force"))
+        )
+        return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1104,7 +1107,7 @@ async def api_match(request: Request):
 async def _pricing_loop():
     while True:
         try:
-            qk_refresh_pricing(force=False)
+            await asyncio.to_thread(qk_refresh_pricing, force=False)
         except Exception as e:
             log.info("quota-keeper pricing refresh failed: %s", e)
         await asyncio.sleep(600)
@@ -1126,6 +1129,7 @@ class Event:
     def __init__(self):
         self.valves = self.Valves()
         self._installed = False
+        self._pricing_task = None
 
     async def event(
         self,
@@ -1167,6 +1171,6 @@ class Event:
             log.info("quota-keeper admin page at %s", page_path)
 
             if self.valves.enable_background_pricing_refresh:
-                asyncio.get_event_loop().create_task(_pricing_loop())
+                self._pricing_task = asyncio.create_task(_pricing_loop())
         except Exception as e:
             log.warning("quota-keeper setup failed: %s", e)

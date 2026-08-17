@@ -3,7 +3,10 @@
 
 Tests are the contract for the admin aggregation logic (the brief's qk_stats
 sketch has a known-wrong per-user `models` line; these tests pin the fix).
+
+Task 7: pricing-loop robustness tests appended at the bottom.
 """
+import asyncio
 import sys
 import types
 from datetime import date, datetime
@@ -259,3 +262,55 @@ def test_pricing_summary_vs_full(admin_client):
     body = r.json()
     assert body["table"] == {"m/x": {"input": 1.0}}
     assert body["fetched_at"] == 123
+
+
+# ---- Task 7: pricing loop robustness -----------------------------------------
+
+
+def _fake_app():
+    """Minimal stand-in for Open WebUI's FastAPI app: records nothing, but
+    accepts the include_router/get calls event() makes."""
+    class App:
+        routes = []
+        def include_router(self, *a, **k):
+            pass
+        def get(self, *a, **k):
+            def deco(fn):
+                return fn
+            return deco
+    return App()
+
+
+def test_event_mounts_cleanly_with_background_refresh_off(load_admin):
+    # Task 7 refactor guard: with background refresh disabled, mounting must
+    # stay independent of the pricing-loop changes (Task 2 baseline behavior).
+    adm = load_admin()
+    ev = adm.Event()
+    ev.valves.enable_background_pricing_refresh = False
+    asyncio.run(ev.event(
+        {}, __event_name__="system.startup.completed", __id__="f1",
+        __app__=_fake_app()))
+    assert ev._installed is True
+
+
+def test_pricing_loop_task_created_with_strong_ref(load_admin, monkeypatch):
+    # The pricing loop must be launched via asyncio.create_task and the task
+    # kept on the Event instance (strong reference) -- otherwise a
+    # garbage-collected task never runs. The real _pricing_loop is swapped for
+    # a flag-setting fake; the assertion that the fake ran proves the task was
+    # actually scheduled.
+    adm = load_admin()
+    ran = []
+
+    async def fake_loop():
+        ran.append(True)
+
+    monkeypatch.setattr(adm, "_pricing_loop", fake_loop)
+    ev = adm.Event()
+    ev.valves.enable_background_pricing_refresh = True
+    asyncio.run(ev.event(
+        {}, __event_name__="system.startup.completed", __id__="f1",
+        __app__=_fake_app()))
+    assert ev._pricing_task is not None
+    assert ran == [True]
+    assert ev._pricing_task.done()  # fake loop completed inside asyncio.run
