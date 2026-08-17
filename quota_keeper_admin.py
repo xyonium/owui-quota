@@ -272,12 +272,14 @@ def qk_time_multiplier(cfg: dict) -> float:
     now = qk_local_now(cfg)
     sch = cfg.get("schedule") or {}
     mult = 1.0
+    wm_raw = sch.get("weekend_multiplier", 1.0)
     try:
-        wm = float(sch.get("weekend_multiplier", 1.0))
+        wm = float(wm_raw) if _num(wm_raw) else 1.0
     except Exception:
         wm = 1.0
+    nm_raw = sch.get("night_multiplier", 1.0)
     try:
-        nm = float(sch.get("night_multiplier", 1.0))
+        nm = float(nm_raw) if _num(nm_raw) else 1.0
     except Exception:
         nm = 1.0
     if now.weekday() >= 5 and wm != 1.0:
@@ -306,20 +308,27 @@ def qk_user_group_ids(user: dict):
         return []
 
 
+def _num(v):
+    """True for numbers, but not bools (bool is an int subclass and must not
+    be accepted as a quota/multiplier value)."""
+    return not isinstance(v, bool) and isinstance(v, (int, float))
+
+
 def qk_resolve_quota(cfg: dict, user: dict):
+    """user quota (if set) wins; otherwise the highest group quota; else default."""
     uq = (cfg.get("user_quotas") or {}).get((user or {}).get("id"))
-    if isinstance(uq, (int, float)) and uq > 0:
+    if _num(uq) and uq > 0:
         return float(uq), "user"
     gq = cfg.get("group_quotas") or {}
     vals = [
         float(gq[str(g)])
         for g in qk_user_group_ids(user or {})
-        if isinstance(gq.get(str(g)), (int, float)) and gq.get(str(g)) > 0
+        if _num(gq.get(str(g))) and gq.get(str(g)) > 0
     ]
     if vals:
         return max(vals), "group"
     dq = cfg.get("default_quota_credits")
-    if isinstance(dq, (int, float)) and dq > 0:
+    if _num(dq) and dq > 0:
         return float(dq), "default"
     return None, "none"
 

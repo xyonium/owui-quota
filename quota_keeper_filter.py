@@ -240,9 +240,11 @@ def qk_normalize_usage(u) -> Optional[dict]:
         cached = (cached_oai or 0.0) + (cr or 0.0)
         inp = max(0.0, pt - cached)
         out = ct if ct is not None else (ao or 0.0)
-    elif ai is not None:
+    elif ai is not None or ao is not None:
+        # input_tokens and/or output_tokens; a lone output_tokens appears in
+        # Anthropic message_delta partial-usage events
         cached = cr or 0.0
-        inp = ai
+        inp = ai or 0.0
         out = ao or 0.0
     else:
         return None
@@ -274,14 +276,19 @@ def qk_prune_ledger(led: dict, cfg: dict) -> None:
         days = 0
     if days <= 0:
         return
-    cutoff = (datetime.now(_dt_timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    # cutoff in the configured timezone so "today" is the same day the
+    # ledger buckets were written under (previously naive UTC)
+    cutoff = (qk_local_now(cfg) - timedelta(days=days)).strftime("%Y-%m-%d")
     for uid in list((led.get("users") or {}).keys()):
         udays = (led["users"].get(uid) or {}).get("days") or {}
         for k in [k for k in udays if k < cutoff]:
             udays.pop(k, None)
 
 
-def qk_record_usage(user: dict, model: str, tok: dict) -> None:
+def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True) -> None:
+    """Record one usage event. count_request=False marks a partial-usage
+    topup for an id that already recorded: tokens/cost still accumulate but
+    the request counters (day/hours/models) are not incremented again."""
     uid = (user or {}).get("id")
     if not uid:
         return
@@ -295,7 +302,8 @@ def qk_record_usage(user: dict, model: str, tok: dict) -> None:
         price = pconf.get("default_pricing")
         priced = price is not None
     cost = qk_cost_usd(tok, price)
-    day = qk_local_now(cfg).strftime("%Y-%m-%d")
+    now_local = qk_local_now(cfg)
+    day = now_local.strftime("%Y-%m-%d")
     model = str(model or "unknown")[:200]
 
     with qk_lock():
@@ -313,10 +321,25 @@ def qk_record_usage(user: dict, model: str, tok: dict) -> None:
                 "models": {},
             },
         )
-        d["requests"] = d.get("requests", 0) + 1
+        if count_request:
+            d["requests"] = d.get("requests", 0) + 1
         d["cost_usd"] = round(d.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             d["tokens"][k] = d["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        # hourly bucket (consumed by the dashboard at granularity=hour)
+        h = d.setdefault("hours", {}).setdefault(
+            str(now_local.hour),
+            {
+                "requests": 0,
+                "cost_usd": 0.0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+            },
+        )
+        if count_request:
+            h["requests"] = h.get("requests", 0) + 1
+        h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
+        for k in ("cached", "input", "output"):
+            h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
         mm = d["models"].setdefault(
             model,
             {
@@ -324,13 +347,19 @@ def qk_record_usage(user: dict, model: str, tok: dict) -> None:
                 "cost_usd": 0.0,
                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
                 "priced": True,
+                "unpriced_requests": 0,
             },
         )
-        mm["requests"] = mm.get("requests", 0) + 1
+        # unpriced_requests is a per-request counter; topups are not requests
+        if count_request:
+            mm["requests"] = mm.get("requests", 0) + 1
+            mm["unpriced_requests"] = mm.get("unpriced_requests", 0) + (0 if priced else 1)
         mm["cost_usd"] = round(mm.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             mm["tokens"][k] = mm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
-        mm["priced"] = bool(mm.get("priced", True)) and priced
+        # derived flag kept for UI back-compat until Task 9 (same semantics as
+        # the old sticky AND: once an unpriced request occurred, stays false)
+        mm["priced"] = mm.get("unpriced_requests", 0) == 0
         qk_prune_ledger(led, cfg)
         qk_atomic_write(QK_LEDGER_PATH, led)
 
@@ -366,21 +395,27 @@ def qk_user_group_ids(user: dict):
         return []
 
 
+def _num(v):
+    """True for numbers, but not bools (bool is an int subclass and must not
+    be accepted as a quota/multiplier value)."""
+    return not isinstance(v, bool) and isinstance(v, (int, float))
+
+
 def qk_resolve_quota(cfg: dict, user: dict):
     """user quota (if set) wins; otherwise the highest group quota; else default."""
     uq = (cfg.get("user_quotas") or {}).get((user or {}).get("id"))
-    if isinstance(uq, (int, float)) and uq > 0:
+    if _num(uq) and uq > 0:
         return float(uq), "user"
     gq = cfg.get("group_quotas") or {}
     vals = [
         float(gq[str(g)])
         for g in qk_user_group_ids(user or {})
-        if isinstance(gq.get(str(g)), (int, float)) and gq.get(str(g)) > 0
+        if _num(gq.get(str(g))) and gq.get(str(g)) > 0
     ]
     if vals:
         return max(vals), "group"
     dq = cfg.get("default_quota_credits")
-    if isinstance(dq, (int, float)) and dq > 0:
+    if _num(dq) and dq > 0:
         return float(dq), "default"
     return None, "none"
 
@@ -389,12 +424,14 @@ def qk_time_multiplier(cfg: dict) -> float:
     sch = cfg.get("schedule") or {}
     now = qk_local_now(cfg)
     mult = 1.0
+    wm_raw = sch.get("weekend_multiplier", 1.0)
     try:
-        wm = float(sch.get("weekend_multiplier", 1.0))
+        wm = float(wm_raw) if _num(wm_raw) else 1.0
     except Exception:
         wm = 1.0
+    nm_raw = sch.get("night_multiplier", 1.0)
     try:
-        nm = float(sch.get("night_multiplier", 1.0))
+        nm = float(nm_raw) if _num(nm_raw) else 1.0
     except Exception:
         nm = 1.0
     if now.weekday() >= 5 and wm != 1.0:
@@ -457,27 +494,19 @@ class Filter:
         return True
 
     def _record(self, user: dict, model: str, tok: dict, rid: str = "") -> None:
-        rid = rid or f"{time.time_ns()}"
-        if not self._mark_seen(rid):
-            return
-        if not (user or {}).get("id"):
+        # orphan (no user yet) is stashed WITHOUT marking seen, so the same
+        # response id can be adopted and recorded later by outlet()/stream()
+        uid = (user or {}).get("id")
+        if not uid:
+            rid = rid or f"{time.time_ns()}"
             self._orphan[rid] = {"model": model, "tok": tok, "ts": time.time()}
             while len(self._orphan) > 256:
                 self._orphan.popitem(last=False)
             return
+        rid = rid or f"{time.time_ns()}"
+        if not self._mark_seen(rid):
+            return
         qk_record_usage(user, model, tok)
-
-    @staticmethod
-    def _estimate_from_body(body: dict) -> dict:
-        msgs = body.get("messages") or []
-        inp_chars = sum(len(str(m.get("content") or "")) for m in msgs[:-1] or [])
-        out_chars = len(str(msgs[-1].get("content") or "")) if msgs else 0
-        return {
-            "cached": 0.0,
-            "input": max(0.0, inp_chars / 4.0),
-            "output": max(0.0, out_chars / 4.0),
-            "cache_write": 0.0,
-        }
 
     # -- enforcement ----------------------------------------------------------
 
@@ -498,25 +527,39 @@ class Filter:
             cfg = qk_get_config()
             quota, source = qk_resolve_quota(cfg, user)
             if quota is None:
-                return body
+                return body  # unlimited
             mult = qk_time_multiplier(cfg)
             eff = quota * mult
             if eff <= 0:
-                return body
+                # multiplier zeroed the quota (e.g. night_multiplier=0): a
+                # hard block, not unlimited
+                raise QuotaBlocked(
+                    "Quota temporarily disabled: effective quota is 0 "
+                    "(time multiplier = {}). Contact admin to adjust the "
+                    "schedule multipliers.".format(round(mult, 3))
+                )
             try:
                 cpu_ = float(cfg.get("credits_per_usd") or 1000.0)
             except Exception:
                 cpu_ = 1000.0
             used = qk_period_used_usd(uid, cfg) * cpu_
             if used >= eff:
-                raise QuotaBlocked(
-                    self.valves.block_message.format(
+                try:
+                    msg = self.valves.block_message.format(
                         used=round(used, 1),
                         quota=round(eff, 1),
                         source=source,
                         mult=round(mult, 3),
                     )
-                )
+                except Exception:
+                    log.warning("quota-keeper block_message template invalid; using default")
+                    msg = Filter.Valves().block_message.format(
+                        used=round(used, 1),
+                        quota=round(eff, 1),
+                        source=source,
+                        mult=round(mult, 3),
+                    )
+                raise QuotaBlocked(msg)
             return body
         except QuotaBlocked:
             raise
@@ -532,6 +575,8 @@ class Filter:
         try:
             ev = event
             if isinstance(ev, str):
+                if '"usage"' not in ev:
+                    return event  # cheap pre-filter: no usage field, skip json.loads
                 s = ev.strip()
                 if s.startswith("data:"):
                     s = s[5:].strip()
@@ -544,11 +589,22 @@ class Filter:
             if not isinstance(ev, dict):
                 return event
             u = ev.get("usage")
+            if u is None and isinstance(ev.get("message"), dict):
+                # Anthropic message_start nests usage under "message"
+                u = ev["message"].get("usage")
             tok = qk_normalize_usage(u)
             if tok is None:
                 return event
             rid = str(ev.get("id") or f"stream-{time.time_ns()}")
             model = str(ev.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+            if rid in self._seen:
+                # Later partial usage for an already-recorded id: contribute
+                # its own fields additively (no new request). Anthropic sends
+                # input in message_start and cumulative output in
+                # message_delta, so plain addition matches the real totals;
+                # input is counted once from the first event.
+                qk_record_usage(__user__ or {}, model, tok, count_request=False)
+                return event
             self._record(__user__ or {}, model, tok, rid)
         except Exception as e:
             log.warning("quota-keeper stream error: %s", e)
@@ -567,19 +623,20 @@ class Filter:
             if tok is None and isinstance(choices, list) and choices:
                 tok = qk_normalize_usage((choices[0] or {}).get("usage"))
             rid = str(body.get("id") or "")
+            model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
             if tok is not None:
-                model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
-                self._record(__user__ or {}, model, tok, rid or f"outlet-{time.time_ns()}")
-            elif self.valves.estimate_unreported_tokens and rid:
-                # adopt usage stashed by stream() when user info was missing there
-                if rid in self._orphan and (__user__ or {}).get("id"):
-                    ent = self._orphan.pop(rid)
-                    qk_record_usage(__user__, ent["model"], ent["tok"])
-                elif (__user__ or {}).get("id") and body.get("messages"):
-                    est = self._estimate_from_body(body)
-                    model = str(body.get("model") or "unknown")
-                    if self._mark_seen(rid or f"est-{time.time_ns()}"):
-                        qk_record_usage(__user__, model, est)
+                self._record(__user__ or {}, model, tok, rid)
+            elif rid and (__user__ or {}).get("id") and rid in self._orphan:
+                # adopt usage stashed by stream() when user info was missing
+                # there (independent of estimate_unreported_tokens)
+                ent = self._orphan.pop(rid)
+                qk_record_usage(__user__, ent["model"], ent["tok"])
+            elif self.valves.estimate_unreported_tokens and (__user__ or {}).get("id"):
+                ch = (body.get("choices") or [{}])[0]
+                content = str((ch.get("message") or {}).get("content") or "")
+                if content:
+                    est = {"cached": 0.0, "input": 0.0, "output": len(content) / 4.0, "cache_write": 0.0}
+                    self._record(__user__, model, est, rid or f"est-{time.time_ns()}")
         except Exception as e:
             log.warning("quota-keeper outlet error: %s", e)
         return body
