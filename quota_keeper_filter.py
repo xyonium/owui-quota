@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.1.1
+version: 0.2.0
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 
+# ==== shared helpers: keep in sync with quota_keeper_admin.py (same code) ====
+
 def qk_data_dir() -> str:
     base = os.environ.get("DATA_DIR") or "/app/backend/data"
     d = os.path.join(base, "quota_keeper")
@@ -37,6 +39,7 @@ QK_DIR = qk_data_dir()
 QK_CONFIG_PATH = os.path.join(QK_DIR, "config.json")
 QK_LEDGER_PATH = os.path.join(QK_DIR, "ledger.json")
 QK_PRICING_PATH = os.path.join(QK_DIR, "pricing_cache.json")
+QK_RECENT_PATH = os.path.join(QK_DIR, "recent.json")
 
 DEFAULT_PRICING_URL = (
     "https://raw.githubusercontent.com/BerriAI/litellm/"
@@ -62,6 +65,20 @@ DEFAULT_CONFIG = {
         "night_end_hour": 8,
         "night_multiplier": 1.0,        # quota * multiplier at night (e.g. 0.5)
         "weekend_multiplier": 1.0,      # quota * multiplier on Sat/Sun
+    },
+    "tou": {
+        "enabled": False,
+        "timezone": None,               # None -> schedule.timezone
+        "tiers": {
+            "peak": {"rate": 2.0, "windows": [{"days": [1, 2, 3, 4, 5], "start": "09:00", "end": "12:00"},
+                                               {"days": [1, 2, 3, 4, 5], "start": "14:00", "end": "18:00"}]},
+            "offpeak": {"rate": 0.5, "windows": [{"days": [0, 1, 2, 3, 4, 5, 6], "start": "00:30", "end": "08:30"}]},
+            "normal": {"rate": 1.0},
+        },
+        "holidays": [],                  # "YYYY-MM-DD" -> whole day offpeak
+        "default_policy": "off",         # off | normal
+        "providers": {},                 # "<first path segment>": {"enabled": bool, "tiers": {name: {"rate": x}}}
+        "models": {},                    # exact model id: {"enabled": bool, "tiers": {...}}
     },
 }
 
@@ -130,6 +147,8 @@ JC = _JsonCache()
 
 
 def qk_merge_config(cfg: dict) -> dict:
+    if not isinstance(cfg, dict):
+        cfg = {}
     base = json.loads(json.dumps(DEFAULT_CONFIG))
     for k, v in (cfg or {}).items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
@@ -137,6 +156,89 @@ def qk_merge_config(cfg: dict) -> dict:
         else:
             base[k] = v
     return base
+
+
+def qk_deep_merge(base, patch):
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            qk_deep_merge(base[k], v)
+        else:
+            base[k] = v
+    return base
+
+
+_QK_NUM = lambda v: not isinstance(v, bool) and isinstance(v, (int, float))
+
+
+def qk_validate_config(cfg) -> list:
+    errs = []
+    if not isinstance(cfg, dict):
+        return ["config must be an object"]
+    if "credits_per_usd" in cfg and not (_QK_NUM(cfg["credits_per_usd"]) and cfg["credits_per_usd"] > 0):
+        errs.append("credits_per_usd must be a positive number")
+    if "quota_period" in cfg and cfg["quota_period"] not in (None, "daily", "monthly"):
+        errs.append("quota_period must be daily|monthly")
+    for key in ("user_quotas", "group_quotas"):
+        if key in cfg and not isinstance(cfg[key], dict):
+            errs.append(f"{key} must be an object")
+    sch = cfg.get("schedule")
+    if sch is not None and not isinstance(sch, dict):
+        errs.append("schedule must be an object")
+    if isinstance(sch, dict):
+        for k in ("night_start_hour", "night_end_hour"):
+            if k in sch and not (isinstance(sch[k], int) and not isinstance(sch[k], bool) and 0 <= sch[k] <= 23):
+                errs.append(f"schedule.{k} must be int 0-23")
+        for k in ("night_multiplier", "weekend_multiplier"):
+            if k in sch and not (_QK_NUM(sch[k]) and sch[k] >= 0):
+                errs.append(f"schedule.{k} must be number >= 0")
+    pri = cfg.get("pricing")
+    if pri is not None and not isinstance(pri, dict):
+        errs.append("pricing must be an object")
+    tou = cfg.get("tou")
+    if tou is not None and not isinstance(tou, dict):
+        errs.append("tou must be an object")
+    if isinstance(tou, dict):
+        dp = tou.get("default_policy")
+        if dp is not None and dp not in ("off", "normal"):
+            errs.append("tou.default_policy must be off|normal")
+        hol = tou.get("holidays")
+        if hol is not None:
+            if not isinstance(hol, list):
+                errs.append("tou.holidays must be a list of YYYY-MM-DD")
+            elif any(not isinstance(h, str) or not re.match(r"^\d{4}-\d{2}-\d{2}$", h) for h in hol):
+                errs.append("tou.holidays entries must be YYYY-MM-DD")
+        tiers = tou.get("tiers")
+        if tiers is not None and not isinstance(tiers, dict):
+            errs.append("tou.tiers must be an object")
+        elif isinstance(tiers, dict):
+            for tname, tconf in tiers.items():
+                if not isinstance(tconf, dict):
+                    errs.append(f"tou.tiers.{tname} must be an object")
+                    continue
+                rate = tconf.get("rate")
+                if rate is not None and not (_QK_NUM(rate) and rate > 0):
+                    errs.append(f"tou.tiers.{tname}.rate must be a positive number")
+                for wi, w in enumerate(tconf.get("windows") or []):
+                    if not isinstance(w, dict):
+                        errs.append(f"tou.tiers.{tname}.windows[{wi}] must be an object")
+                        continue
+                    days = w.get("days")
+                    if days is not None and (
+                        not isinstance(days, list)
+                        or not all(isinstance(dx, int) and not isinstance(dx, bool) and 0 <= dx <= 6 for dx in days)
+                    ):
+                        errs.append(f"tou.tiers.{tname}.windows[{wi}].days must be a list of ints 0-6")
+                    for hh in ("start", "end"):
+                        v = w.get(hh)
+                        if v is None:
+                            continue
+                        if not isinstance(v, str) or not re.match(r"^\d{2}:\d{2}$", v):
+                            errs.append(f"tou.tiers.{tname}.windows[{wi}].{hh} must be HH:MM")
+                        else:
+                            h_, m_ = int(v[:2]), int(v[3:])
+                            if not (0 <= h_ <= 23 and 0 <= m_ <= 59):
+                                errs.append(f"tou.tiers.{tname}.windows[{wi}].{hh} must be HH:MM 00:00-23:59")
+    return errs
 
 
 def qk_get_config() -> dict:
@@ -154,6 +256,91 @@ def qk_local_now(cfg: dict) -> datetime:
             return datetime.now(_dt_timezone.utc)
     except Exception:
         return datetime.now(_dt_timezone.utc)
+
+
+def qk_tou_local_now(cfg: dict) -> datetime:
+    """Now in the TOU timezone (tou.timezone > schedule.timezone > TZ > UTC)."""
+    tou = cfg.get("tou") or {}
+    tz = tou.get("timezone") or (cfg.get("schedule") or {}).get("timezone")
+    if tz:
+        try:
+            from zoneinfo import ZoneInfo
+
+            return datetime.now(ZoneInfo(tz))
+        except Exception:
+            pass
+    return qk_local_now(cfg)
+
+
+def qk_tou_resolve_policy(cfg: dict, model_id: str):
+    """models[exact] -> providers[first segment] -> default_policy. Returns policy dict or None (off)."""
+    tou = cfg.get("tou") or {}
+    if not tou.get("enabled"):
+        return None
+    mid = str(model_id or "").strip().lower()
+    mpol = (tou.get("models") or {}).get(mid)
+    if isinstance(mpol, dict):
+        return mpol if mpol.get("enabled", True) else None
+    prov = mid.split("/")[0] if "/" in mid else "_default"
+    ppol = (tou.get("providers") or {}).get(prov)
+    if isinstance(ppol, dict):
+        return ppol if ppol.get("enabled", True) else None
+    if (tou.get("providers") or {}).get(prov) is None and tou.get("default_policy") == "normal":
+        return {}
+    return None
+
+
+def qk_tou_rate(cfg: dict, model_id: str, now) -> tuple:
+    """Returns (rate, tier). Tier 'off' means TOU does not apply (rate 1.0).
+    Window days use JS-style numbering (0=Sunday .. 6=Saturday) so the
+    default offpeak `days: [0..6]` covers every day of the week.
+    `days: []` (or missing) means every day."""
+    tou = cfg.get("tou") or {}
+    pol = qk_tou_resolve_policy(cfg, model_id)
+    if pol is None:
+        return 1.0, "off"
+    tiers = dict(tou.get("tiers") or {})
+
+    def _merge(tname):
+        base = dict(tiers.get(tname) or {})
+        over = ((pol.get("tiers") or {}).get(tname)) or {}
+        base.update(over)
+        return base
+
+    peak, offpeak, normal = _merge("peak"), _merge("offpeak"), _merge("normal")
+    dstr = now.strftime("%Y-%m-%d")
+    if dstr in (tou.get("holidays") or []):
+        if offpeak:
+            return float(offpeak.get("rate", 1.0)), "offpeak"
+        cands = [(float(t.get("rate", 1.0)), n) for n, t in (("peak", peak), ("normal", normal)) if t]
+        if cands:
+            return min(cands, key=lambda x: x[0])
+        return 1.0, "normal"
+
+    def _hit(tier):
+        for w in tier.get("windows") or []:
+            days = w.get("days") or list(range(7))
+            if (now.weekday() + 1) % 7 not in days:
+                continue
+            try:
+                sh, sm = map(int, str(w.get("start", "00:00")).split(":"))
+                eh, em = map(int, str(w.get("end", "00:00")).split(":"))
+            except Exception:
+                continue
+            s, e, cur = sh * 60 + sm, eh * 60 + em, now.hour * 60 + now.minute
+            if s <= e:
+                if s <= cur < e:
+                    return True
+            else:  # spans midnight
+                if cur >= s or cur < e:
+                    return True
+        return False
+
+    if peak and _hit(peak):
+        return float(peak.get("rate", 1.0)), "peak"
+    if offpeak and _hit(offpeak):
+        return float(offpeak.get("rate", 1.0)), "offpeak"
+    return float(normal.get("rate", 1.0)), "normal"
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +425,11 @@ def qk_normalize_usage(u) -> Optional[dict]:
         cached = (cached_oai or 0.0) + (cr or 0.0)
         inp = max(0.0, pt - cached)
         out = ct if ct is not None else (ao or 0.0)
-    elif ai is not None:
+    elif ai is not None or ao is not None:
+        # input_tokens and/or output_tokens; a lone output_tokens appears in
+        # Anthropic message_delta partial-usage events
         cached = cr or 0.0
-        inp = ai
+        inp = ai or 0.0
         out = ao or 0.0
     else:
         return None
@@ -272,14 +461,22 @@ def qk_prune_ledger(led: dict, cfg: dict) -> None:
         days = 0
     if days <= 0:
         return
-    cutoff = (datetime.now(_dt_timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+    # cutoff in the configured timezone so "today" is the same day the
+    # ledger buckets were written under (previously naive UTC)
+    cutoff = (qk_local_now(cfg) - timedelta(days=days)).strftime("%Y-%m-%d")
     for uid in list((led.get("users") or {}).keys()):
         udays = (led["users"].get(uid) or {}).get("days") or {}
         for k in [k for k in udays if k < cutoff]:
             udays.pop(k, None)
 
 
-def qk_record_usage(user: dict, model: str, tok: dict) -> None:
+def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True,
+                    now: datetime = None) -> None:
+    """Record one usage event. count_request=False marks a partial-usage
+    topup for an id that already recorded: tokens/cost still accumulate but
+    the request counters (day/hours/models) are not incremented again.
+    `now` overrides the current time (also picks the TOU tier/day key);
+    default is the TOU-aware local now."""
     uid = (user or {}).get("id")
     if not uid:
         return
@@ -292,9 +489,12 @@ def qk_record_usage(user: dict, model: str, tok: dict) -> None:
     if price is None:
         price = pconf.get("default_pricing")
         priced = price is not None
-    cost = qk_cost_usd(tok, price)
-    day = qk_local_now(cfg).strftime("%Y-%m-%d")
+    base_cost = qk_cost_usd(tok, price)
+    now_local = now or qk_tou_local_now(cfg)
+    day = now_local.strftime("%Y-%m-%d")
     model = str(model or "unknown")[:200]
+    rate, tier = qk_tou_rate(cfg, model, now_local)
+    cost = base_cost * rate
 
     with qk_lock():
         led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
@@ -308,13 +508,34 @@ def qk_record_usage(user: dict, model: str, tok: dict) -> None:
                 "requests": 0,
                 "cost_usd": 0.0,
                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "tou": {"peak": 0, "offpeak": 0, "normal": 0},
+                "cost_saved_usd": 0.0,
                 "models": {},
             },
         )
-        d["requests"] = d.get("requests", 0) + 1
+        if count_request:
+            d["requests"] = d.get("requests", 0) + 1
         d["cost_usd"] = round(d.get("cost_usd", 0.0) + cost, 8)
+        dtou = d.setdefault("tou", {"peak": 0, "offpeak": 0, "normal": 0})
+        if count_request and tier in dtou:
+            dtou[tier] = dtou.get(tier, 0) + 1
+        d["cost_saved_usd"] = round(d.get("cost_saved_usd", 0.0) + (base_cost - cost), 8)
         for k in ("cached", "input", "output"):
             d["tokens"][k] = d["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        # hourly bucket (consumed by the dashboard at granularity=hour)
+        h = d.setdefault("hours", {}).setdefault(
+            str(now_local.hour),
+            {
+                "requests": 0,
+                "cost_usd": 0.0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+            },
+        )
+        if count_request:
+            h["requests"] = h.get("requests", 0) + 1
+        h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
+        for k in ("cached", "input", "output"):
+            h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
         mm = d["models"].setdefault(
             model,
             {
@@ -322,15 +543,49 @@ def qk_record_usage(user: dict, model: str, tok: dict) -> None:
                 "cost_usd": 0.0,
                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
                 "priced": True,
+                "unpriced_requests": 0,
+                "tou": {"peak": 0, "offpeak": 0, "normal": 0},
+                "cost_saved_usd": 0.0,
             },
         )
-        mm["requests"] = mm.get("requests", 0) + 1
+        # unpriced_requests is a per-request counter; topups are not requests
+        if count_request:
+            mm["requests"] = mm.get("requests", 0) + 1
+            mm["unpriced_requests"] = mm.get("unpriced_requests", 0) + (0 if priced else 1)
         mm["cost_usd"] = round(mm.get("cost_usd", 0.0) + cost, 8)
+        mtou = mm.setdefault("tou", {"peak": 0, "offpeak": 0, "normal": 0})
+        if count_request and tier in mtou:
+            mtou[tier] = mtou.get(tier, 0) + 1
+        mm["cost_saved_usd"] = round(mm.get("cost_saved_usd", 0.0) + (base_cost - cost), 8)
         for k in ("cached", "input", "output"):
             mm["tokens"][k] = mm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
-        mm["priced"] = bool(mm.get("priced", True)) and priced
+        # derived flag kept for UI back-compat until Task 9 (same semantics as
+        # the old sticky AND: once an unpriced request occurred, stays false)
+        mm["priced"] = mm.get("unpriced_requests", 0) == 0
         qk_prune_ledger(led, cfg)
         qk_atomic_write(QK_LEDGER_PATH, led)
+        # recent.json ring buffer (dashboard "recent activity" feed), capped
+        # at 200 newest-last; same lock so it stays consistent with the ledger.
+        # Topups (count_request=False) are partial-usage merges for an already
+        # recorded response, not new responses: they do not enter the feed.
+        if count_request:
+            rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+            items = rec.setdefault("items", [])
+            items.append(
+                {
+                    "ts": time.time(),
+                    "user_id": uid,
+                    "name": u.get("name", ""),
+                    "email": u.get("email", ""),
+                    "model": model,
+                    "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
+                    "cost_usd": cost,
+                    "tou_tier": tier,
+                    "priced": priced,
+                }
+            )
+            del items[:-200]
+            qk_atomic_write(QK_RECENT_PATH, rec)
 
 
 def qk_period_used_usd(uid: str, cfg: dict) -> float:
@@ -364,21 +619,27 @@ def qk_user_group_ids(user: dict):
         return []
 
 
+def _num(v):
+    """True for numbers, but not bools (bool is an int subclass and must not
+    be accepted as a quota/multiplier value)."""
+    return not isinstance(v, bool) and isinstance(v, (int, float))
+
+
 def qk_resolve_quota(cfg: dict, user: dict):
     """user quota (if set) wins; otherwise the highest group quota; else default."""
     uq = (cfg.get("user_quotas") or {}).get((user or {}).get("id"))
-    if isinstance(uq, (int, float)) and uq > 0:
+    if _num(uq) and uq > 0:
         return float(uq), "user"
     gq = cfg.get("group_quotas") or {}
     vals = [
         float(gq[str(g)])
         for g in qk_user_group_ids(user or {})
-        if isinstance(gq.get(str(g)), (int, float)) and gq.get(str(g)) > 0
+        if _num(gq.get(str(g))) and gq.get(str(g)) > 0
     ]
     if vals:
         return max(vals), "group"
     dq = cfg.get("default_quota_credits")
-    if isinstance(dq, (int, float)) and dq > 0:
+    if _num(dq) and dq > 0:
         return float(dq), "default"
     return None, "none"
 
@@ -387,12 +648,14 @@ def qk_time_multiplier(cfg: dict) -> float:
     sch = cfg.get("schedule") or {}
     now = qk_local_now(cfg)
     mult = 1.0
+    wm_raw = sch.get("weekend_multiplier", 1.0)
     try:
-        wm = float(sch.get("weekend_multiplier", 1.0))
+        wm = float(wm_raw) if _num(wm_raw) else 1.0
     except Exception:
         wm = 1.0
+    nm_raw = sch.get("night_multiplier", 1.0)
     try:
-        nm = float(sch.get("night_multiplier", 1.0))
+        nm = float(nm_raw) if _num(nm_raw) else 1.0
     except Exception:
         nm = 1.0
     if now.weekday() >= 5 and wm != 1.0:
@@ -455,27 +718,19 @@ class Filter:
         return True
 
     def _record(self, user: dict, model: str, tok: dict, rid: str = "") -> None:
-        rid = rid or f"{time.time_ns()}"
-        if not self._mark_seen(rid):
-            return
-        if not (user or {}).get("id"):
+        # orphan (no user yet) is stashed WITHOUT marking seen, so the same
+        # response id can be adopted and recorded later by outlet()/stream()
+        uid = (user or {}).get("id")
+        if not uid:
+            rid = rid or f"{time.time_ns()}"
             self._orphan[rid] = {"model": model, "tok": tok, "ts": time.time()}
             while len(self._orphan) > 256:
                 self._orphan.popitem(last=False)
             return
+        rid = rid or f"{time.time_ns()}"
+        if not self._mark_seen(rid):
+            return
         qk_record_usage(user, model, tok)
-
-    @staticmethod
-    def _estimate_from_body(body: dict) -> dict:
-        msgs = body.get("messages") or []
-        inp_chars = sum(len(str(m.get("content") or "")) for m in msgs[:-1] or [])
-        out_chars = len(str(msgs[-1].get("content") or "")) if msgs else 0
-        return {
-            "cached": 0.0,
-            "input": max(0.0, inp_chars / 4.0),
-            "output": max(0.0, out_chars / 4.0),
-            "cache_write": 0.0,
-        }
 
     # -- enforcement ----------------------------------------------------------
 
@@ -496,25 +751,39 @@ class Filter:
             cfg = qk_get_config()
             quota, source = qk_resolve_quota(cfg, user)
             if quota is None:
-                return body
+                return body  # unlimited
             mult = qk_time_multiplier(cfg)
             eff = quota * mult
             if eff <= 0:
-                return body
+                # multiplier zeroed the quota (e.g. night_multiplier=0): a
+                # hard block, not unlimited
+                raise QuotaBlocked(
+                    "Quota temporarily disabled: effective quota is 0 "
+                    "(time multiplier = {}). Contact admin to adjust the "
+                    "schedule multipliers.".format(round(mult, 3))
+                )
             try:
                 cpu_ = float(cfg.get("credits_per_usd") or 1000.0)
             except Exception:
                 cpu_ = 1000.0
             used = qk_period_used_usd(uid, cfg) * cpu_
             if used >= eff:
-                raise QuotaBlocked(
-                    self.valves.block_message.format(
+                try:
+                    msg = self.valves.block_message.format(
                         used=round(used, 1),
                         quota=round(eff, 1),
                         source=source,
                         mult=round(mult, 3),
                     )
-                )
+                except Exception:
+                    log.warning("quota-keeper block_message template invalid; using default")
+                    msg = Filter.Valves().block_message.format(
+                        used=round(used, 1),
+                        quota=round(eff, 1),
+                        source=source,
+                        mult=round(mult, 3),
+                    )
+                raise QuotaBlocked(msg)
             return body
         except QuotaBlocked:
             raise
@@ -530,6 +799,8 @@ class Filter:
         try:
             ev = event
             if isinstance(ev, str):
+                if '"usage"' not in ev:
+                    return event  # cheap pre-filter: no usage field, skip json.loads
                 s = ev.strip()
                 if s.startswith("data:"):
                     s = s[5:].strip()
@@ -542,11 +813,22 @@ class Filter:
             if not isinstance(ev, dict):
                 return event
             u = ev.get("usage")
+            if u is None and isinstance(ev.get("message"), dict):
+                # Anthropic message_start nests usage under "message"
+                u = ev["message"].get("usage")
             tok = qk_normalize_usage(u)
             if tok is None:
                 return event
             rid = str(ev.get("id") or f"stream-{time.time_ns()}")
             model = str(ev.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+            if rid in self._seen:
+                # Later partial usage for an already-recorded id: contribute
+                # its own fields additively (no new request). Anthropic sends
+                # input in message_start and cumulative output in
+                # message_delta, so plain addition matches the real totals;
+                # input is counted once from the first event.
+                qk_record_usage(__user__ or {}, model, tok, count_request=False)
+                return event
             self._record(__user__ or {}, model, tok, rid)
         except Exception as e:
             log.warning("quota-keeper stream error: %s", e)
@@ -565,19 +847,20 @@ class Filter:
             if tok is None and isinstance(choices, list) and choices:
                 tok = qk_normalize_usage((choices[0] or {}).get("usage"))
             rid = str(body.get("id") or "")
+            model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
             if tok is not None:
-                model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
-                self._record(__user__ or {}, model, tok, rid or f"outlet-{time.time_ns()}")
-            elif self.valves.estimate_unreported_tokens and rid:
-                # adopt usage stashed by stream() when user info was missing there
-                if rid in self._orphan and (__user__ or {}).get("id"):
-                    ent = self._orphan.pop(rid)
-                    qk_record_usage(__user__, ent["model"], ent["tok"])
-                elif (__user__ or {}).get("id") and body.get("messages"):
-                    est = self._estimate_from_body(body)
-                    model = str(body.get("model") or "unknown")
-                    if self._mark_seen(rid or f"est-{time.time_ns()}"):
-                        qk_record_usage(__user__, model, est)
+                self._record(__user__ or {}, model, tok, rid)
+            elif rid and (__user__ or {}).get("id") and rid in self._orphan:
+                # adopt usage stashed by stream() when user info was missing
+                # there (independent of estimate_unreported_tokens)
+                ent = self._orphan.pop(rid)
+                qk_record_usage(__user__, ent["model"], ent["tok"])
+            elif self.valves.estimate_unreported_tokens and (__user__ or {}).get("id"):
+                ch = (body.get("choices") or [{}])[0]
+                content = str((ch.get("message") or {}).get("content") or "")
+                if content:
+                    est = {"cached": 0.0, "input": 0.0, "output": len(content) / 4.0, "cache_write": 0.0}
+                    self._record(__user__, model, est, rid or f"est-{time.time_ns()}")
         except Exception as e:
             log.warning("quota-keeper outlet error: %s", e)
         return body
