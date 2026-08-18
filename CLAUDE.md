@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 **Quota Keeper** — a pair of Open WebUI plugin Functions that meter per-user token cost (web UI and direct API calls) and enforce credit quotas:
 
 - `quota_keeper_filter.py` — **Filter Function**: `inlet()` blocks requests over quota, `stream()`/`outlet()` record token usage (cached/input/output/cache_write) converted to USD via a pricing table.
-- `quota_keeper_admin.py` — **Event Function** (requires Open WebUI ≥ 0.10.0): on startup/enable registers `/api/v1/quota-keeper/*` admin API + `/quota` single-page admin UI onto `__app__`, and runs a background loop that refreshes the model pricing table.
+- `quota_keeper_admin.py` — **Event Function** (requires Open WebUI ≥ 0.10.0): on startup/enable registers `/api/v1/quota-keeper/*` admin API + `/quota` single-page UI (role-split: admin console vs personal card) onto `__app__`, and runs a background loop that refreshes the model pricing table.
 
 `quota_keeper_README.md` (user-facing install/config guide, Chinese) and `quota_keeper_HANDOFF.md` (detailed dev handoff with algorithms, known limitations, and roadmap — **read it before non-trivial changes**) are the authoritative docs.
 
@@ -24,17 +24,20 @@ Shared helpers (data dir, file locking, JSON cache, config schema, pricing fetch
 
 ## Architecture essentials
 
-- **Data**: all state lives in `$DATA_DIR/quota_keeper/` (default `/app/backend/data/quota_keeper/`): `config.json` (authoritative schema = `DEFAULT_CONFIG`), `ledger.json` (usage, written by Filter), `pricing_cache.json` (written by Event). Writes are atomic (tmp + fsync + os.replace) under an fcntl flock; the Open WebUI database is never touched.
+- **Data**: all state lives in `$DATA_DIR/quota_keeper/` (default `/app/backend/data/quota_keeper/`): `config.json` (authoritative schema = `DEFAULT_CONFIG`), `ledger.json` (usage, written by Filter), `pricing_cache.json` (written by Event), `recent.json` (last-200 ring buffer, written by Filter alongside the ledger). Writes are atomic (tmp + fsync + os.replace) under an fcntl flock; the Open WebUI database is never touched.
 - **Quota resolution priority**: per-user quota > max of user's group quotas > default > unlimited. Effective quota = resolved quota × time multiplier (night and weekend multipliers multiply; night window may span midnight).
-- **Cost model**: `credits_per_usd` (default 1000 credits = $1). Prices come from an upstream URL (LiteLLM flat format or models.dev nested format, auto-detected), cached per-1M-token.
-- **Price matching** (`qk_find_pricing`): override → exact → date-suffix-stripped exact → path suffix → path segment → longest substring (`contains`), with `.`↔`-` normalization. Unmatched models cost 0 and get flagged `priced=false` in the ledger.
+- **Cost model**: `credits_per_usd` (default 1000 credits = $1). Prices come from an upstream URL (LiteLLM flat format or models.dev nested format, auto-detected), cached per-1M-token. TOU (`config.tou`, see HANDOFF §5.7) multiplies the whole per-unit cost by the active tier's rate (peak/offpeak/normal windows + holidays; resolution models → providers → `default_policy`), orthogonal to quota multipliers; ledger records per-tier request counts and `cost_saved_usd`.
+- **Price matching** (`qk_find_pricing`): override → exact → date-suffix-stripped exact → path suffix → path segment → longest substring (`contains`), with `.`↔`-` normalization. Unmatched models cost 0 and get flagged `priced=false` in the ledger (per-request `unpriced_requests` counter drives the flag).
+- **API** (admin-only except `/me`): `GET/POST /config` (validate + deep-merge), `GET /users /groups /ledger`, `GET /pricing` (summary; `?full=1` for the editor), `GET /recent`, `GET /stats?from&to&user&model&granularity=hour|day` (server-side aggregation: KPI, stacked series, per-user/per-model rows), `POST /pricing/refresh`, `GET /pricing/match`; `GET /me` (`_require_user`, own-data-only) backs the non-admin card. Failures raise `HTTPException` (401/403) from the auth dependencies; router mount is deduped via `_mount_guard`; the pricing loop runs via `asyncio.create_task` (strong ref) + `asyncio.to_thread`.
 - **Fail-open**: the Filter logs and passes through on unexpected errors; admins bypass enforcement by default; background tasks (title/tag generation) are never blocked but still metered.
-- **Dedup**: usage is recorded once per response id (`_seen` OrderedDict, capped 4096).
+- **Dedup**: usage is recorded once per response id (`_seen` OrderedDict, capped 4096); orphan adoption in outlet is unconditional when the user is present.
 
 ## Known sharp edges (see HANDOFF §8 for full list)
 
 - Not yet verified against a real Open WebUI instance — `__user__`/`__metadata__` shapes and stream event formats vary by connector.
-- Function hot-reload can double-register the API router (page route has a dup check, API does not).
+- Router double-registration on hot-reload is guarded by `_mount_guard`, but `_pricing_task` is never cancelled on reload and old-prefix routes linger after an `api_prefix` valve change (HANDOFF §8.14/15).
+- TOU topups are additive — a cumulative-style usage reporter would double-count tokens/cost (HANDOFF §8.13).
+- Only cost/credits KPI cards carry sparklines (4 of 6 do not); `/me` `tou.current_tier` is a reserved null field (HANDOFF §8.16/17).
 - The lock degrades to a process-local `threading.Lock` without fcntl (Windows + multi-worker loses writes).
 - `contains` price matching can misfire between model families with very different prices — check the `how` field when debugging cost anomalies.
 

@@ -1,6 +1,6 @@
 # Quota Keeper for Open WebUI — 开发交接文档
 
-> 版本：v0.1.1（2026-08）· 状态：核心逻辑已实现并通过单元测试，未经生产验证
+> 版本：v0.2.0（2026-08）· 状态：核心逻辑已实现并通过单元测试，未经生产验证
 > 用途：bug 修复 / 后续开发交接。请先读完全文再动代码。
 
 ---
@@ -52,13 +52,16 @@ Open WebUI 实例
 │                 兼做 stream 阶段缺 user 信息时的 orphan 认领
 ├── Event(quota_keeper_admin)
 │   └── system.startup.completed / function.enable_started
-│       ├── app.include_router(api, prefix="/api/v1/quota-keeper")  # Depends(_require_admin)
-│       ├── app.get("/quota")  → 内嵌单页 HTML（QK_PAGE 常量，约200行 JS）
-│       └── create_task(_pricing_loop)  # 每600s检查，按 refresh_hours 真正刷新
+│       ├── app.include_router(qk_router, prefix=valves.api_prefix)  # 默认 /api/v1/quota-keeper
+│       ├── app.get(page_path)  → 内嵌单页 HTML（qk_build_page，约700行 JS），
+│       │                        __QK_API_PREFIX__ 占位符在挂载时替换
+│       └── self._pricing_task = create_task(_pricing_loop)  # 每600s检查，按 refresh_hours 刷新；
+│                                                            # 强引用保存在实例上
 └── $DATA_DIR/quota_keeper/          # DATA_DIR env，默认 /app/backend/data
     ├── config.json        # 全部配置（网页编辑产生）
     ├── ledger.json        # 记账账本（Filter 写，网页读）
     ├── pricing_cache.json # 价格表缓存（Event 写，Filter 读）
+    ├── recent.json        # 最近 200 条响应环缓冲（Filter 在记账时顺带写，dashboard 读）
     └── .lock              # fcntl 文件锁（Windows 退化为 threading.Lock）
 ```
 
@@ -82,15 +85,37 @@ Open WebUI 实例
     "timezone": null,                 // null→$TZ→UTC
     "night_start_hour": 22, "night_end_hour": 8,   // 可跨零点
     "night_multiplier": 1.0, "weekend_multiplier": 1.0
+  },
+  "tou": {                            // v0.2.0 分时计价（详见 §5.7）
+    "enabled": false,
+    "timezone": null,                 // null→schedule.timezone
+    "tiers": {                        // 每档 {rate, windows[]}; normal 可无 windows
+      "peak":    {"rate": 2.0, "windows": [{"days":[1,2,3,4,5],"start":"09:00","end":"12:00"},
+                                           {"days":[1,2,3,4,5],"start":"14:00","end":"18:00"}]},
+      "offpeak": {"rate": 0.5, "windows": [{"days":[0,1,2,3,4,5,6],"start":"00:30","end":"08:30"}]},
+      "normal":  {"rate": 1.0}
+    },
+    "holidays": [],                   // "YYYY-MM-DD" → 全天强制 offpeak
+    "default_policy": "off",          // off | normal；模型/提供方都未命中时
+    "providers": {},                  // 首段: {"enabled":bool,"tiers":{name:{"rate":x}}}；裸模型名 → "_default"
+    "models": {}                      // 精确模型 id: {"enabled":bool,"tiers":{...}}，优先级最高
   }
 }
 ```
 
 ### ledger.json 结构
 
-`users.<uid>.days.<YYYY-MM-DD> = {requests, cost_usd, tokens:{cached,input,output}, models:{<model>:{requests,cost_usd,tokens,priced}}}`。
-- 天 key 用**配置时区的本地日期**（qk_local_now）。
-- `priced=false`：该模型当期出现过无匹配且无兜底 → 记账 cost 0 + 网页打 unpriced 标签。注意它是"与"累积：一旦 false 不再翻回 true（`mm["priced"] = mm.get("priced",True) and priced`）。
+`users.<uid>.days.<YYYY-MM-DD> = {requests, cost_usd, tokens:{cached,input,output}, tou:{peak,offpeak,normal}, cost_saved_usd, hours:{<H>: {requests,cost_usd,tokens}}, models:{<model>:{requests,cost_usd,tokens,priced,unpriced_requests,tou,cost_saved_usd}}}`。
+- 天 key 用**配置时区的本地日期**（qk_local_now）；`hours` 桶（按本地小时，v0.2.0 新增，dashboard `granularity=hour` 消费；仅天级、不按模型）。
+- `priced` 由 `unpriced_requests`（每请求计数，v0.2.0 取代旧的 sticky "与"累积）派生：`mm["priced"] = mm.get("unpriced_requests",0) == 0`，语义向后兼容（出现过一次 unpriced 即 false）。`count_request=False` 的增量（Anthropic 部分 usage 合并的 topup）不递增任何请求计数、不递增 unpriced。
+- `tou`：逐日/逐模型记录各档请求数（peak/offpeak/normal）；`cost_saved_usd` = 按 normal 价应计成本 − 实际成本（TOU rate 折扣额）。
+- 旧账本缺这些字段时全部按 0/缺省读（向后兼容，无迁移）。
+
+### recent.json 结构（v0.2.0，dashboard「最近动态」）
+
+`{items: [{ts, user_id, name, email, model, tokens:{cached,input,output}, cost_usd, tou_tier, priced}]}`。
+- 环形缓冲，**上限 200 条**，`del items[:-200]` 淘汰最旧；Filter 在记账的同一把锁内顺带追加（与 ledger 一致），O(1) 小文件写。
+- `GET /recent` 返回 `items` **倒序**（最新在前）。文件不索引、不按请求留历史。
 
 ## 5. 核心算法
 
@@ -142,23 +167,43 @@ bedrock.us-east-1/anthropic.claude-3-5-haiku→contains / totally-unknown→None
 
 - 全部写操作走 `qk_lock()`（fcntl flock，跨 worker；Windows/异常退化为进程内 Lock——**多 worker + Windows 场景有丢写风险，见 §8**）。
 - 原子写：tmp + fsync + os.replace。
-- 读走 `_JsonCache`（mtime 失效缓存），记账读 ledger 用缓存，写时直读+加锁。
+- 读走 `_JsonCache`（mtime 失效缓存；v0.2.0 起键上文件 size，规避 mtime 粒度问题），记账读 ledger 用缓存，写时直读+加锁。
+
+### 5.7 分时计价 qk_tou_rate / qk_tou_resolve_policy（filter + admin 各一份，逻辑必须一致）
+
+- `qk_tou_resolve_policy(cfg, model_id)`：`models[精确 id]` → `providers[首段]`（裸模型名 → `_default`）→ `default_policy`（"off" 返回 None，不参与；"normal" 返回 `{}` 即 normal 档）。`enabled:false` 的策略返回 None。**先判 `tou.enabled`**，关闭时直接 None（rate 1.0）。
+- `qk_tou_rate(cfg, model_id, now)` 返回 `(rate, tier)`，tier `"off"` = 不适用（rate 1.0）：
+  1. 策略档级配置在全局 `tiers` 之上浅合并（`base.update(over)`，窗口与 rate 可部分覆盖）。
+  2. 时区：`tou.timezone` → `schedule.timezone` → `$TZ` → UTC（`qk_tou_local_now`）；day/hour 均按此时区判定。
+  3. 节假日：`holidays` 含当天 → 强制 offpeak；无 offpeak 档则取 peak/normal 中 rate 最低者。
+  4. 窗口命中（`_hit`）：`days` 用 JS 星期号（`(now.weekday()+1) % 7`，0=周日）；`start/end` 解析 HH:MM 为分钟；`start<=end` 时 `s<=cur<e`，跨零点（s>e）时 `cur>=s or cur<e`；解析失败跳过该窗。
+  5. 命中顺序 peak → offpeak → 兜底 normal。
+- 应用点：`qk_record_usage` 内对**整单** `cost = base_cost * rate`（cached+input+cache_write+output 全部乘 rate，DeepSeek 风格）；与 `schedule` 配额倍数正交（一个改价格、一个改配额上限）。
+- 已验证（tests/test_tou.py）：工作日 peak 窗 / offpeak 窗 / 窗外 normal / 周末无 peak / 未匹配模型 default off 不参与 / 模型覆盖优先于提供方 / 提供方档级 rate 覆盖 / 节假日强制 offpeak / 无 offpeak 档节假日取最低档 / 跨零点窗口 / 记账时 rate 应用与 `cost_saved_usd` 落账。
 
 ## 6. API 与页面
 
-路由（prefix 由 Event Valves `api_prefix` 控制，默认如下）：
+路由（prefix 由 Event Valves `api_prefix` 控制，默认 `/api/v1/quota-keeper`；**路由不再带 `/quota-keeper` 段**，v0.2.0 修复）：
 ```
-GET  /api/v1/quota-keeper/config           # 附加 _time_multiplier
-POST /api/v1/quota-keeper/config           # 网页保存（merge 后全量写）
-GET  /users /groups /ledger /pricing       # 数据源（users/groups 来自 OWUI DB）
-POST /pricing/refresh                      # {force}
-GET  /pricing/match?model=...              # {matched, how, price}
+GET  /config                        # 附加 _time_multiplier
+POST /config                        # 网页保存：schema 校验(400 on violation) + 深合并进盘上 config（部分 POST 不再重置兄弟键）
+GET  /users /groups /ledger         # 数据源（users/groups 来自 OWUI DB）
+GET  /pricing                       # 默认只回摘要 {url, fetched_at_iso, models}；?full=1 回全表（编辑器）
+GET  /recent                        # recent.json 倒序（最近 200 条，v0.2.0）
+GET  /stats?from&to&user&model&granularity=hour|day   # 服务端聚合（v0.2.0，详见 qk_stats）
+GET  /me                            # 自助（v0.2.0，仅 _require_user，强制本人数据）
+POST /pricing/refresh               # {force}；asyncio.to_thread 包装，不阻塞事件循环
+GET  /pricing/match?model=...       # {matched, how, price}
 ```
-全部经 `Depends(_require_admin)`（`open_webui.utils.auth.get_verified_user` + role==admin，401/403 JSON）。
+admin 路由全部经 `Depends(_require_admin)`（`open_webui.utils.auth.get_verified_user` + role==admin，失败 **raise HTTPException** 401/403，v0.2.0 修复）；`/me` 用 `_require_user`。挂载前经 `_mount_guard` 查 `__app__.routes` 防重复（v0.2.0 修复），页面路由另有 `path` 查重。
 
-页面 `/quota`（Valves `route_prefix`）：单页内嵌 HTML，fetch 同源 API；区块：General / 时段 / 价格源(含 Test match) / 组配额表 / 用户配额表(来源 tag + 用量进度条) / 当月 per-model 用量表(unpriced 标记)。
+页面 `/quota`（Valves `route_prefix`）：单页内嵌 HTML（`QK_PAGE` 常量 + `__QK_API_PREFIX__` 占位符，挂载时替换），按角色分流——`/me` 返回 role==admin 渲染完整控制台，否则渲染个人卡片（配额 + 进度条 + 倍数提示 + 用量明细 + 7 天趋势）。admin 区块：General / 时段 / TOU 编辑器（档位 + 窗口 + 提供方 + 模型 + 节假日，节假日支持一键从 date.nager.at `GET /api/v3/PublicHolidays/{year}/{CC}` 拉取，无 key）/ 价格源（Test match + 覆盖编辑器：搜索、分页、行内编辑、manual 徽标）/ 组配额表 / 用户配额表（来源 tag + 服务端算的进度条）/ 6 张 KPI 卡（成本与 credits 带手写 SVG sparkline）/ 时间跨度 24h·7d·30d·90d·custom（localStorage 持久化，24h 内走小时粒度）/ 堆叠趋势图 / 用户排行表（搜索 + 排序 + 点击下钻 per-model）/ 模型表（混合 $/M、unpriced 徽标、匹配目标按钮）/ 最近动态（手动刷新）/ CSV 导出（前端生成）。**页面无任何自动刷新/轮询**。
 
-Filter Valves：`enable_enforcement`(true)、`admins_bypass`(true)、`allow_background_tasks`(true, 后台任务放行但记账)、`estimate_unreported_tokens`(false, 按 chars/4 估算)、`block_message`(占位符 `{used}{quota}{source}{mult}`)。
+Filter Valves：`enable_enforcement`(true)、`admins_bypass`(true)、`allow_background_tasks`(true, 后台任务放行但记账)、`estimate_unreported_tokens`(false, 按 chars/4 估算)、`block_message`(占位符 `{used}{quota}{source}{mult}`；模板渲染失败回退默认文案并 log.warning，v0.2.0 修复)。
+
+### /me 响应结构
+
+`{user:{id,name,email,role}, quota, quota_source(user|group|default|none), multiplier, effective_quota, used_credits(按 quota_period 折算，月=当月美元×credits_per_usd，日=今日), today:{cost_usd,requests}, trend:[7 天 {day,requests,cost_usd}], tou:{current_tier:null(预留, 见代码注释)}}`。
 
 ## 7. 已验证内容（Pyodide 沙箱 + pydantic stub，非真实 OWUI 环境）
 
@@ -168,44 +213,61 @@ Filter Valves：`enable_enforcement`(true)、`admins_bypass`(true)、`allow_back
 - 配额解析：user 覆盖 / 组取 max / default / 不限，四态正确。
 - 时段倍数：四时间点正确（含跨零点、周末叠加）。
 - 成本计算：`(input×2.5 + cached×1.25 + output×10)/1e6` 精确一致；cache_write 计入。
-- 记账 round-trip：日聚合 + 模型聚合 + priced 标志 + retention 裁剪路径。
+- 记账 round-trip：日聚合 + 模型聚合 + priced 标志 + retention 裁剪路径（TZ-aware 裁剪）。
 - inlet 拦截：超限 raise QuotaBlocked（消息含 used/quota/source/mult）、admin bypass、无配额放行、夜间倍数收紧触发拦截而白天放行。
 - stream()：SSE str 与 dict 事件、按响应 id 去重（重复同 id 不重记）。
 - outlet()：非流式 body.usage、choices[0].usage 回退。
+
+v0.2.0 追加验证（tests/ 全量 42 例，2026-08-18）：
+- **auth**：`_require_admin`/`_require_user` 失败 raise HTTPException 401/403（不再返回 JSONResponse）。
+- **前缀**：路由单前缀挂载（挂载路径恰为 `/api/v1/quota-keeper/*`）；页面 `__QK_API_PREFIX__` 占位符替换。
+- **记账修复**：orphan 认领（stream 无 user → outlet 有 user+usage 恰好记一次；outlet 有 user 无 usage 也认领）、`block_message` 模板失败回退、`eff<=0` 有配额即拦截、bool 配额/倍数拒绝、`unpriced_requests` 逐请求计数可自愈、SSE 文本 `"usage"` 预筛、Anthropic 部分 usage 合并（`count_request=False` topup 不重复计数）。
+- **config**：schema 校验（类型/范围违规 400）+ 深合并（部分 POST 保留兄弟键）；JS `isNaN` 显式检查（0 可保存）。
+- **TOU**：见 §5.7 已验证列表。
+- **stats/recent/me**：/stats 聚合（hour/day 粒度、筛选、缓存率、配额进度数）、/recent 环形缓冲与倒序、/me 只返回本人数据、模型筛选下 day 序列不重复计费、/pricing 摘要 vs `?full=1`。
+- **运行时**：价格拉取走 `asyncio.to_thread` + `_pricing_task` 强引用；`_mount_guard` 防重复挂载。
 
 **未验证 / 需在真实环境确认**（见下节）。
 
 ## 8. 已知限制与潜在 bug（后续开发重点）
 
-按优先级排序：
+按优先级排序（v0.2.0 更新：原 §8.2 已修复，原 §8.4 已修复，编号顺移）：
 
 1. **真实 OWUI 集成未经测试**（最重要）：filter 的 `__user__` 注入形态（`group_ids` 是否存在）、`__metadata__.task` 后台任务标记、stream() 收到的 event 具体形状（字符串 SSE 还是 dict、终止 chunk 是否带 usage——官方文档明说"形状因 connector 而异"）、outlet 在 API 直连时是否被调用。**首先做一轮真机日志验证**（log.warning 已埋好）。
-2. **函数热重载重复注册**：`_installed` 是实例标志，OWUI 重载 function 模块会新建实例，`include_router` 可能重复挂载（API 405/多路由）；页面路由有 `path` 查重保护但 API 没有。修复方向：挂载前查 `__app__.routes` 是否已含 prefix，或改用 startup-only + Redis/disk 标志。
+2. ~~**函数热重载重复注册**~~ — **v0.2.0 已修复**：挂载前 `_mount_guard` 查 `__app__.routes` 是否已含 prefix 再 include_router；页面路由保留 `path` 查重。**残余**：`_mount_guard` 只防"已挂同前缀"，若 admin 改了 `api_prefix` Valve 再重载，旧前缀路由仍留在 `__app__.routes`（不会重复但残留空壳）；`self._pricing_task` 在重载/禁用时**从不取消**（旧 task 挂到新实例的 loop 上，可能双跑刷新）。
 3. **usage 可能漏计**：若上游流式响应从不返回 usage 且未开模型 Usage capability → 不记账。`estimate_unreported_tokens` 是粗略兜底（chars/4）。改进方向：主动给请求注入 `stream_options:{include_usage:true}`（参照 open-webui PR #23556 对 Bedrock 的做法）。
-4. **orphan 认领路径窄**：stream 阶段无 user 时存 `_orphan`，只有 outlet 且 `estimate_unreported_tokens=True` 且响应带同 id 才认领。真实环境若 API 直连根本不进 filter 的 outlet，这段逻辑无效（预期内：直连计量主要靠 stream 的 usage + `__user__` 注入）。
+4. ~~**orphan 认领路径窄**~~ — **v0.2.0 已修复**：outlet 有 user 时**无条件**认领同 id orphan（不再依赖 `estimate_unreported_tokens`）；无 user 的 stream 事件只占 orphan 槽不占 `_seen` 槽。**残余**：真实环境若 API 直连根本不进 filter 的 outlet，认领逻辑无效（预期内：直连计量主要靠 stream 的 usage + `__user__` 注入）。
 5. **Windows/无 fcntl 多 worker**：锁退化为进程内，SQLite 式丢写风险（atomic replace 可缓解但 ledger 读改写非事务）。修复方向：改 SQLite 或加版本号重试。
-6. **性能**：`qk_find_pricing` 每请求线性扫全表（LiteLLM 表 ~800 模型×4变体×5策略≈最坏 16k 次 endswith/in）；inlet 每次 JSON 全量读 ledger（ JC 缓存 mtime 失效，但大实例日积月累后 days/models 字典会变大）。retention 400 天默认偏长。修复方向：匹配结果 LRU 缓存；ledger 按期分文件。
+6. **性能**：`qk_find_pricing` 每请求线性扫全表（LiteLLM 表 ~800 模型×4变体×5策略≈最坏 16k 次 endswith/in）；inlet 每次 JSON 全量读 ledger（JC 缓存 mtime+size 失效，但大实例日积月累后 days/models 字典会变大）。retention 400 天默认偏长。修复方向：匹配结果 LRU 缓存；ledger 按期分文件。
 7. **quota_period 只有 daily/monthly**；无按年/按周；无"配额重置时点"自定义（now 本地自然日/月切换）。
 8. **配额粒度**：只有"当期总 credits"一种维度；无 per-model 独立额度（dartmouth 的 sponsored allowance 模式）、无请求数限制。`model_rpm/tpm` 类限速未做。
-9. **网页**：overrides 无编辑 UI（只能手改 config.json）；用户/组多时分页缺失；用量表只看当月且截断 200 行；无 CSV 导出。
-10. **价格匹配风险**：`contains` 策略可能误命中（如 `gpt-4o` 会 contains 命中 `gpt-4o-mini` 的 id 之外，反过来 `chatgpt-4o-latest` 类长 key 与短 key 竞争时取最长子串，但语义相近模型家族（4o-mini vs 4o）价格差 16 倍，误配代价高）。改进方向：exact/suffix 失败后先查"去 provider 前缀+去日期"的族匹配，contains 只作最后手段并在 UI 显示 how 供人工核对（现已显示）。
+9. **网页**：用户/组多时分页缺失；模型表/价格表分页为纯前端；用量明细只从 `/stats` 聚合出发。
+10. **价格匹配风险**：`contains` 策略可能误命中（如 `gpt-4o` 会 contains 命中 `gpt-4o-mini` 的 id 之外，反过来 `chatgpt-4o-latest` 类长 key 与短 key 竞争时取最长子串，但语义相近模型家族（4o-mini vs 4o）价格差 16 倍，误配代价高）。改进方向：exact/suffix 失败后先查"去 provider 前缀+去日期"的族匹配，contains 只作最后手段并在 UI 显示 how 供人工核对（已显示）。
 11. **安全**：页面与 API 仅靠 OWUI 会话 admin 校验；`/quota` 路径与 prune 一样无 CSP/额外防护，若实例暴露公网建议前置反代限流（OWUI 官方 hardening 建议）。
 12. **credits 语义**：成本为 0 的模型（本地 ollama、无匹配）不消耗配额 → 配额形同虚设；可考虑给 unpriced 模型配 tokens 计数维度或强制 default_pricing。
+
+v0.2.0 新增已知限制：
+
+13. **topup 加法重复计费**：Anthropic 部分 usage 合并用 `count_request=False` 补差，tokens/成本是**加法**累积——对"累计式"用量上报的 connector（每次事件给的是累计值而非增量），会导致 tokens/cost 翻倍。当前实现面向增量式上报（OpenAI 终值 / Anthropic message_delta 增量），**未做增量 vs 累计检测**。
+14. **`_pricing_task` 生命周期**：`create_task` 强引用存在 Event 实例上，但重载/禁用时不 cancel；两次热重载后旧 task 无人清理（低危：循环每 600s 唤醒，`refresh_hours` 未到不做事，但 `force` 手动刷新并发时可能双写 pricing_cache）。
+15. **`_mount_guard` 旧前缀残留**：改 `api_prefix` Valve 后重载，新前缀正常挂载，但旧前缀路由仍留在 `__app__.routes`（无功能影响，路由表脏）。
+16. **KPI sparkline 不全**：6 张 KPI 卡中仅成本与 credits 两张带 7 天 sparkline（手写 SVG），其余 4 张无（spec 原案 6 张全带，实现时收敛）。
+17. **`/me` 的 `tou.current_tier` 为占位 null**：页面拿到的是配额/倍数/趋势；当前档位字段预留未接（页面无 per-user 模型列表无从展示，见代码注释）。
 
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。
-- **P1 健壮性**：§8.1/2/3——注入 stream_options、防重复挂载、补 per-connector usage 测试矩阵（OpenAI/Anthropic/Ollama/Bedrock/OpenRouter）。
-- **P2 功能**：per-model 配额（config 加 `model_quotas`，解析时与总配额取 min 或独立账本）；请求数维度；quota 周期自定义；网页编辑 overrides；用量导出 CSV。
+- **P1 健壮性**：§8.1/3/13——注入 stream_options、补 per-connector usage 测试矩阵（OpenAI/Anthropic/Ollama/Bedrock/OpenRouter）、增量 vs 累计式用量检测；§8.14/15 `_pricing_task` cancel 与 `_mount_guard` 旧前缀清理。
+- **P2 功能**：per-model 配额（config 加 `model_quotas`，解析时与总配额取 min 或独立账本）；请求数维度；quota 周期自定义；补齐 6 张 KPI 卡 sparkline（§8.16）；`/me` 当前 TOU 档位（§8.17）。
 - **P3 性能/规模**：SQLite 后端（表：usage_day(user,model,day,cached,input,output,cost)）；匹配 LRU；大实例分页。
 - **P4 对齐上游**：关注 open-webui #23558（CUNY per-group limit PR 是否合并——若合并 builtin 化，本插件可退化为计量/计费层）；#23926 系（API usage 追踪 builtin 化）。
 
 ## 10. 快速上手（给 coding agent）
 
 1. 环境要求：Open WebUI ≥ 0.10.0（Event primitive + `__app__` 注入；Filter 部分兼容 0.6+）。
-2. 复现测试：文档 §7 的用例可在无 OWUI 依赖下跑（stub pydantic 即可，见本次会话测试代码模式：`sys.modules['pydantic']` 注入 `_BM`/`Field`）。
-3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6 中标注"两文件各一份"的）必须同步双文件，diff 检查。
-4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 三个 JSON。
+2. 复现测试：仓库 `tests/` 的 42 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中。
+3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6/5.7 中标注"两文件各一份"的）必须同步双文件，diff 检查。
+4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 四个 JSON（config/ledger/pricing_cache/recent）。
 5. 日志：全部 `log.warning/log.info`，前缀 `quota-keeper`，`docker logs` 可过滤。
 
 ## 11. 参考资料

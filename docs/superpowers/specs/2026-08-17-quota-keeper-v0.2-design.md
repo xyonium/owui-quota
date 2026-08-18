@@ -1,6 +1,6 @@
 # Quota Keeper v0.2.0 Design
 
-> Date: 2026-08-17 · Status: approved in brainstorming + spec review
+> Date: 2026-08-17 · Status: implemented (v0.2.0, 2026-08-18 — see task-9 report)
 > Scope: P0/P1 defect fixes + admin dashboard + per-user self-service + pricing overrides UI + DeepSeek-style time-of-use (TOU) tiered pricing.
 
 ## 0. Background
