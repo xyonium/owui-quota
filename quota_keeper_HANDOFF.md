@@ -259,6 +259,7 @@ v0.2.0 新增已知限制：
 v0.2.1 修复记录（真实实例首验发现）：
 
 20. ~~**SPA 兜底遮蔽插件路由（/quota 与全部 API 变 404）**~~ — **v0.2.1 已修复**。根因：OWUI 在 **import 时**就把 `SPAStaticFiles`（404 时回退 index.html）mount 到 `/`（`name="spa-static-files"`），v0.2.0 的 `_mount_guard` 在 `system.startup.completed` 事件里用 `include_router` **追加**路由，排在兜底之后永不命中——`GET /quota` 返回 SPA 外壳（HTTP 200，前端路由显示 404），API 返回 HTML，POST 返回 405。prune 插件之所以正常，是它的 `mount_routes` 在 `include_router` 后把新增路由 **splice 到 `spa-static-files` mount 之前**（其注释原话："routes appended during the startup event land after it and get shadowed"）。v0.2.1 采用同一方案，并把页面路由也并入同一个临时 router 一起 splice（顺带 `include_in_schema=False`，不再污染 /openapi.json）。同时补了 prune 的 **late-init 兜底**：任何事件到来时若本实例未挂载则挂载——热更新代码后下一个事件即完成清陈旧 + 重挂载，无需重启。诊断要点：HTTP 200 + HTML ≠ 路由活着，curl 看 body 或发 POST 看是否 405；`tests/test_endpoints.py` 末尾两个用例钉死该回归。
+21. ~~**OWUI auth 签名漂移导致全端点 401**~~ — **v0.2.2 已修复**。`_require_user` 原来 `await get_verified_user(request)`；但 `get_verified_user` 是**依赖式**函数 `get_verified_user(user=Depends(get_current_user))`，收的是 user——把 request 传进去在 `user.role` 处 AttributeError，被兜底成 401，页面与 API 全灭（真机症状：日志正常、路由命中、全部 401）。v0.2.2 改为手动驱动真实链路：`bearer_security(request)` 取 token（`HTTPBearer(auto_error=False)`）→ `get_current_user(request, response, background_tasks, auth_token)`（按 TypeError 逐级减参兼容旧签名）→ `get_verified_user(user)`（sync/async 都兼容）；`_require_user/_require_admin` 声明 `response`/`background_tasks` 参数由 FastAPI 注入真对象，cookie 刷新不丢。教训：**OWUI 的 auth 工具是 FastAPI 依赖不是普通函数，接入前先读签名**；测试桩已改成真实依赖式签名（并断言 `get_verified_user` 收到的是 user），另增未认证 401 用例。
 
 ## 9. 后续开发路线（按用户早前需求延伸）
 
@@ -271,7 +272,7 @@ v0.2.1 修复记录（真实实例首验发现）：
 ## 10. 快速上手（给 coding agent）
 
 1. 环境要求：Open WebUI ≥ 0.10.0（Event primitive + `__app__` 注入；Filter 部分兼容 0.6+）。
-2. 复现测试：仓库 `tests/` 的 51 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
+2. 复现测试：仓库 `tests/` 的 53 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
 3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6/5.7 中标注"两文件各一份"的）必须同步双文件，diff 检查。
 4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 四个 JSON（config/ledger/pricing_cache/recent）。
 5. 日志：全部 `log.warning/log.info`，前缀 `quota-keeper`，`docker logs` 可过滤。

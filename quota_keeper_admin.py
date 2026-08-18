@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.1
+version: 0.2.2
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from typing import Optional
 
 from pydantic import BaseModel, Field
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 
 log = logging.getLogger(__name__)
@@ -649,18 +649,74 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day"):
 # ==== Open WebUI integration ====
 
 
-async def _require_user(request: Request):
-    try:
-        from open_webui.utils.auth import get_verified_user
+async def _qk_resolve_user(request: Request, response: Response, background_tasks: BackgroundTasks):
+    """Resolve the OWUI session user, tolerating auth-signature drift across
+    OWUI versions.
 
-        user = await get_verified_user(request)
+    Current builds: get_current_user(request, response, background_tasks,
+    auth_token=Depends(bearer_security)); older ones took (request,
+    auth_token=...). And get_verified_user is dependency-style everywhere
+    supported -- it takes the resolved *user*, NOT the request (v0.2.1
+    called it with the request, it touched request.role, and every call
+    401'd).
+    """
+    try:
+        from open_webui.utils import auth as _auth
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"auth failed: {e}")
+        raise HTTPException(status_code=401, detail=f"auth unavailable: {e}")
+
+    auth_token = None
+    bearer = getattr(_auth, "bearer_security", None)
+    if bearer is not None:
+        try:
+            auth_token = await bearer(request)  # HTTPBearer(auto_error=False)
+        except Exception:
+            auth_token = None
+
+    user = None
+    attempts = (
+        {"response": response, "background_tasks": background_tasks, "auth_token": auth_token},
+        {"auth_token": auth_token},
+        {},
+    )
+    last_type_err = None
+    for kw in attempts:
+        try:
+            user = await _auth.get_current_user(request, **kw)
+            break
+        except TypeError as e:
+            last_type_err = e  # unexpected-kwarg mismatch -> retry narrower
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"auth failed: {e}")
+    else:
+        raise HTTPException(status_code=401, detail=f"auth failed: {last_type_err}")
+
+    gv = getattr(_auth, "get_verified_user", None)
+    if gv is not None:
+        try:
+            res = gv(user)
+            user = await res if asyncio.iscoroutine(res) else res
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=401, detail=f"auth failed: {e}")
+    if user is None:
+        raise HTTPException(status_code=401, detail="auth failed: no user")
     return user
 
 
-async def _require_admin(request: Request):
-    user = await _require_user(request)
+async def _require_user(
+    request: Request, response: Response, background_tasks: BackgroundTasks
+):
+    return await _qk_resolve_user(request, response, background_tasks)
+
+
+async def _require_admin(
+    request: Request, response: Response, background_tasks: BackgroundTasks
+):
+    user = await _require_user(request, response, background_tasks)
     if (getattr(user, "role", "") or "") != "admin":
         raise HTTPException(status_code=403, detail="admin only")
     return user

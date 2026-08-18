@@ -129,7 +129,8 @@
 
 | 现象 | 根因 | 处理 |
 |------|------|------|
-| 浏览器显示 404，但 curl 看到 `200` + HTML | **SPA 遮蔽**（v0.2.0 的 bug）：OWUI 在 import 时就把前端兜底挂到 `/`（`spa-static-files`），插件启动时 append 的路由排在其后永不命中；`/quota` 返回 SPA 外壳，由前端路由显示 404 | admin 函数升级到 >= 0.2.1（路由改为插入 `spa-static-files` mount 之前，方案同 prune 插件）。保存代码即自动重挂载，无需重启；也可以重启容器 |
+| 浏览器显示 404，但 curl 看到 `200` + HTML | **SPA 遮蔽**（v0.2.0 的 bug）：OWUI 在 import 时就把前端兜底挂到 `/`（`spa-static-files`），插件启动时 append 的路由排在其后永不命中；`/quota` 返回 SPA 外壳，由前端路由显示 404 | admin 函数升级到 >= 0.2.2（路由改为插入 `spa-static-files` mount 之前，方案同 prune 插件）。保存代码即自动重挂载，无需重启；也可以重启容器 |
+| 路由通了但页面/接口全部 `401`，detail 为 `auth failed: 'Request' object has no attribute 'role'` | v0.2.1 的 auth 兼容 bug：OWUI 的 `get_verified_user` 是 FastAPI 依赖函数（收 **user** 不是 request），按 request 调用导致全端点 401 | admin 函数升级到 >= 0.2.2（改为手动驱动 `bearer_security` -> `get_current_user` -> `get_verified_user` 真实链路，兼容新旧签名） |
 | 保存新代码后页面/接口还是旧行为 | Starlette 不能原地替换 handler，旧路由残留在路由表 | >= 0.2.1 保存后自动按路径清陈旧路由再重挂载；更旧的版本只能重启容器 |
 | 改了 `route_prefix` / `api_prefix` Valve | 保存 Valve 即触发重挂载，**新路径立即生效**；旧前缀路由找不到归属、残留在路由表直到重启（无害空壳） | 重启容器清掉旧前缀 |
 | 重启容器后全部 404 且日志没有 quota-keeper 行 | Event 函数未启用，或 OWUI < 0.10 不支持 Event 类型 | 启用函数 / 升级 OWUI |

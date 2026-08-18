@@ -25,9 +25,11 @@ def _app(load_admin):
 
 
 def _stub_self_user(monkeypatch, uid="u1", role="user"):
-    """Stub open_webui.utils.auth.get_verified_user to a plain (non-admin)
-    user. Mirrors conftest._stub_webui_auth, but the self-service /me route
-    must work for non-admins too."""
+    """Stub open_webui.utils.auth with the real dependency-style signatures
+    (current OWUI: get_current_user(request, response=, background_tasks=,
+    auth_token=) -> user; get_verified_user(user) -> user, sync). Mirrors
+    conftest._stub_webui_auth, but the self-service /me route must work for
+    non-admins too."""
     ow = types.ModuleType("open_webui")
     utils = types.ModuleType("open_webui.utils")
     auth = types.ModuleType("open_webui.utils.auth")
@@ -37,9 +39,16 @@ def _stub_self_user(monkeypatch, uid="u1", role="user"):
     U = type("U", (), {"id": uid, "name": "U", "email": f"{uid}@x.com",
                        "role": role, "group_ids": []})
 
-    async def get_verified_user(request):
+    async def get_current_user(request, **kw):
         return U()
 
+    def get_verified_user(user):
+        # dependency-style contract: receives the resolved user, never the
+        # request (v0.2.1 regression was calling it with the request)
+        assert hasattr(user, "role")
+        return user
+
+    auth.get_current_user = get_current_user
     auth.get_verified_user = get_verified_user
     utils.auth = auth
     ow.utils = utils
@@ -389,3 +398,48 @@ def test_late_init_remount_drops_stale_routes(load_admin):
     asyncio.run(ev2.event({}, __event_name__="chat.created", __id__="f1",
                           __app__=client.app))
     assert len(client.app.router.routes) == n_before
+
+
+# ---- auth chain compatibility (v0.2.2 root-cause fix) ------------------------
+
+
+def test_auth_chain_uses_dependency_style_signatures(load_admin, monkeypatch):
+    """Regression: current OWUI's get_verified_user takes the resolved *user*
+    (dependency-style); calling it with the request 401'd everything. The
+    stubs in conftest/_stub_self_user now mirror the real signatures and
+    assert the contract, so /me working here proves the chain is driven
+    correctly end to end."""
+    _stub_self_user(monkeypatch, uid="u1", role="user")
+    c, adm = _app(load_admin)
+    r = c.get("/api/v1/quota-keeper/me")
+    assert r.status_code == 200
+    assert r.json()["user"]["id"] == "u1"
+
+
+def test_unauthenticated_requests_401(load_admin, monkeypatch):
+    """get_current_user raising HTTPException(401) (no/invalid token) must
+    surface as 401 -- not be masked into a different error."""
+    from fastapi import HTTPException
+
+    ow = types.ModuleType("open_webui")
+    utils = types.ModuleType("open_webui.utils")
+    auth = types.ModuleType("open_webui.utils.auth")
+
+    async def get_current_user(request, **kw):
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    def get_verified_user(user):
+        return user
+
+    auth.get_current_user = get_current_user
+    auth.get_verified_user = get_verified_user
+    utils.auth = auth
+    ow.utils = utils
+    monkeypatch.setitem(sys.modules, "open_webui", ow)
+    monkeypatch.setitem(sys.modules, "open_webui.utils", utils)
+    monkeypatch.setitem(sys.modules, "open_webui.utils.auth", auth)
+
+    c, adm = _app(load_admin)
+    assert c.get("/api/v1/quota-keeper/me").status_code == 401
+    assert c.get("/api/v1/quota-keeper/me").json()["detail"] == "Invalid token"
+    assert c.get("/api/v1/quota-keeper/config").status_code == 401

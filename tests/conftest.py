@@ -69,10 +69,13 @@ def load_admin(tmp_path, monkeypatch):
 
 
 def _stub_webui_auth(monkeypatch):
-    """Make `open_webui.utils.auth.get_verified_user` resolve to a stub admin
-    user. The admin module imports it lazily at request time, so stubbing the
-    modules in sys.modules is enough (real open_webui is not installed in the
-    test env; see CLAUDE.md "no dependency manifest")."""
+    """Stub `open_webui.utils.auth` with the real dependency-style
+    signatures (current OWUI: `get_current_user(request, response=,
+    background_tasks=, auth_token=)` resolves the session user;
+    `get_verified_user(user)` is a sync role gate taking the *user*).
+    The admin module imports auth lazily at request time, so stubbing the
+    modules in sys.modules is enough (real open_webui is not installed in
+    the test env; see CLAUDE.md "no dependency manifest")."""
     ow = types.ModuleType("open_webui")
     utils = types.ModuleType("open_webui.utils")
     auth = types.ModuleType("open_webui.utils.auth")
@@ -84,9 +87,16 @@ def _stub_webui_auth(monkeypatch):
         role = "admin"
         group_ids = []
 
-    async def get_verified_user(request):
+    async def get_current_user(request, **kw):
         return AdminUser()
 
+    def get_verified_user(user):
+        # dependency-style contract: receives the resolved user, never the
+        # request (v0.2.1 regression was calling it with the request)
+        assert hasattr(user, "role")
+        return user
+
+    auth.get_current_user = get_current_user
     auth.get_verified_user = get_verified_user
     utils.auth = auth
     ow.utils = utils
