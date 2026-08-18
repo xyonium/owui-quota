@@ -63,3 +63,17 @@ def test_list_config_on_disk_recovers(admin_client):
     assert r.status_code == 200
     assert isinstance(r.json(), dict)
     assert r.json()["schedule"]["timezone"] == "UTC"
+
+
+def test_get_config_recovers_from_list_config(admin_client):
+    # Fix: GET /config used to 500 when the on-disk config.json parses to a
+    # non-dict (qk_merge_config called .items() on it). It must merge from an
+    # empty object and return the full defaults-shaped config.
+    c, adm = _app(admin_client)
+    adm.qk_atomic_write(adm.QK_CONFIG_PATH, ["not", "an", "object"])
+    r = c.get("/api/v1/quota-keeper/config")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body, dict)
+    assert body["credits_per_usd"] == 1000.0
+    assert body["pricing"]["refresh_hours"] == 24

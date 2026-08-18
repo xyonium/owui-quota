@@ -147,6 +147,8 @@ JC = _JsonCache()
 
 
 def qk_merge_config(cfg: dict) -> dict:
+    if not isinstance(cfg, dict):
+        cfg = {}
     base = json.loads(json.dumps(DEFAULT_CONFIG))
     for k, v in (cfg or {}).items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):

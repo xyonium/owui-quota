@@ -123,6 +123,8 @@ except Exception:
 
 
 def qk_merge_config(cfg: dict) -> dict:
+    if not isinstance(cfg, dict):
+        cfg = {}
     base = json.loads(json.dumps(DEFAULT_CONFIG))
     for k, v in (cfg or {}).items():
         if isinstance(v, dict) and isinstance(base.get(k), dict):
@@ -1559,7 +1561,7 @@ function collectOverrides(){
   const ov={};
   Object.entries(STATE.pe.orig).forEach(([key,row])=>{
     const out={};
-    FIELDS.forEach(f=>{out[f]=(row.cur[f]!==undefined)?row.cur[f]:row.orig[f]??null});
+    FIELDS.forEach(f=>{out[f]=(row.cur[f]??row.orig[f])??null});
     const changed=FIELDS.some(f=>out[f]!==row.orig[f]);
     const hasVal=FIELDS.some(f=>out[f]!==null&&out[f]!==undefined);
     if(hasVal&&(row.manual||changed))ov[key]=out;
