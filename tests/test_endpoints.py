@@ -273,16 +273,17 @@ def test_pricing_summary_vs_full(admin_client):
 
 
 def _fake_app():
-    """Minimal stand-in for Open WebUI's FastAPI app: records nothing, but
-    accepts the include_router/get calls event() makes."""
+    """Minimal stand-in for Open WebUI's FastAPI app: a route list behind
+    .router.routes, the include_router call event() makes, and .state for
+    the pricing task."""
     class App:
-        routes = []
-        def include_router(self, *a, **k):
-            pass
-        def get(self, *a, **k):
-            def deco(fn):
-                return fn
-            return deco
+        def __init__(self):
+            self.router = types.SimpleNamespace(routes=[])
+            self.state = types.SimpleNamespace()
+
+        def include_router(self, router, **k):
+            self.router.routes.extend(getattr(router, "routes", []))
+
     return App()
 
 
@@ -319,3 +320,72 @@ def test_pricing_loop_task_created_with_strong_ref(load_admin, monkeypatch):
     assert ev._pricing_task is not None
     assert ran == [True]
     assert ev._pricing_task.done()  # fake loop completed inside asyncio.run
+
+
+# ---- SPA catch-all shadowing (v0.2.1 root-cause fix) -------------------------
+
+
+def _spa_shell_app():
+    """FastAPI app emulating OWUI's route table: a catch-all SPA mount named
+    'spa-static-files' at '/', registered at 'import time' -- i.e. BEFORE any
+    plugin route. Anything reaching it gets the SPA HTML shell, which is what
+    rendered the client-side 404 for /quota before the splice fix."""
+    from starlette.responses import HTMLResponse
+
+    async def spa_asgi(scope, receive, send):
+        assert scope["type"] == "http"
+        await HTMLResponse("<!doctype html>spa-shell")(scope, receive, send)
+
+    app = FastAPI()
+    app.mount("/", spa_asgi, name="spa-static-files")
+    return app
+
+
+def _mount_via_event(adm, app, name="system.startup.completed"):
+    ev = adm.Event()
+    ev.valves.enable_background_pricing_refresh = False
+    asyncio.run(ev.event({}, __event_name__=name, __id__="f1", __app__=app))
+    return ev
+
+
+def test_routes_spliced_ahead_of_spa_catchall(load_admin):
+    """Regression: with OWUI's SPA mount present, /quota and the API must hit
+    OUR handlers (401 without auth -- open_webui is absent in tests), never
+    the SPA's 200 HTML shell. An unknown path must still fall through."""
+    adm = load_admin()
+    client = TestClient(_spa_shell_app())
+    ev = _mount_via_event(adm, client.app)
+
+    assert ev._installed is True
+    assert client.get("/quota").status_code == 401
+    assert client.get("/api/v1/quota-keeper/me").status_code == 401
+    assert client.get("/api/v1/quota-keeper/config").status_code == 401
+    # POST must reach our router too (the SPA mount only allows GET/HEAD and
+    # would answer 405 itself).
+    assert client.post("/api/v1/quota-keeper/config", json={}).status_code != 405
+    r = client.get("/definitely-not-a-plugin-path")
+    assert r.status_code == 200 and "spa-shell" in r.text
+
+
+def test_late_init_remount_drops_stale_routes(load_admin):
+    """Hot code update: a fresh Event instance remounts via the late-init net
+    (any event name); stale routes are dropped, so the route table does not
+    grow and ordering ahead of the SPA mount is preserved."""
+    adm = load_admin()
+    client = TestClient(_spa_shell_app())
+    ev1 = _mount_via_event(adm, client.app)
+    n1 = len(client.app.router.routes)
+
+    ev2 = _mount_via_event(adm, client.app, name="chat.created")  # any event
+    n2 = len(client.app.router.routes)
+
+    assert ev2._installed is True
+    assert n2 == n1  # stale dropped before re-add: no duplicates
+    assert client.get("/quota").status_code == 401
+
+    # An installed instance ignores unrelated events (no re-mount churn).
+    ev2.event  # bound method exists
+    n_before = len(client.app.router.routes)
+    asyncio.run(ev2.event({}, __event_name__="chat.created", __id__="f1",
+                          __app__=client.app))
+    assert len(client.app.router.routes) == n_before

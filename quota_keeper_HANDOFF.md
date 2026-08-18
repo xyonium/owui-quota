@@ -225,7 +225,7 @@ v0.2.0 追加验证（tests/ 全量 42 例，2026-08-18）：
 - **config**：schema 校验（类型/范围违规 400）+ 深合并（部分 POST 保留兄弟键）；JS `isNaN` 显式检查（0 可保存）。
 - **TOU**：见 §5.7 已验证列表。
 - **stats/recent/me**：/stats 聚合（hour/day 粒度、筛选、缓存率、配额进度数）、/recent 环形缓冲与倒序、/me 只返回本人数据、模型筛选下 day 序列不重复计费、/pricing 摘要 vs `?full=1`。
-- **运行时**：价格拉取走 `asyncio.to_thread` + `_pricing_task` 强引用；`_mount_guard` 防重复挂载。
+- **运行时**：价格拉取走 `asyncio.to_thread` + `_pricing_task` 强引用；`_mount_guard` 防重复挂载。**v0.2.1 起** `_mount_guard` 改为把路由 splice 到 OWUI 的 `spa-static-files` 兜底 mount 之前、并按路径清陈旧路由（SPA 遮蔽与热更新残留均有回归测试，见 `tests/test_endpoints.py` 末尾）；挂载路径已在真实实例（main-slim 构建）验证。
 
 **未验证 / 需在真实环境确认**（见下节）。
 
@@ -234,7 +234,7 @@ v0.2.0 追加验证（tests/ 全量 42 例，2026-08-18）：
 按优先级排序（v0.2.0 更新：原 §8.2 已修复，原 §8.4 已修复，编号顺移）：
 
 1. **真实 OWUI 集成未经测试**（最重要）：filter 的 `__user__` 注入形态（`group_ids` 是否存在）、`__metadata__.task` 后台任务标记、stream() 收到的 event 具体形状（字符串 SSE 还是 dict、终止 chunk 是否带 usage——官方文档明说"形状因 connector 而异"）、outlet 在 API 直连时是否被调用。**首先做一轮真机日志验证**（log.warning 已埋好）。
-2. ~~**函数热重载重复注册**~~ — **v0.2.0 已修复**：挂载前 `_mount_guard` 查 `__app__.routes` 是否已含 prefix 再 include_router；页面路由保留 `path` 查重。**残余**：`_mount_guard` 只防"已挂同前缀"，若 admin 改了 `api_prefix` Valve 再重载，旧前缀路由仍留在 `__app__.routes`（不会重复但残留空壳）；`self._pricing_task` 在重载/禁用时**从不取消**（旧 task 挂到新实例的 loop 上，可能双跑刷新）。
+2. ~~**函数热重载重复注册**~~ — **v0.2.0 已修复**：挂载前 `_mount_guard` 查 `__app__.routes` 是否已含 prefix 再 include_router；页面路由保留 `path` 查重。**v0.2.1 进一步**：改为先按当前 `route_prefix`/`api_prefix` 路径清陈旧路由再 splice 重挂（热更新保存代码即换新手柄，无需重启），`_pricing_task` 改存 `__app__.state`、重挂载时 cancel 旧 task 再建（不再泄漏）。**残余**：改前缀 Valve 后**旧前缀**路由无法按路径找到、仍残留到重启（Valve 描述已注明）。
 3. **usage 可能漏计**：若上游流式响应从不返回 usage 且未开模型 Usage capability → 不记账。`estimate_unreported_tokens` 是粗略兜底（chars/4）。改进方向：主动给请求注入 `stream_options:{include_usage:true}`（参照 open-webui PR #23556 对 Bedrock 的做法）。
 4. ~~**orphan 认领路径窄**~~ — **v0.2.0 已修复**：outlet 有 user 时**无条件**认领同 id orphan（不再依赖 `estimate_unreported_tokens`）；无 user 的 stream 事件只占 orphan 槽不占 `_seen` 槽。**残余**：真实环境若 API 直连根本不进 filter 的 outlet，认领逻辑无效（预期内：直连计量主要靠 stream 的 usage + `__user__` 注入）。
 5. **Windows/无 fcntl 多 worker**：锁退化为进程内，SQLite 式丢写风险（atomic replace 可缓解但 ledger 读改写非事务）。修复方向：改 SQLite 或加版本号重试。
@@ -249,12 +249,16 @@ v0.2.0 追加验证（tests/ 全量 42 例，2026-08-18）：
 v0.2.0 新增已知限制：
 
 13. **topup 加法重复计费**：Anthropic 部分 usage 合并用 `count_request=False` 补差，tokens/成本是**加法**累积——对"累计式"用量上报的 connector（每次事件给的是累计值而非增量），会导致 tokens/cost 翻倍。当前实现面向增量式上报（OpenAI 终值 / Anthropic message_delta 增量），**未做增量 vs 累计检测**。（v0.2.0 收尾修复：`recent.json` **不再记录 topup 行**——`count_request=False` 是已记账响应的一次补充合并而非新响应，feed 只收整请求；`/recent` 的 200 条因此与 ledger 的 requests 计数一致。）
-14. **`_pricing_task` 生命周期**：`create_task` 强引用存在 Event 实例上，但重载/禁用时不 cancel；两次热重载后旧 task 无人清理（低危：循环每 600s 唤醒，`refresh_hours` 未到不做事，但 `force` 手动刷新并发时可能双写 pricing_cache）。
-15. **`_mount_guard` 旧前缀残留**：改 `api_prefix` Valve 后重载，新前缀正常挂载，但旧前缀路由仍留在 `__app__.routes`（无功能影响，路由表脏）。
+14. ~~**`_pricing_task` 生命周期**~~ — **v0.2.1 已修复**：task 改存 `__app__.state.quota_keeper_pricing_task`，每次（重）挂载先 cancel 旧 task 再按需重建；热更新/改 Valve 不再泄漏后台循环。
+15. **`_mount_guard` 旧前缀残留**：改 `api_prefix` Valve 后重载，新前缀正常挂载，但旧前缀路由仍留在 `__app__.routes`（无功能影响，路由表脏；重启清除）。
 16. **KPI sparkline 不全**：6 张 KPI 卡中仅成本与 credits 两张带 7 天 sparkline（手写 SVG），其余 4 张无（spec 原案 6 张全带，实现时收敛）。
 17. **`/me` 的 `tou.current_tier` 为占位 null**：页面拿到的是配额/倍数/趋势；当前档位字段预留未接（页面无 per-user 模型列表无从展示，见代码注释）。
 18. **TOU 时间窗 `days: []` = 每天**：`qk_tou_rate` 的 `_hit` 用 `w.get("days") or list(range(7))` 兜底，空列表（或缺省）等于全周命中；校验器 `qk_validate_config` 对空列表放行（合法值域 ints 0-6，允许空）。若未来想让"空列表 = 永不命中"，需同时改 `_hit` 与校验器与编辑器。
 19. **TOU 时间窗 `start/end` 范围校验**：`qk_validate_config` 在 HH:MM 形状之外校验 0<=hh<=23、0<=mm<=59（错误信息形如 `tou.tiers.peak.windows[0].start must be HH:MM 00:00-23:59`）。
+
+v0.2.1 修复记录（真实实例首验发现）：
+
+20. ~~**SPA 兜底遮蔽插件路由（/quota 与全部 API 变 404）**~~ — **v0.2.1 已修复**。根因：OWUI 在 **import 时**就把 `SPAStaticFiles`（404 时回退 index.html）mount 到 `/`（`name="spa-static-files"`），v0.2.0 的 `_mount_guard` 在 `system.startup.completed` 事件里用 `include_router` **追加**路由，排在兜底之后永不命中——`GET /quota` 返回 SPA 外壳（HTTP 200，前端路由显示 404），API 返回 HTML，POST 返回 405。prune 插件之所以正常，是它的 `mount_routes` 在 `include_router` 后把新增路由 **splice 到 `spa-static-files` mount 之前**（其注释原话："routes appended during the startup event land after it and get shadowed"）。v0.2.1 采用同一方案，并把页面路由也并入同一个临时 router 一起 splice（顺带 `include_in_schema=False`，不再污染 /openapi.json）。同时补了 prune 的 **late-init 兜底**：任何事件到来时若本实例未挂载则挂载——热更新代码后下一个事件即完成清陈旧 + 重挂载，无需重启。诊断要点：HTTP 200 + HTML ≠ 路由活着，curl 看 body 或发 POST 看是否 405；`tests/test_endpoints.py` 末尾两个用例钉死该回归。
 
 ## 9. 后续开发路线（按用户早前需求延伸）
 
@@ -267,7 +271,7 @@ v0.2.0 新增已知限制：
 ## 10. 快速上手（给 coding agent）
 
 1. 环境要求：Open WebUI ≥ 0.10.0（Event primitive + `__app__` 注入；Filter 部分兼容 0.6+）。
-2. 复现测试：仓库 `tests/` 的 42 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中。
+2. 复现测试：仓库 `tests/` 的 51 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
 3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6/5.7 中标注"两文件各一份"的）必须同步双文件，diff 检查。
 4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 四个 JSON（config/ledger/pricing_cache/recent）。
 5. 日志：全部 `log.warning/log.info`，前缀 `quota-keeper`，`docker logs` 可过滤。

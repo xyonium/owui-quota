@@ -82,3 +82,62 @@
 | allow_background_tasks | true | 后台任务放行（仍记账） |
 | estimate_unreported_tokens | false | 上游不报 usage 时按字符/4 估算（非账单级） |
 | block_message | … | 拦截提示文案，可用 {used} {quota} {source} {mult} 占位符 |
+
+## 调试与排障
+
+### 不打开页面，怎么确认插件在运行？
+
+1. **看容器日志**（最直接）：
+
+   ```bash
+   docker logs open-webui 2>&1 | grep quota-keeper
+   ```
+
+   启动后应出现两行健康标志：
+
+   - `quota-keeper API mounted at /api/v1/quota-keeper`
+   - `quota-keeper admin page at /quota`
+
+   保存/更新函数代码后重挂载会多一行 `quota-keeper refreshed N stale route(s)`；出现 `quota-keeper setup failed: ...` 说明挂载失败（带上该行报错排查）。**一条 quota-keeper 日志都没有** = Event 函数根本没运行：到 Admin Panel -> Functions 确认它是 Enabled，且 Open WebUI >= 0.10.0（Event 类型从该版本引入，旧版本的函数类型列表里没有 Event）。
+
+2. **API 探针**（Admin Panel -> Settings -> Account 生成 API Key 后）：
+
+   ```bash
+   curl -sS -o /tmp/qk.out -w "%{http_code}\n" \
+     -H "Authorization: Bearer <API_KEY>" \
+     https://你的实例/api/v1/quota-keeper/me
+   head -c 120 /tmp/qk.out
+   ```
+
+   | 结果 | 含义 |
+   |------|------|
+   | `200` + JSON（有 `"quota"` 等字段） | 插件正常 |
+   | `401/403` + JSON | 路由活着，是凭证/权限问题（换 admin key 重试；`/me` 任何登录用户可用，其余端点要 admin） |
+   | `200` 但内容以 `<!doctype html>` 开头 | **请求没到插件**。结合日志区分：日志里有 "API mounted" 却返回 HTML = 被前端 SPA 兜底路由遮蔽（v0.2.0 的 bug，见下表）；日志里没有 = Event 函数没运行（未启用 / OWUI 版本过低） |
+
+3. **看数据文件**（验证 Filter 侧在记账）：
+
+   ```bash
+   docker exec open-webui ls -l /app/backend/data/quota_keeper/
+   ```
+
+   发一条测试消息后 `ledger.json` / `recent.json` 的 mtime 应更新；`pricing_cache.json` 的 `fetched_at_iso` 新鲜说明价格表后台刷新在跑。
+
+4. **页面判别**：`curl -s https://你的实例/quota | grep -c quota-keeper` —— 大于 0 是本插件页面；为 0 则是 OWUI 的 SPA 外壳（浏览器里会被前端路由渲染成它的 404 页）。
+
+### 404 / 页面打不开对照表
+
+| 现象 | 根因 | 处理 |
+|------|------|------|
+| 浏览器显示 404，但 curl 看到 `200` + HTML | **SPA 遮蔽**（v0.2.0 的 bug）：OWUI 在 import 时就把前端兜底挂到 `/`（`spa-static-files`），插件启动时 append 的路由排在其后永不命中；`/quota` 返回 SPA 外壳，由前端路由显示 404 | admin 函数升级到 >= 0.2.1（路由改为插入 `spa-static-files` mount 之前，方案同 prune 插件）。保存代码即自动重挂载，无需重启；也可以重启容器 |
+| 保存新代码后页面/接口还是旧行为 | Starlette 不能原地替换 handler，旧路由残留在路由表 | >= 0.2.1 保存后自动按路径清陈旧路由再重挂载；更旧的版本只能重启容器 |
+| 改了 `route_prefix` / `api_prefix` Valve | 保存 Valve 即触发重挂载，**新路径立即生效**；旧前缀路由找不到归属、残留在路由表直到重启（无害空壳） | 重启容器清掉旧前缀 |
+| 重启容器后全部 404 且日志没有 quota-keeper 行 | Event 函数未启用，或 OWUI < 0.10 不支持 Event 类型 | 启用函数 / 升级 OWUI |
+| `/quota` 返回 401/403 | 未登录或会话失效；页面要求 admin 会话，普通用户的自助卡片数据走 `/me` | 先登录 OWUI；API 用 `Authorization: Bearer` |
+| 用 `:main` / `:main-slim` 滚动镜像，重启后行为变了 | 滚动 tag 每次拉新构建，行为可能变化 | `docker exec open-webui env \| grep WEBUI_BUILD_VERSION` 记录当前构建；生产建议锁定 release tag |
+
+### 端到端验证计量
+
+1. 用一个普通用户发一条短消息；
+2. `recent.json` 里出现新条目（admin 也可调 `/api/v1/quota-keeper/recent` 查看）；
+3. 该用户打开 `/quota` 卡片，今日用量 +1。

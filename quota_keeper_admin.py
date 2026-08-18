@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.0
+version: 0.2.1
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1704,12 +1704,62 @@ def qk_build_page(api_prefix: str) -> str:
     return QK_PAGE.replace("__QK_API_PREFIX__", api_prefix)
 
 
-def _mount_guard(app, prefix: str) -> bool:
-    """Idempotently attach the API router; True when already mounted."""
-    if any(getattr(r, "path", None) == f"{prefix}/config" for r in app.routes):
-        return True
-    app.include_router(qk_router, prefix=prefix)
-    return False
+def _mount_guard(app, page_path: str, api_prefix: str) -> int:
+    """(Re)attach the page + API routes ahead of OWUI's SPA catch-all mount.
+
+    OWUI mounts SPAStaticFiles at "/" (name "spa-static-files") at import
+    time; routes merely appended later land after it and are shadowed -- the
+    page then serves the OWUI SPA shell (which renders its client-side 404)
+    and the APIs return HTML instead of JSON. Splice ours in just before
+    that mount instead (same workaround as the prune plugin this web mode is
+    modeled on).
+
+    Starlette cannot swap a route's handler in place, so after a hot code
+    update the previous module's routes would keep serving until restart.
+    Drop our stale routes by path first so the fresh handlers take effect at
+    once. Routes under a *changed* prefix cannot be found this way and still
+    linger until restart (see valve descriptions).
+
+    Returns the number of stale routes dropped.
+    """
+    routes = app.router.routes
+    stale = [
+        r
+        for r in routes
+        if getattr(r, "path", None) in (page_path, api_prefix)
+        or str(getattr(r, "path", "")).startswith(api_prefix + "/")
+    ]
+    if stale:
+        stale_ids = {id(r) for r in stale}
+        routes[:] = [r for r in routes if id(r) not in stale_ids]
+
+    router = APIRouter()
+
+    @router.get(
+        page_path, include_in_schema=False, dependencies=[Depends(_require_admin)]
+    )
+    async def _qk_page(request: Request):
+        return HTMLResponse(qk_build_page(api_prefix))
+
+    router.include_router(qk_router, prefix=api_prefix)
+
+    before = len(routes)
+    app.include_router(router)
+    added = routes[before:]
+    # The SPA mount is added at OWUI import time, long before any plugin
+    # route, so spa_i < before holds and the index stays valid after del.
+    spa_i = next(
+        (
+            i
+            for i, r in enumerate(routes)
+            if getattr(r, "name", None) == "spa-static-files"
+        ),
+        None,
+    )
+    if spa_i is not None and added:
+        del routes[before:]
+        routes[spa_i:spa_i] = added
+    return len(stale)
 
 
 # ==== Router ====
@@ -1862,11 +1912,12 @@ async def _pricing_loop():
 class Event:
     class Valves(BaseModel):
         route_prefix: str = Field(
-            default="/quota", description="Path of the admin UI page"
+            default="/quota",
+            description="Path of the admin UI page (after changing, the old path stays registered until restart)",
         )
         api_prefix: str = Field(
             default="/api/v1/quota-keeper",
-            description="Base path for config/pricing APIs",
+            description="Base path for config/pricing APIs (after changing, the old path stays registered until restart)",
         )
         enable_background_pricing_refresh: bool = Field(
             default=True, description="Periodically refresh the pricing table"
@@ -1885,38 +1936,46 @@ class Event:
         __app__=None,
         **kwargs,
     ):
-        if __event_name__ not in (
-            "system.startup.completed",
+        name = __event_name__ or ""
+        if not name or __app__ is None:
+            return
+        subject = (event or {}).get("subject") or {}
+        subject_id = subject.get("id") if isinstance(subject, dict) else None
+        own_lifecycle = subject_id == __id__ and name in (
             "function.enable_started",
-        ):
-            return
-        subject = (event.get("subject") or {}).get("id")
-        if __event_name__ == "function.enable_started" and subject != __id__:
-            return
-        if __app__ is None or self._installed:
+            "function.updated",
+            "function.valves_updated",
+        )
+        # Late-init safety net (prune pattern): a hot code update swaps in a
+        # fresh instance that has never mounted, while the previous module's
+        # routes may still be in the table. Remount on the first event that
+        # arrives so the new handlers take effect without a server restart.
+        if name != "system.startup.completed" and not own_lifecycle and self._installed:
             return
         try:
-            _mount_guard(__app__, self.valves.api_prefix)
-            self._installed = True
-            log.info("quota-keeper API mounted at %s", self.valves.api_prefix)
-
-            page_path = self.valves.route_prefix
+            page_path = (self.valves.route_prefix or "/quota").strip()
             if not page_path.startswith("/"):
                 page_path = "/" + page_path
+            if page_path == "/":
+                page_path = "/quota"  # an empty valve would shadow the SPA at "/"
+            stale = _mount_guard(__app__, page_path, self.valves.api_prefix)
+            if stale:
+                log.info("quota-keeper refreshed %d stale route(s)", stale)
+            if not self._installed:
+                log.info("quota-keeper API mounted at %s", self.valves.api_prefix)
+                log.info("quota-keeper admin page at %s", page_path)
+            self._installed = True
 
-            async def _page(request: Request):
-                return HTMLResponse(qk_build_page(self.valves.api_prefix))
-
-            # avoid duplicate page routes across reloads
-            if not any(
-                getattr(r, "path", None) == page_path for r in __app__.routes
-            ):
-                __app__.get(
-                    page_path, dependencies=[Depends(_require_admin)]
-                )(_page)
-            log.info("quota-keeper admin page at %s", page_path)
-
+            # The pricing loop is tracked on app.state so a hot code update
+            # cancels the previous module instance's loop instead of leaking
+            # one background task per save (HANDOFF §8.14).
+            task = getattr(__app__.state, "quota_keeper_pricing_task", None)
+            if task is not None and not task.done():
+                task.cancel()
             if self.valves.enable_background_pricing_refresh:
                 self._pricing_task = asyncio.create_task(_pricing_loop())
+                __app__.state.quota_keeper_pricing_task = self._pricing_task
+            else:
+                __app__.state.quota_keeper_pricing_task = None
         except Exception as e:
             log.warning("quota-keeper setup failed: %s", e)
