@@ -42,7 +42,11 @@
 ## 分时计价（TOU，DeepSeek 式峰谷价格）
 
 - 配置 `tou.enabled` 开启；`tou` 下分 `peak / offpeak / normal` 三档，每档一个 `rate` 倍数和若干时间窗 `windows`（`days` 用 JS 星期号 0=周日…6=周六，`start/end` 为 HH:MM，可跨零点）。
-- 命中规则：`models[精确模型 id]` → `providers[模型 id 首段]` → `default_policy`（off=不参与 / normal=按 normal 档）。`holidays` 里的日期全天强制 offpeak（无 offpeak 档则取最低 rate 档）。
+- 命中规则：`models[精确模型 id]` → `providers[模型 id 首段]` → `default_policy`。`holidays` 里的日期全天强制 offpeak（无 offpeak 档则取最低 rate 档）。
+- `default_policy` 语义（针对未在 `providers`/`models` 里配置的模型）：
+  - `"off"`：未配置 provider 的模型不参与峰谷计费（rate 恒为 1，账本标记 tier=off）。**建议保持 off**。
+  - `"normal"`：未配置 provider 的模型按全局 `tiers` 窗口参与计费（仍会命中 peak/offpeak 窗口，只是无 provider 级覆盖）。
+- 时间窗 `days` 为空列表（或缺省）表示每天。
 - 命中档位的 rate 乘以**整单价格**（cached+input+cache_write+output，DeepSeek 风格），与配额倍数（`schedule`）互不影响——前者改价格、后者改配额上限。
 - 账本逐日/逐模型记录各档请求数 `tou` 与折扣金额 `cost_saved_usd`（= 按 normal 价算的成本 − 实际成本）；`/me` 与管理台显示当前用户所处档位。
 

@@ -86,6 +86,37 @@ def test_midnight_spanning_window(qk):
     assert tier == "offpeak"
 
 
+def _tou_post_body(**win_over):
+    return {"tou": {"enabled": True, "tiers": {
+        "peak": {"rate": 2.0, "windows": [
+            dict({"days": [1, 2, 3, 4, 5], "start": "09:00", "end": "12:00"}, **win_over)
+        ]},
+    }}}
+
+
+def test_tou_window_hour_25_rejected(admin_client):
+    # Fix: HH:MM shape alone accepted "25:00"; the hour range must be 0-23.
+    c, _ = admin_client()
+    r = c.post("/api/v1/quota-keeper/config", json=_tou_post_body(start="25:00"))
+    assert r.status_code == 400
+    assert "windows[0].start" in r.text and "00:00-23:59" in r.text
+
+
+def test_tou_window_minute_60_rejected(admin_client):
+    c, _ = admin_client()
+    r = c.post("/api/v1/quota-keeper/config", json=_tou_post_body(end="12:60"))
+    assert r.status_code == 400
+    assert "windows[0].end" in r.text
+
+
+def test_tou_window_boundaries_accepted(admin_client):
+    # 00:00 and 23:59 are legal; empty days list (all days) stays legal.
+    c, _ = admin_client()
+    r = c.post("/api/v1/quota-keeper/config", json=_tou_post_body(
+        start="00:00", end="23:59", days=[]))
+    assert r.status_code == 200
+
+
 def test_record_applies_tou_and_saves(qk, monkeypatch):
     cfg = _cfg(qk)
     qk.qk_atomic_write(qk.QK_CONFIG_PATH, cfg)

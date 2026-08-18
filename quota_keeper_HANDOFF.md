@@ -248,11 +248,13 @@ v0.2.0 追加验证（tests/ 全量 42 例，2026-08-18）：
 
 v0.2.0 新增已知限制：
 
-13. **topup 加法重复计费**：Anthropic 部分 usage 合并用 `count_request=False` 补差，tokens/成本是**加法**累积——对"累计式"用量上报的 connector（每次事件给的是累计值而非增量），会导致 tokens/cost 翻倍。当前实现面向增量式上报（OpenAI 终值 / Anthropic message_delta 增量），**未做增量 vs 累计检测**。
+13. **topup 加法重复计费**：Anthropic 部分 usage 合并用 `count_request=False` 补差，tokens/成本是**加法**累积——对"累计式"用量上报的 connector（每次事件给的是累计值而非增量），会导致 tokens/cost 翻倍。当前实现面向增量式上报（OpenAI 终值 / Anthropic message_delta 增量），**未做增量 vs 累计检测**。（v0.2.0 收尾修复：`recent.json` **不再记录 topup 行**——`count_request=False` 是已记账响应的一次补充合并而非新响应，feed 只收整请求；`/recent` 的 200 条因此与 ledger 的 requests 计数一致。）
 14. **`_pricing_task` 生命周期**：`create_task` 强引用存在 Event 实例上，但重载/禁用时不 cancel；两次热重载后旧 task 无人清理（低危：循环每 600s 唤醒，`refresh_hours` 未到不做事，但 `force` 手动刷新并发时可能双写 pricing_cache）。
 15. **`_mount_guard` 旧前缀残留**：改 `api_prefix` Valve 后重载，新前缀正常挂载，但旧前缀路由仍留在 `__app__.routes`（无功能影响，路由表脏）。
 16. **KPI sparkline 不全**：6 张 KPI 卡中仅成本与 credits 两张带 7 天 sparkline（手写 SVG），其余 4 张无（spec 原案 6 张全带，实现时收敛）。
 17. **`/me` 的 `tou.current_tier` 为占位 null**：页面拿到的是配额/倍数/趋势；当前档位字段预留未接（页面无 per-user 模型列表无从展示，见代码注释）。
+18. **TOU 时间窗 `days: []` = 每天**：`qk_tou_rate` 的 `_hit` 用 `w.get("days") or list(range(7))` 兜底，空列表（或缺省）等于全周命中；校验器 `qk_validate_config` 对空列表放行（合法值域 ints 0-6，允许空）。若未来想让"空列表 = 永不命中"，需同时改 `_hit` 与校验器与编辑器。
+19. **TOU 时间窗 `start/end` 范围校验**：`qk_validate_config` 在 HH:MM 形状之外校验 0<=hh<=23、0<=mm<=59（错误信息形如 `tou.tiers.peak.windows[0].start must be HH:MM 00:00-23:59`）。
 
 ## 9. 后续开发路线（按用户早前需求延伸）
 

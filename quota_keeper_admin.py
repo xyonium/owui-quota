@@ -204,8 +204,14 @@ def qk_validate_config(cfg) -> list:
                         errs.append(f"tou.tiers.{tname}.windows[{wi}].days must be a list of ints 0-6")
                     for hh in ("start", "end"):
                         v = w.get(hh)
-                        if v is not None and (not isinstance(v, str) or not re.match(r"^\d{2}:\d{2}$", v)):
+                        if v is None:
+                            continue
+                        if not isinstance(v, str) or not re.match(r"^\d{2}:\d{2}$", v):
                             errs.append(f"tou.tiers.{tname}.windows[{wi}].{hh} must be HH:MM")
+                        else:
+                            h_, m_ = int(v[:2]), int(v[3:])
+                            if not (0 <= h_ <= 23 and 0 <= m_ <= 59):
+                                errs.append(f"tou.tiers.{tname}.windows[{wi}].{hh} must be HH:MM 00:00-23:59")
     return errs
 
 
@@ -261,7 +267,8 @@ def qk_tou_resolve_policy(cfg: dict, model_id: str):
 def qk_tou_rate(cfg: dict, model_id: str, now) -> tuple:
     """Returns (rate, tier). Tier 'off' means TOU does not apply (rate 1.0).
     Window days use JS-style numbering (0=Sunday .. 6=Saturday) so the
-    default offpeak `days: [0..6]` covers every day of the week."""
+    default offpeak `days: [0..6]` covers every day of the week.
+    `days: []` (or missing) means every day."""
     tou = cfg.get("tou") or {}
     pol = qk_tou_resolve_policy(cfg, model_id)
     if pol is None:
@@ -1537,21 +1544,25 @@ function peEdit(inp){
   row.cur[inp.dataset.f]=isNaN(v)?null:v;
 }
 function collectOverrides(){
-  // read the live inputs into row.cur; empty field -> null (keep original)
-  document.querySelectorAll('[data-pk]').forEach(inp=>{
-    const row=STATE.pe.orig[inp.dataset.pk];if(!row)return;
-    const v=parseFloat(inp.value);
-    row.cur[inp.dataset.f]=isNaN(v)?null:v;
-  });
+  // DOM-independent: iterate every row in STATE.pe.orig (all table keys from
+  // /pricing?full=1 plus existing overrides). peEdit keeps row.cur in sync on
+  // input events, so rows not currently in the DOM (other pages / filtered by
+  // search) keep their edits and their baseline values.
+  // Emission rules:
+  //  - a row with an existing override is always re-emitted (preservation)
+  //  - a row is emitted only when its effective values differ from baseline
+  //    (a cleared field falls back to orig: upstream baseline for table rows,
+  //    the stored override for manual rows) and at least one effective value
+  //    is non-empty
+  //  - unedited baseline rows are never emitted
+  const FIELDS=['input','cached','cache_write','output'];
   const ov={};
   Object.entries(STATE.pe.orig).forEach(([key,row])=>{
-    const changed=['input','cached','cache_write','output'].some(f=>row.cur[f]!==row.orig[f]);
-    const hasAny=['input','cached','cache_write','output'].some(f=>row.cur[f]!==null&&row.cur[f]!==undefined);
-    if(changed&&hasAny){
-      const out={};
-      ['input','cached','cache_write','output'].forEach(f=>{out[f]=(row.cur[f]??row.orig[f])??null});
-      ov[key]=out;
-    }
+    const out={};
+    FIELDS.forEach(f=>{out[f]=(row.cur[f]!==undefined)?row.cur[f]:row.orig[f]??null});
+    const changed=FIELDS.some(f=>out[f]!==row.orig[f]);
+    const hasVal=FIELDS.some(f=>out[f]!==null&&out[f]!==undefined);
+    if(hasVal&&(row.manual||changed))ov[key]=out;
   });
   return ov;
 }
@@ -1715,12 +1726,18 @@ async def api_config(request: Request):
 
 @qk_router.post("/config", dependencies=[Depends(_require_admin)])
 async def api_save_config(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"errors": ["invalid JSON body"]}, status_code=400)
     errs = qk_validate_config(body)
     if errs:
         return JSONResponse({"errors": errs}, status_code=400)
     with qk_lock():
         cur = qk_load_json(QK_CONFIG_PATH, {})
+        if not isinstance(cur, dict):
+            log.warning("quota-keeper config.json was not an object; starting from defaults")
+            cur = {}
         qk_deep_merge(cur, body)
         cfg = qk_merge_config(cur)
         qk_atomic_write(QK_CONFIG_PATH, cfg)

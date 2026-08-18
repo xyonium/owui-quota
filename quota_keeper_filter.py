@@ -228,8 +228,14 @@ def qk_validate_config(cfg) -> list:
                         errs.append(f"tou.tiers.{tname}.windows[{wi}].days must be a list of ints 0-6")
                     for hh in ("start", "end"):
                         v = w.get(hh)
-                        if v is not None and (not isinstance(v, str) or not re.match(r"^\d{2}:\d{2}$", v)):
+                        if v is None:
+                            continue
+                        if not isinstance(v, str) or not re.match(r"^\d{2}:\d{2}$", v):
                             errs.append(f"tou.tiers.{tname}.windows[{wi}].{hh} must be HH:MM")
+                        else:
+                            h_, m_ = int(v[:2]), int(v[3:])
+                            if not (0 <= h_ <= 23 and 0 <= m_ <= 59):
+                                errs.append(f"tou.tiers.{tname}.windows[{wi}].{hh} must be HH:MM 00:00-23:59")
     return errs
 
 
@@ -285,7 +291,8 @@ def qk_tou_resolve_policy(cfg: dict, model_id: str):
 def qk_tou_rate(cfg: dict, model_id: str, now) -> tuple:
     """Returns (rate, tier). Tier 'off' means TOU does not apply (rate 1.0).
     Window days use JS-style numbering (0=Sunday .. 6=Saturday) so the
-    default offpeak `days: [0..6]` covers every day of the week."""
+    default offpeak `days: [0..6]` covers every day of the week.
+    `days: []` (or missing) means every day."""
     tou = cfg.get("tou") or {}
     pol = qk_tou_resolve_policy(cfg, model_id)
     if pol is None:
@@ -556,24 +563,27 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         qk_prune_ledger(led, cfg)
         qk_atomic_write(QK_LEDGER_PATH, led)
         # recent.json ring buffer (dashboard "recent activity" feed), capped
-        # at 200 newest-last; same lock so it stays consistent with the ledger
-        rec = qk_load_json(QK_RECENT_PATH, {"items": []})
-        items = rec.setdefault("items", [])
-        items.append(
-            {
-                "ts": time.time(),
-                "user_id": uid,
-                "name": u.get("name", ""),
-                "email": u.get("email", ""),
-                "model": model,
-                "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
-                "cost_usd": cost,
-                "tou_tier": tier,
-                "priced": priced,
-            }
-        )
-        del items[:-200]
-        qk_atomic_write(QK_RECENT_PATH, rec)
+        # at 200 newest-last; same lock so it stays consistent with the ledger.
+        # Topups (count_request=False) are partial-usage merges for an already
+        # recorded response, not new responses: they do not enter the feed.
+        if count_request:
+            rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+            items = rec.setdefault("items", [])
+            items.append(
+                {
+                    "ts": time.time(),
+                    "user_id": uid,
+                    "name": u.get("name", ""),
+                    "email": u.get("email", ""),
+                    "model": model,
+                    "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
+                    "cost_usd": cost,
+                    "tou_tier": tier,
+                    "priced": priced,
+                }
+            )
+            del items[:-200]
+            qk_atomic_write(QK_RECENT_PATH, rec)
 
 
 def qk_period_used_usd(uid: str, cfg: dict) -> float:

@@ -39,3 +39,27 @@ def test_numeric_bounds(admin_client):
     c, adm = _app(admin_client)
     r = c.post("/api/v1/quota-keeper/config", json={"schedule": {"night_start_hour": 99}})
     assert r.status_code == 400
+
+
+def test_non_json_body_400(admin_client):
+    # Fix: malformed body must be a clean 400, not an unhandled 500 from
+    # `await request.json()` raising.
+    c, adm = _app(admin_client)
+    r = c.post("/api/v1/quota-keeper/config", content=b"{not json",
+               headers={"Content-Type": "application/json"})
+    assert r.status_code == 400
+    assert "invalid JSON body" in r.text
+
+
+def test_list_config_on_disk_recovers(admin_client):
+    # Fix: a config.json that is a JSON list (e.g. manual corruption) used to
+    # crash the POST path (500) inside qk_deep_merge; it must be treated as an
+    # empty object so a save succeeds and GET /config returns an object.
+    c, adm = _app(admin_client)
+    adm.qk_atomic_write(adm.QK_CONFIG_PATH, ["not", "an", "object"])
+    r = c.post("/api/v1/quota-keeper/config", json={"schedule": {"timezone": "UTC"}})
+    assert r.status_code == 200
+    r = c.get("/api/v1/quota-keeper/config")
+    assert r.status_code == 200
+    assert isinstance(r.json(), dict)
+    assert r.json()["schedule"]["timezone"] == "UTC"

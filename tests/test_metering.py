@@ -99,6 +99,11 @@ def test_anthropic_partial_usage_merged(qk):
     d = led["users"]["u1"]["days"][day]
     assert d["requests"] == 1
     assert d["tokens"]["input"] == 40 and d["tokens"]["output"] == 7
+    # the topup (count_request=False) is a merge, not a response: recent.json
+    # must contain exactly the first partial's single entry
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {"items": []})
+    assert len(rec["items"]) == 1
+    assert rec["items"][0]["model"] == "claude-x"
 
 
 def test_stream_sse_string_with_usage_prefix(qk):

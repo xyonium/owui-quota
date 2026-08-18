@@ -133,6 +133,11 @@ def test_me_requires_auth(load_admin):
 
 
 def test_stats_aggregates(qk, load_admin, monkeypatch):
+    # Pin the recording clock (same style as tests/test_metering.py) so the
+    # day-bucket assertion cannot flake when the suite runs across midnight.
+    fixed = datetime(2026, 8, 17, 12, 0)
+    monkeypatch.setattr(qk, "qk_local_now", lambda cfg: fixed)
+    monkeypatch.setattr(qk, "qk_tou_local_now", lambda cfg: fixed)
     qk.qk_atomic_write(qk.QK_PRICING_PATH, {"table": {"m/x": {"input": 1.0, "output": 2.0}}})
     qk.qk_record_usage({"id": "u1", "name": "U", "email": "e"}, "m/x",
                        {"cached": 10, "input": 90, "output": 50, "cache_write": 0})
@@ -147,8 +152,8 @@ def test_stats_aggregates(qk, load_admin, monkeypatch):
     assert out["users"][0]["user_id"] == "u1"
     assert out["users"][0]["quota_source"] in ("user", "group", "default", "none")
     assert out["users"][0]["multiplier"] == 1.0
-    # recorded under the real local now, so the day bucket is today
-    assert out["series"] == [{"bucket": date.today().isoformat(), "by_model": {"m/x": 1.9e-4}}]
+    # recorded under the pinned clock, so the day bucket is deterministic
+    assert out["series"] == [{"bucket": "2026-08-17", "by_model": {"m/x": 1.9e-4}}]
 
 
 def test_stats_per_user_models_count_only_own_models(qk, load_admin):
