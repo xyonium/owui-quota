@@ -21,3 +21,8 @@ venv/
 
 # Quota Keeper runtime data (ledger/config/pricing caches)
 quota_keeper/
+
+# Test tooling (jsdom etc.)
+node_modules/
+package-lock.json
+package.json
