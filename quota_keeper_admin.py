@@ -1142,6 +1142,7 @@ async function loadStats(){
   const qs=new URLSearchParams({from:sp.from,to:sp.to,granularity:sp.gran});
   if(STATE.filter.user)qs.set('user',STATE.filter.user);
   if(STATE.filter.model)qs.set('model',STATE.filter.model);
+  STATE.drill={}; // drill-down cache is span/filter-scoped: invalidate on reload
   try{
     STATE.stats=await api('/stats?'+qs.toString());
   }catch(e){toast('Stats load failed: '+e.message);return}
