@@ -708,11 +708,15 @@ header{padding:18px 24px;border-bottom:1px solid var(--line);display:flex;align-
 header h1{margin:0;font-size:18px}
 header .spacer{flex:1}
 .badge{font-size:11px;padding:2px 8px;border-radius:99px;background:var(--card);border:1px solid var(--line);color:var(--mut)}
-main{max-width:1100px;margin:0 auto;padding:24px}
+main{max-width:1200px;margin:0 auto;padding:24px}
 section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+details{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:18px}
+details>summary{cursor:pointer;font-size:15px;color:var(--acc);font-weight:600}
 h2{margin:0 0 4px;font-size:15px;color:var(--acc)}
+h3{margin:16px 0 4px;font-size:13px;color:var(--txt)}
 p.hint{margin:0 0 14px;color:var(--mut);font-size:12px}
 label{display:block;margin:10px 0 4px;font-size:12px;color:var(--mut)}
+label.inline{display:inline-flex;align-items:center;gap:5px;margin:0 6px 0 0;width:auto;font-size:12px;color:var(--mut)}
 input,select{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#0b1220;color:var(--txt);font:inherit}
 input:focus,select:focus{outline:1px solid var(--acc)}
 .row{display:grid;gap:12px}
@@ -720,35 +724,165 @@ input:focus,select:focus{outline:1px solid var(--acc)}
 button{padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:#0b1220;color:var(--txt);cursor:pointer;font:inherit}
 button.primary{background:var(--acc);border-color:var(--acc);color:#082f49;font-weight:600}
 button:hover{filter:brightness(1.1)}
+button.small{padding:3px 8px;font-size:12px}
+button:disabled{opacity:.4;cursor:default}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
 th{color:var(--mut);font-weight:500;font-size:12px}
+th.sortable{cursor:pointer;user-select:none}
+th.sortable:hover{color:var(--txt)}
+th.num{text-align:right}
+th.sortable.asc::after{content:" ▲"}
+th.sortable.desc::after{content:" ▼"}
 td.num{text-align:right;font-variant-numeric:tabular-nums}
+tr.clickable{cursor:pointer}
+tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 .bar{height:6px;border-radius:4px;background:#0b1220;overflow:hidden;min-width:120px}
 .bar i{display:block;height:100%;background:var(--ok)}
 .bar i.warn{background:var(--warn)}.bar i.bad{background:var(--bad)}
 .pct{font-size:11px;color:var(--mut)}
-.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--mut)}
+.tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--mut);margin:1px 2px 1px 0}
 .tag.src-user{color:var(--acc);border-color:var(--acc)}
 .tag.src-group{color:var(--ok);border-color:var(--ok)}
 .tag.unpriced{color:var(--warn);border-color:var(--warn)}
+.tag.t-peak{color:var(--warn);border-color:var(--warn)}
+.tag.t-offpeak{color:var(--acc);border-color:var(--acc)}
+.tag.t-normal{color:var(--ok);border-color:var(--ok)}
+.tag.manual{color:var(--acc);border-color:var(--acc)}
 .toast{position:fixed;right:18px;bottom:18px;padding:10px 16px;border-radius:10px;background:var(--card);border:1px solid var(--line);box-shadow:0 8px 30px rgba(0,0,0,.4);opacity:0;transition:.25s;z-index:99}
 .toast.show{opacity:1}
+.admin-only{display:none}
 .muted{color:var(--mut)}
 .small{font-size:12px}
+.empty{padding:18px;text-align:center;color:var(--mut)}
 #matchResult{margin-top:8px;font-size:12px;color:var(--mut);word-break:break-all}
+.match-out{margin-left:6px;font-size:11px;color:var(--mut);word-break:break-all}
+/* KPI cards */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px}
+.kpi{background:#0b1220;border:1px solid var(--line);border-radius:10px;padding:12px}
+.kpi .lbl{font-size:11px;color:var(--mut);text-transform:uppercase;letter-spacing:.04em}
+.kpi .val{font-size:20px;font-weight:650;margin:4px 0 2px;font-variant-numeric:tabular-nums}
+.kpi svg{width:100%;height:34px;display:block}
+/* span selector + filters */
+.spans{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+.spans button.active{background:var(--acc);border-color:var(--acc);color:#082f49;font-weight:600}
+.spans input[type=date]{width:auto;padding:6px 8px}
+.filters{display:flex;gap:10px;flex-wrap:wrap;align-items:end;margin-bottom:14px}
+.filters .f{display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--mut)}
+.filters input,.filters select{width:230px;padding:6px 8px}
+.filters button{padding:6px 14px}
+/* trend chart */
+.legend{display:flex;flex-wrap:wrap;gap:10px;margin:10px 0;font-size:12px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+#trend svg{width:100%;height:auto}
+/* pricing editor */
+.pe-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.pe-tools input[type=search]{width:280px;padding:6px 8px}
+.pe-tools button{padding:6px 12px}
+.pe-num{width:120px;padding:6px 8px}
+.pageinfo{font-size:12px;color:var(--mut)}
+.scroll{overflow:auto;max-height:440px}
+/* TOU editor */
+.chips{display:flex;gap:4px}
+.chip{width:32px;height:26px;border-radius:6px;border:1px solid var(--line);background:#0b1220;color:var(--mut);font-size:11px;padding:0;cursor:pointer}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#082f49}
+.win{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+.win input[type=time]{width:110px;padding:5px 8px}
+.win input[type=date]{width:150px;padding:5px 8px}
+.win .chip{width:30px}
+.prow{display:flex;gap:8px;align-items:center;margin:6px 0;flex-wrap:wrap}
+.prow input[type=text]{width:230px;padding:6px 8px}
+.prow input[type=number]{width:90px;padding:6px 8px}
+.prow input[type=checkbox]{width:auto}
 </style>
 </head>
 <body>
 <header>
- <h1>📊 Quota Keeper</h1>
+ <h1>Quota Keeper</h1>
  <span class="badge" id="meta"></span>
  <span class="spacer"></span>
- <button onclick="saveConfig()">💾 Save config</button>
- <button class="primary" onclick="refreshPricing(true)">↻ Refresh pricing</button>
+ <button id="btnSave" class="admin-only" onclick="saveConfig()">Save config</button>
+ <button id="btnRefresh" class="primary admin-only" onclick="refreshPricing(true)">Refresh pricing</button>
 </header>
 <main>
- <section>
+ <section id="secPersonal" hidden></section>
+
+ <section id="secDash" hidden>
+  <h2>Dashboard</h2>
+  <div class="spans">
+   <button data-span="24h" onclick="setSpan('24h')">24h</button>
+   <button data-span="7d" onclick="setSpan('7d')">7d</button>
+   <button data-span="30d" onclick="setSpan('30d')">30d</button>
+   <button data-span="90d" onclick="setSpan('90d')">90d</button>
+   <button data-span="custom" onclick="setSpan('custom')">custom</button>
+   <span id="customDates" style="display:none;gap:8px;align-items:center">
+    <input type="date" id="spanFrom" onchange="setCustom('from')"/>
+    <span class="muted">to</span>
+    <input type="date" id="spanTo" onchange="setCustom('to')"/>
+   </span>
+  </div>
+  <div class="filters">
+   <div class="f"><span>User (name / email / id)</span><input id="fUser" placeholder="all users"/></div>
+   <div class="f"><span>Model</span><select id="fModel"><option value="">all</option></select></div>
+   <button onclick="loadStats()">Apply</button>
+  </div>
+  <div class="kpis" id="kpis"></div>
+  <div class="legend" id="trendLegend"></div>
+  <div id="trend"><p class="hint">No data yet for the selected span.</p></div>
+ </section>
+
+ <section id="secUsers" hidden>
+  <h2>Users ranking</h2>
+  <p class="hint">Span-scope usage; Quota% compares span credits against the period quota × multiplier. Click a row to drill into that user's per-model usage.</p>
+  <div class="filters">
+   <div class="f"><span>Search</span><input id="qUser" oninput="renderUsers()" placeholder="name / email"/></div>
+   <button onclick="exportCsv()">Export CSV</button>
+  </div>
+  <div class="scroll">
+  <table id="uRank">
+   <thead><tr>
+    <th>User</th>
+    <th class="num sortable" data-sort="requests" onclick="toggleSort('requests')">Requests</th>
+    <th class="num sortable" data-sort="tokens" onclick="toggleSort('tokens')">Tokens</th>
+    <th class="num sortable" data-sort="cost_usd" onclick="toggleSort('cost_usd')">Cost $</th>
+    <th class="num sortable" data-sort="credits" onclick="toggleSort('credits')">Credits</th>
+    <th class="num sortable" data-sort="quota" onclick="toggleSort('quota')">Quota%</th>
+    <th>Source</th>
+   </tr></thead>
+   <tbody></tbody>
+  </table></div>
+ </section>
+
+ <section id="secModels" hidden>
+  <h2>Models</h2>
+  <p class="hint">Blended $/M = cost per 1M tokens across all usage. The match button resolves the fuzzy pricing target via /pricing/match (the /stats payload does not carry the matched key per model) and shows it inline.</p>
+  <div class="scroll">
+  <table id="modelsT">
+   <thead><tr>
+    <th>Model</th><th class="num">Requests</th><th class="num">Users</th>
+    <th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th>
+    <th class="num">Cost $</th><th class="num">Blended $/M</th><th class="num">Saved $</th><th>TOU</th>
+   </tr></thead>
+   <tbody></tbody>
+  </table></div>
+ </section>
+
+ <section id="secRecent" hidden>
+  <h2>Recent activity</h2>
+  <p class="hint">Newest first, max 200 rows. Manual refresh only — nothing polls.</p>
+  <button onclick="loadRecent()">Refresh</button>
+  <div class="scroll">
+  <table id="recentT">
+   <thead><tr>
+    <th>Time</th><th>User</th><th>Model</th>
+    <th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th>
+    <th class="num">Cache%</th><th class="num">Cost $</th><th>Tier</th>
+   </tr></thead>
+   <tbody><tr><td colspan="9" class="empty">Press Refresh to load.</td></tr></tbody>
+  </table></div>
+ </section>
+
+ <section id="secGeneral" hidden>
   <h2>General</h2>
   <p class="hint">Credits are derived from real cost (USD); 1000 credits = $1 by default. Effective quota = resolved quota (user &gt; max group &gt; default) × time multiplier.</p>
   <div class="row c3">
@@ -758,7 +892,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
   </div>
  </section>
 
- <section>
+ <section id="secSchedule" hidden>
   <h2>Time schedule (multipliers)</h2>
   <p class="hint">Applied at request time. Example: night ×0.5, weekend ×0.5.</p>
   <div class="row c3">
@@ -773,7 +907,7 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
   <p class="hint" id="mult_now"></p>
  </section>
 
- <section>
+ <section id="secPricing" hidden>
   <h2>Pricing source</h2>
   <p class="hint">Supports LiteLLM model_prices_and_context_window.json (per-token converted to per-1M) and models.dev format. Match order: override → exact → date-stripped → path suffix → segment → contains.</p>
   <div class="row c2">
@@ -789,175 +923,767 @@ td.num{text-align:right;font-variant-numeric:tabular-nums}
   <div id="matchResult"></div>
  </section>
 
- <section>
+ <section id="secGroups" hidden>
   <h2>Group quotas (highest wins)</h2>
   <p class="hint">A user in several groups gets the max of those group quotas. A user-level quota overrides groups entirely.</p>
-  <div style="overflow:auto;max-height:320px">
+  <div class="scroll">
   <table id="groups"><thead><tr><th>Group</th><th style="width:180px">Quota (credits)</th><th class="num">Members</th></tr></thead><tbody></tbody></table>
   </div>
  </section>
 
- <section>
+ <section id="secUserq" hidden>
   <h2>User quotas (highest priority)</h2>
-  <p class="hint">Leave empty to inherit from groups / default.</p>
-  <div style="overflow:auto;max-height:420px">
-  <table id="users"><thead><tr><th>User</th><th style="width:180px">Quota (credits)</th><th>Source</th><th>Used this period</th></tr></thead><tbody></tbody></table>
+  <p class="hint">Leave empty to inherit from groups / default. Used column is the current stats span.</p>
+  <div class="scroll">
+  <table id="userq"><thead><tr><th>User</th><th style="width:180px">Quota (credits)</th><th>Source</th><th class="num">Used (span)</th><th class="num">Quota%</th></tr></thead><tbody></tbody></table>
   </div>
  </section>
 
- <section>
-  <h2>Usage this month (per model)</h2>
-  <p class="hint">Metered from chat completion responses: cached / input / output tokens (cache-write included in cost). Unpriced rows had no pricing match and no fallback.</p>
-  <div style="overflow:auto;max-height:460px">
-  <table id="usage"><thead><tr><th>User</th><th>Model</th><th class="num">Requests</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost</th><th class="num">Credits</th></tr></thead><tbody></tbody></table>
+ <details id="secPricingEditor" hidden>
+  <summary>Pricing editor (upstream table → per-1M overrides)</summary>
+  <p class="hint">Rows are prefilled from the cached upstream table; override rows carry a manual badge. Save collects edited rows into pricing.overrides and POSTs /config (deep merge preserves the rest of the config). Overrides win over the next upstream refresh.</p>
+  <div class="pe-tools">
+   <input type="search" id="peSearch" placeholder="search model key" oninput="peSearch()"/>
+   <button onclick="loadPricingFull()">Refresh table</button>
+   <button class="primary" onclick="saveConfig()">Save overrides</button>
+   <span class="pageinfo" id="pePage"></span>
+   <button onclick="pePage(-1)" id="pePrev">‹ prev</button>
+   <button onclick="pePage(1)" id="peNext">next ›</button>
   </div>
- </section>
+  <div class="scroll">
+  <table id="peRows">
+   <thead><tr><th>Model key</th><th class="num">input</th><th class="num">cached</th><th class="num">cache_write</th><th class="num">output</th></tr></thead>
+   <tbody></tbody>
+  </table></div>
+ </details>
+
+ <details id="secTou" hidden>
+  <summary>TOU editor (time-of-use tiered pricing)</summary>
+  <p class="hint">Windows use JS-style day numbers (0 = Sunday). Holidays force the whole day to the cheapest tier. Providers key on the first path segment of a model id; model overrides key on the exact id.</p>
+  <div class="row c3">
+   <div><label>Enabled</label><input type="checkbox" id="touEnabled" style="width:auto"/></div>
+   <div><label>Timezone (empty = schedule TZ)</label><input id="touTz" placeholder="Asia/Shanghai"/></div>
+   <div><label>Default policy</label><select id="touPolicy"><option value="off">off</option><option value="normal">normal</option></select></div>
+  </div>
+  <h3>Global tier rates (multipliers of the base price)</h3>
+  <div class="row c3">
+   <div><label>Peak rate</label><input id="trate_peak" type="number" step="0.05" min="0"/></div>
+   <div><label>Off-peak rate</label><input id="trate_offpeak" type="number" step="0.05" min="0"/></div>
+   <div><label>Normal rate</label><input id="trate_normal" type="number" step="0.05" min="0"/></div>
+  </div>
+  <div class="row c3">
+   <div><label>Peak windows</label><div id="wins_peak"></div><button class="small" onclick="addWin('peak')">+ window</button></div>
+   <div><label>Off-peak windows</label><div id="wins_offpeak"></div><button class="small" onclick="addWin('offpeak')">+ window</button></div>
+   <div><label>Normal windows</label><div id="wins_normal"></div><button class="small" onclick="addWin('normal')">+ window</button></div>
+  </div>
+  <h3>Providers (first path segment)</h3>
+  <div id="provs"></div>
+  <button class="small" onclick="addProv()">+ provider</button>
+  <h3>Model overrides (exact model id)</h3>
+  <div id="toumodels"></div>
+  <button class="small" onclick="addTouModel()">+ model override</button>
+  <h3>Holidays (whole day cheapest tier)</h3>
+  <div id="holidays"></div>
+  <button class="small" onclick="addHoliday()">+ holiday</button>
+  <div class="row" style="margin-top:10px;max-width:520px">
+   <input id="holYear" placeholder="year, e.g. 2026"/>
+   <input id="holCountry" placeholder="country code, e.g. CN"/>
+   <button onclick="fetchHolidays()">Fetch holidays (date.nager.at)</button>
+  </div>
+ </details>
 </main>
 <div class="toast" id="toast"></div>
 <script>
-let CFG=null, USERS=[], GROUPS=[], LEDGER=null, PRICING=null;
+// ===== Quota Keeper admin page =====
+// Fetch policy (zero polling; every stale-able section has an explicit
+// Refresh button; nothing fires on a timer except the toast fade-out):
+//   /me on load; admins additionally fetch /stats (current span + filters),
+//   /recent (manual Refresh button only), /pricing summary (header meta),
+//   /config + /users + /groups (config sections); /pricing?full=1 is fetched
+//   ONLY when the Pricing editor is first expanded or its Refresh is pressed.
+// =====
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(msg,ms=2200){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),ms)}
 async function api(path,opts){const r=await fetch('__QK_API_PREFIX__'+path,opts);if(!r.ok){throw new Error(await r.text()||r.status)}return r.json()}
-function fmt(n,d=0){if(n===null||n===undefined||isNaN(n))return '–';return Number(n).toLocaleString(undefined,{maximumFractionDigits:d})}
-async function loadAll(){
- [CFG,USERS,GROUPS,LEDGER,PRICING]=await Promise.all([api('/config'),api('/users'),api('/groups'),api('/ledger'),api('/pricing')]);
- $('credits_per_usd').value=CFG.credits_per_usd;
- $('quota_period').value=CFG.quota_period||'daily';
- $('default_quota_credits').value=CFG.default_quota_credits??'';
- const s=CFG.schedule||{};
- $('schedule_timezone').value=s.timezone??'';
- $('night_start_hour').value=s.night_start_hour??22;
- $('night_end_hour').value=s.night_end_hour??8;
- $('night_multiplier').value=s.night_multiplier??1;
- $('weekend_multiplier').value=s.weekend_multiplier??1;
- const p=CFG.pricing||{};
- $('pricing_url').value=p.url||'';
- $('refresh_hours').value=p.refresh_hours??24;
- $('default_pricing').value=p.default_pricing?JSON.stringify(p.default_pricing):'';
- $('meta').textContent=(PRICING.models?PRICING.models+' models · ':'')+(PRICING.fetched_at_iso?('updated '+new Date(PRICING.fetched_at_iso).toLocaleString()):'no pricing yet');
- $('mult_now').textContent='Current time multiplier: ×'+(CFG._time_multiplier??1);
- renderGroups();renderUsers();renderUsage();
+function fmt(n,d=2){if(n===null||n===undefined||isNaN(n))return '–';return Number(n).toLocaleString(undefined,{maximumFractionDigits:d})}
+// num: zero-safe number parse — 0 survives, empty/NaN falls back to def
+const num=(id,def)=>{const v=parseFloat($(id).value);return isNaN(v)?def:v};
+
+// Categorical palette (dark, 8 slots in fixed order) — validated with the
+// dataviz palette checker against the card surface #1e293b: all slots clear
+// 3:1 contrast (slot 4 lifted to #1f9d4d for that); CVD separation sits in
+// the 8-12 floor band, made legal by the legend + per-segment titles + the
+// models table view as secondary encoding. Color follows the entity: a model
+// keeps its slot across buckets, ranks are computed once per span.
+const SERIES_COLORS=['#3987e5','#199e70','#c98500','#1f9d4d','#9085e9','#e66767','#d55181','#d95926'];
+const OTHER_COLOR='#64748b';
+
+const STATE={
+  me:null,cfg:null,users:[],groups:[],stats:null,recent:null,pricing:null,
+  allModels:[],
+  span:{key:localStorage.getItem('qk_span')||'7d',from:localStorage.getItem('qk_span_from')||'',to:localStorage.getItem('qk_span_to')||''},
+  sort:(()=>{const p=localStorage.getItem('qk_sort')||'cost_usd:desc';const i=p.indexOf(':');return {col:i<0?'cost_usd':p.slice(0,i),dir:p.slice(i+1)==='asc'?'asc':'desc'}})(),
+  filter:{user:'',model:''},
+  drill:{},            // user_id -> /stats drilldown payload cache
+  pe:{loaded:false,page:0,search:'',full:null,orig:{}}, // pricing editor state
+  tou:null,            // live editable copy of cfg.tou
+};
+
+// ---------- entry ----------
+async function init(){
+  try{
+    STATE.me=await api('/me');
+    if((STATE.me.user||{}).role!=='admin'){renderPersonal();return}
+    document.querySelectorAll('.admin-only').forEach(el=>el.classList.remove('admin-only'));
+    await loadAdmin();
+  }catch(e){toast('Load failed: '+e.message)}
 }
-function userGroups(u){
- const byMembership=GROUPS.filter(g=>(g.members||[]).includes(u.id)).map(g=>g.id);
- return byMembership;
+async function loadAdmin(){
+  [STATE.cfg,STATE.users,STATE.groups,STATE.pricing]=await Promise.all([api('/config'),api('/users'),api('/groups'),api('/pricing')]);
+  STATE.tou=JSON.parse(JSON.stringify(STATE.cfg.tou||{}));
+  ['secDash','secUsers','secModels','secRecent','secGeneral','secSchedule','secPricing','secGroups','secUserq','secPricingEditor','secTou'].forEach(id=>$(id).hidden=false);
+  renderMeta();renderConfig();renderGroups();renderUsersQ();renderTou();initSpanUI();
+  await loadStats();
 }
-function resolveQuota(u){
- const uq=(CFG.user_quotas||{})[u.id];
- if(typeof uq==='number'&&uq>0)return {q:uq,src:'user'};
- const gq=CFG.group_quotas||{};
- const vals=userGroups(u).map(g=>gq[g]).filter(v=>typeof v==='number'&&v>0);
- if(vals.length)return {q:Math.max(...vals),src:'group'};
- if(typeof CFG.default_quota_credits==='number'&&CFG.default_quota_credits>0)return {q:CFG.default_quota_credits,src:'default'};
- return {q:null,src:'none'};
+function renderMeta(){
+  const p=STATE.pricing||{};
+  $('meta').textContent=(p.models?p.models+' models · ':'')+(p.fetched_at_iso?('updated '+new Date(p.fetched_at_iso).toLocaleString()):'no pricing yet');
 }
-function periodKey(){
- const d=new Date();const pad=n=>String(n).padStart(2,'0');
- if((CFG.quota_period||'daily')==='monthly')return {prefix:d.getFullYear()+'-'+pad(d.getMonth()+1)+'-',day:null};
- return {prefix:null,day:d.getFullYear()+'-'+pad(d.getMonth()+1)+'-'+pad(d.getDate())};
+
+// ---------- non-admin view ----------
+function renderPersonal(){
+  const me=STATE.me,u=me.user||{};
+  const eff=me.effective_quota;
+  const pct=(eff>0)?Math.min(100,(me.used_credits||0)/eff*100):null;
+  const cls=pct===null?'':(pct>=100?'bad':pct>=80?'warn':'');
+  const tier=(me.tou&&me.tou.current_tier)?me.tou.current_tier:'off';
+  const trend=(me.trend||[]);
+  const cost7=trend.reduce((s,d)=>s+((d.cost_usd||0)),0);
+  const req7=trend.reduce((s,d)=>s+((d.requests||0)),0);
+  // /me exposes period credits (used_credits) and today's cost; a month cost
+  // in USD is not part of the /me payload, so the period figure is shown in
+  // credits (that IS the month figure when quota_period=monthly).
+  $('secPersonal').innerHTML=`
+   <h2>${esc(u.name||u.id)}</h2>
+   <p class="hint">${esc(u.email||'')} · role ${esc(u.role||'')}</p>
+   <div class="kpis">
+    <div class="kpi"><div class="lbl">Quota used</div>
+     <div class="val">${pct===null?'∞':fmt(pct,1)+'%'}</div>
+     ${pct===null?'<div class="small muted">no quota set</div>':`<div class="bar"><i class="${cls}" style="width:${pct.toFixed(1)}%"></i></div><div class="small muted">${fmt(me.used_credits,1)} / ${fmt(eff,0)} credits</div>`}</div>
+    <div class="kpi"><div class="lbl">Multiplier</div>
+     <div class="val">×${fmt(me.multiplier,2)}</div>
+     <div class="small muted">current TOU tier: ${esc(tier)}</div></div>
+    <div class="kpi"><div class="lbl">Today</div>
+     <div class="val">$${fmt(me.today.cost_usd,2)}</div>
+     <div class="small muted">${fmt(me.today.requests,0)} requests</div></div>
+    <div class="kpi"><div class="lbl">Period credits</div>
+     <div class="val">${fmt(me.used_credits,0)}</div>
+     <div class="small muted">used this period (month if monthly)</div></div>
+   </div>
+   <p class="hint">7-day cost trend · $${fmt(cost7,2)} total, ${fmt(req7,0)} requests</p>
+   ${sparkSvg(trend.map(d=>d.cost_usd||0),560,56,'#38bdf8')}`;
+  $('secPersonal').hidden=false;
+  $('meta').textContent='self-service view';
 }
-function usedCredits(u){
- const lu=(LEDGER?.users||{})[u.id];if(!lu)return 0;
- const cpu=Number(CFG.credits_per_usd)||1000;
- const {prefix,day}=periodKey();
- let usd=0;
- if(day){usd=(lu.days?.[day]?.cost_usd)||0}
- else{Object.entries(lu.days||{}).forEach(([k,d])=>{if(k.startsWith(prefix))usd+=(d.cost_usd||0)})}
- return usd*cpu;
+
+// ---------- SVG helpers ----------
+function sparkSvg(values,w,h,color){
+  if(!values||values.length<2)return '<div class="small muted">no trend</div>';
+  const max=Math.max(...values),min=Math.min(...values),range=(max-min)||1;
+  const pts=values.map((v,i)=>((i/(values.length-1)*w).toFixed(1))+','+((h-3-((v-min)/range)*(h-8)).toFixed(1))).join(' ');
+  return `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" aria-hidden="true"><polyline points="${pts}" fill="none" stroke="${color}" stroke-width="2"/></svg>`;
 }
-function renderGroups(){
- const tb=$('groups').querySelector('tbody');tb.innerHTML='';
- GROUPS.forEach(g=>{
-  const v=(CFG.group_quotas||{})[g.id];
-  const tr=document.createElement('tr');
-  tr.innerHTML=`<td>${esc(g.name)}<br/><span class="small muted">${esc(g.id)}</span></td>
-  <td><input data-gq="${esc(g.id)}" type="number" step="0.01" value="${v??''}" placeholder="inherit"/></td>
-  <td class="num">${fmt(g.members?.length||0)}</td>`;
-  tb.appendChild(tr);
- });
- if(!GROUPS.length)tb.innerHTML='<tr><td colspan="3" class="muted" style="text-align:center;padding:18px">No groups</td></tr>';
+
+// ---------- span + stats ----------
+function isoDay(d){const p=n=>String(n).padStart(2,'0');return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())}
+function spanDates(){
+  const k=STATE.span.key;
+  if(k==='custom'){
+    if(STATE.span.from&&STATE.span.to)return {from:STATE.span.from,to:STATE.span.to,gran:'day'};
+    return null;
+  }
+  const days={'24h':0,'7d':6,'30d':29,'90d':89}[k]??6;
+  const now=new Date(),from=new Date(now);
+  from.setDate(now.getDate()-days);
+  return {from:isoDay(from),to:isoDay(now),gran:k==='24h'?'hour':'day'};
+}
+function initSpanUI(){
+  document.querySelectorAll('.spans button').forEach(b=>b.classList.toggle('active',b.dataset.span===STATE.span.key));
+  if(STATE.span.key==='custom')$('customDates').style.display='flex';
+  $('spanFrom').value=STATE.span.from||'';
+  $('spanTo').value=STATE.span.to||'';
+}
+function setSpan(k){
+  STATE.span.key=k;
+  if(k==='custom'){
+    $('customDates').style.display='flex';
+    $('spanFrom').value=STATE.span.from||'';
+    $('spanTo').value=STATE.span.to||'';
+    if(!(STATE.span.from&&STATE.span.to))return;
+  }else{
+    $('customDates').style.display='none';
+    STATE.span.from=STATE.span.to='';
+  }
+  localStorage.setItem('qk_span',k);
+  document.querySelectorAll('.spans button').forEach(b=>b.classList.toggle('active',b.dataset.span===k));
+  loadStats();
+}
+function setCustom(which){
+  if(which==='from'){STATE.span.from=$('spanFrom').value;localStorage.setItem('qk_span_from',STATE.span.from)}
+  else{STATE.span.to=$('spanTo').value;localStorage.setItem('qk_span_to',STATE.span.to)}
+  if(STATE.span.from&&STATE.span.to)loadStats();
+}
+async function loadStats(){
+  const sp=spanDates();
+  if(!sp){toast('Set both custom dates');return}
+  STATE.filter.user=$('fUser').value.trim();
+  STATE.filter.model=$('fModel').value;
+  const qs=new URLSearchParams({from:sp.from,to:sp.to,granularity:sp.gran});
+  if(STATE.filter.user)qs.set('user',STATE.filter.user);
+  if(STATE.filter.model)qs.set('model',STATE.filter.model);
+  try{
+    STATE.stats=await api('/stats?'+qs.toString());
+  }catch(e){toast('Stats load failed: '+e.message);return}
+  if(!STATE.filter.model){STATE.allModels=(STATE.stats.models||[]).map(m=>m.model);fillModelSelect()}
+  renderKpis();renderTrend();renderUsers();renderModels();renderUsersQ();
+}
+function fillModelSelect(){
+  const sel=$('fModel');
+  sel.innerHTML='<option value="">all</option>'+STATE.allModels.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
+  sel.value=STATE.filter.model||'';
+}
+
+// ---------- KPI cards ----------
+function renderKpis(){
+  const k=STATE.stats.kpi||{},cpu=Number(STATE.cfg.credits_per_usd)||1000;
+  const tot=(k.tokens||{}).cached+(k.tokens||{}).input+(k.tokens||{}).output;
+  // NOTE: the /stats `series` carries ONLY cost per bucket (see qk_stats), so
+  // per-bucket trends exist for Cost/Credits; Requests/Tokens/Cache rate and
+  // Unpriced show the span total instead of a fabricated sparkline.
+  const ser=STATE.stats.series||[];
+  const costPer=ser.map(b=>Object.values(b.by_model||{}).reduce((a,c)=>a+c,0));
+  const cards=[
+    {lbl:'Requests',val:fmt(k.requests||0,0)},
+    {lbl:'Tokens',val:fmt(tot||0,0)},
+    {lbl:'Cost $',val:'$'+fmt(k.cost_usd||0,2),sp:sparkSvg(costPer,140,34,'#38bdf8')},
+    {lbl:'Credits',val:fmt((k.cost_usd||0)*cpu,0),sp:sparkSvg(costPer.map(v=>v*cpu),140,34,'#34d399')},
+    {lbl:'Cache rate',val:fmt((k.cache_rate||0)*100,1)+'%'},
+    {lbl:'Unpriced',val:fmt(k.unpriced_requests||0,0)},
+  ];
+  $('kpis').innerHTML=cards.map(c=>`<div class="kpi"><div class="lbl">${c.lbl}</div><div class="val">${c.val}</div>${c.sp||''}</div>`).join('');
+}
+
+// ---------- stacked trend chart ----------
+function bucketLabel(b,hourMode){return hourMode?b.slice(11,13)+':00':b.slice(5)}
+function renderTrend(){
+  const box=$('trend');
+  const ser=STATE.stats.series||[];
+  const hourMode=spanDates()&&spanDates().gran==='hour';
+  const totals={};
+  ser.forEach(b=>{Object.entries(b.by_model||{}).forEach(([m,c])=>{totals[m]=(totals[m]||0)+c})});
+  const ranked=Object.entries(totals).sort((a,b)=>b[1]-a[1]);
+  if(!ranked.length){box.innerHTML='<p class="hint">No data for the selected span.</p>';$('trendLegend').innerHTML='';return}
+  const top=ranked.slice(0,8).map(e=>e[0]);
+  const othersCost=ranked.slice(8).reduce((s,e)=>s+e[1],0);
+  const names=top.concat(othersCost>0?['Others']:[]);
+  const colorOf={};top.forEach((m,i)=>colorOf[m]=SERIES_COLORS[i]);colorOf['Others']=OTHER_COLOR;
+  const W=1040,H=250,pl=48,pr=12,pt=10,pb=26;
+  const iw=W-pl-pr,ih=H-pt-pb;
+  let ymax=0;
+  ser.forEach(b=>{const s=Object.values(b.by_model||{}).reduce((a,c)=>a+c,0);if(s>ymax)ymax=s});
+  const yt=v=>pt+ih-(v/ymax*ih);
+  const rows=ser.map(b=>{const bm=b.by_model||{};return {label:b.bucket,parts:names.map(m=>bm[m]||0)}});
+  let g=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Cost per bucket by model">`;
+  [0,.25,.5,.75,1].forEach(f=>{
+    const y=yt(ymax*f);
+    g+=`<line x1="${pl}" y1="${y}" x2="${W-pr}" y2="${y}" stroke="rgba(148,163,184,.18)" stroke-width="1"/>`;
+    g+=`<text x="${pl-6}" y="${y+4}" text-anchor="end" font-size="10" fill="#94a3b8">$${fmt(ymax*f,0)}</text>`;
+  });
+  const n=rows.length,bw=iw/n;
+  rows.forEach((r,i)=>{
+    let y0=yt(0);
+    r.parts.forEach((v,pi)=>{
+      if(v<=0)return;
+      const h=yt(0)-yt(v),y=y0-h;
+      g+=`<rect x="${(pl+i*bw+1).toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(bw-2,1).toFixed(1)}" height="${h.toFixed(1)}" fill="${colorOf[names[pi]]}" stroke="rgba(15,23,42,.55)" stroke-width="1"><title>${esc(names[pi])}: $${fmt(v,2)}</title></rect>`;
+      y0=y;
+    });
+    if(n<=16||i%Math.ceil(n/12)===0||i===n-1){
+      g+=`<text x="${(pl+i*bw+bw/2).toFixed(1)}" y="${H-7}" text-anchor="middle" font-size="10" fill="#94a3b8">${esc(bucketLabel(r.label,hourMode))}</text>`;
+    }
+  });
+  g+='</svg>';
+  box.innerHTML=g;
+  const legTot=m=>totals[m]||0;
+  $('trendLegend').innerHTML=names.map(m=>`<span class="lg"><i style="background:${colorOf[m]}"></i>${esc(m)} <span class="muted">$${fmt(m==='Others'?othersCost:legTot(m),1)}</span></span>`).join('');
+}
+
+// ---------- users ranking ----------
+function toggleSort(col){
+  const s=STATE.sort;
+  if(s.col===col){s.dir=s.dir==='asc'?'desc':'asc'}else{s.col=col;s.dir='desc'}
+  localStorage.setItem('qk_sort',s.col+':'+s.dir);
+  renderUsers();
 }
 function renderUsers(){
- const tb=$('users').querySelector('tbody');tb.innerHTML='';
- USERS.forEach(u=>{
-  const {q,src}=resolveQuota(u);
-  const used=usedCredits(u);
-  const v=(CFG.user_quotas||{})[u.id];
-  const pct=q?Math.min(100,used/q*100):null;
-  const cls=pct===null?'':(pct>=100?'bad':pct>=80?'warn':'');
-  const tr=document.createElement('tr');
-  tr.innerHTML=`<td>${esc(u.name||u.id)}<br/><span class="small muted">${esc(u.email||'')} ${u.role==='admin'?'<span class="tag">admin</span>':''}</span></td>
-  <td><input data-uq="${esc(u.id)}" type="number" step="0.01" value="${v??''}" placeholder="inherit"/></td>
-  <td><span class="tag src-${src}">${src}</span>${q?`<div class="small muted">${fmt(used,1)} / ${fmt(q,0)} credits</div>`:''}</td>
-  <td>${pct===null?'<span class="muted">∞</span>':`<div class="bar"><i class="${cls}" style="width:${pct}%"></i></div><span class="pct">${pct.toFixed(1)}%</span>`}</td>`;
-  tb.appendChild(tr);
- });
- if(!USERS.length)tb.innerHTML='<tr><td colspan="4" class="muted" style="text-align:center;padding:18px">No users</td></tr>';
+  renderSortInd();
+  const cpu=Number(STATE.cfg.credits_per_usd)||1000;
+  const rows=(STATE.stats.users||[]).slice();
+  const q=$('qUser').value.toLowerCase();
+  const f=rows.filter(r=>!q||((r.name||'')+' '+(r.email||'')+' '+r.user_id).toLowerCase().includes(q));
+  const {col,dir}=STATE.sort;
+  const tok=r=>Object.values(r.tokens||{}).reduce((a,b)=>a+b,0);
+  const pct=r=>{const eff=(r.quota||0)*(r.multiplier||1);return eff>0?((r.cost_usd||0)*cpu/eff*100):null};
+  const get=r=>col==='requests'?r.requests:col==='tokens'?tok(r):col==='credits'?(r.cost_usd||0)*cpu:col==='quota'?(pct(r)??-1):r.cost_usd;
+  f.sort((a,b)=>{const va=get(a),vb=get(b);return (dir==='asc'?1:-1)*(va<vb?-1:va>vb?1:0)});
+  const tb=$('uRank').querySelector('tbody');
+  tb.innerHTML=f.map(r=>{
+    const pp=pct(r);
+    const cls=pp===null?'':(pp>=100?'bad':pp>=80?'warn':'');
+    return `<tr class="clickable" data-uid="${esc(r.user_id)}" onclick="toggleDrill(this)">
+     <td>${esc(r.name||r.user_id)}<br/><span class="small muted">${esc(r.email||'')}</span></td>
+     <td class="num">${fmt(r.requests,0)}</td>
+     <td class="num">${fmt(tok(r),0)}</td>
+     <td class="num">$${fmt(r.cost_usd,2)}</td>
+     <td class="num">${fmt((r.cost_usd||0)*cpu,0)}</td>
+     <td>${pp===null?'<span class="muted">∞</span>':`<div class="bar"><i class="${cls}" style="width:${Math.min(pp,100).toFixed(1)}%"></i></div><span class="pct">${pp.toFixed(1)}%</span>`}</td>
+     <td><span class="tag src-${r.quota_source||'none'}">${esc(r.quota_source||'none')}</span></td>
+    </tr>`;}).join('')||'<tr><td colspan="7" class="empty">No users in span</td></tr>';
 }
-function renderUsage(){
- const tb=$('usage').querySelector('tbody');tb.innerHTML='';
- const rows=[];
- const d=new Date();const pad=n=>String(n).padStart(2,'0');
- const pref=d.getFullYear()+'-'+pad(d.getMonth()+1)+'-';
- Object.entries(LEDGER?.users||{}).forEach(([uid,u])=>{
-  Object.entries(u.days||{}).forEach(([day,drec])=>{
-   if(!day.startsWith(pref))return;
-   Object.entries(drec.models||{}).forEach(([m,mm])=>{
-    rows.push({name:u.name||uid,email:u.email||'',m,mm});
-   });
+function renderSortInd(){
+  document.querySelectorAll('#uRank th.sortable').forEach(th=>{
+    th.classList.remove('asc','desc');
+    if(th.dataset.sort===STATE.sort.col)th.classList.add(STATE.sort.dir);
   });
- });
- rows.sort((a,b)=>(b.mm.cost_usd||0)-(a.mm.cost_usd||0));
- const cpu=Number(CFG.credits_per_usd)||1000;
- rows.slice(0,200).forEach(r=>{
-  const t=r.mm.tokens||{};
-  const tr=document.createElement('tr');
-  tr.innerHTML=`<td>${esc(r.name)}<br/><span class="small muted">${esc(r.email)}</span></td>
-  <td>${esc(r.m)} ${r.mm.priced===false?'<span class="tag unpriced">unpriced</span>':''}</td>
-  <td class="num">${fmt(r.mm.requests)}</td>
-  <td class="num">${fmt(t.cached)}</td>
-  <td class="num">${fmt(t.input)}</td>
-  <td class="num">${fmt(t.output)}</td>
-  <td class="num">$${fmt(r.mm.cost_usd,4)}</td>
-  <td class="num">${fmt((r.mm.cost_usd||0)*cpu,1)}</td>`;
-  tb.appendChild(tr);
- });
- if(!rows.length)tb.innerHTML='<tr><td colspan="8" class="muted" style="text-align:center;padding:24px">No usage this month yet — send a chat through the filter first.</td></tr>';
 }
+async function toggleDrill(tr){
+  const uid=tr.dataset.uid;
+  const next=tr.nextElementSibling;
+  if(next&&next.classList.contains('drill')){next.remove();return}
+  tr.parentElement.querySelectorAll('tr.drill').forEach(r=>r.remove());
+  let data=STATE.drill[uid];
+  if(data===undefined){
+    const sp=spanDates();
+    const dr=document.createElement('tr');dr.className='drill';
+    dr.innerHTML='<td colspan="7" class="empty">loading…</td>';
+    tr.after(dr);
+    try{
+      data=await api(`/stats?user=${encodeURIComponent(uid)}&from=${sp.from}&to=${sp.to}&granularity=day`);
+    }catch(e){dr.innerHTML=`<td colspan="7" class="empty">${esc(e.message)}</td>`;return}
+    STATE.drill[uid]=data;
+    dr.remove();
+  }
+  const rows=(data.models||[]).map(m=>{
+    const t=m.tokens||{};
+    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(t.input,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(m.cost_usd,2)}</td></tr>`;
+  }).join('')||'<tr><td colspan="6" class="empty">No usage in span</td></tr>';
+  const dr=document.createElement('tr');dr.className='drill';
+  dr.innerHTML=`<td colspan="7"><table style="max-width:760px"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th></tr></thead><tbody>${rows}</tbody></table></td>`;
+  tr.after(dr);
+}
+function exportCsv(){
+  const cpu=Number(STATE.cfg.credits_per_usd)||1000;
+  const q=$('qUser').value.toLowerCase();
+  const f=(STATE.stats.users||[]).filter(r=>!q||((r.name||'')+' '+(r.email||'')+' '+r.user_id).toLowerCase().includes(q));
+  const escC=v=>{const s=String(v??'');return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s};
+  const lines=[['user','email','requests','tokens','cost_usd','credits','quota','quota_source'].join(',')];
+  f.forEach(r=>lines.push([escC(r.name||r.user_id),escC(r.email||''),r.requests||0,Object.values(r.tokens||{}).reduce((a,b)=>a+b,0),(r.cost_usd||0).toFixed(6),((r.cost_usd||0)*cpu).toFixed(2),r.quota??'',escC(r.quota_source||'')].join(',')));
+  const blob=new Blob([lines.join('\n')],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);a.download='quota-keeper-users.csv';a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ---------- models table ----------
+function renderModels(){
+  const rows=STATE.stats.models||[];
+  const tb=$('modelsT').querySelector('tbody');
+  tb.innerHTML=rows.map((m,i)=>{
+    const t=m.tokens||{},tou=m.tou||{};
+    const ttags=['peak','offpeak','normal'].filter(n=>(tou[n]||0)>0).map(n=>`<span class="tag t-${n}">${n} ${fmt(tou[n],0)}</span>`).join('');
+    const sv=m.cost_saved_usd||0;
+    return `<tr>
+     <td>${esc(m.model)}
+       ${m.unpriced_requests>0?'<span class="tag unpriced">unpriced</span>':''}
+       <button class="small" data-mi="${i}" onclick="matchModel(this)">match</button>
+       <span class="match-out"></span></td>
+     <td class="num">${fmt(m.requests,0)}</td>
+     <td class="num">${fmt(m.users,0)}</td>
+     <td class="num">${fmt(t.cached,0)}</td>
+     <td class="num">${fmt(t.input,0)}</td>
+     <td class="num">${fmt(t.output,0)}</td>
+     <td class="num">$${fmt(m.cost_usd,2)}</td>
+     <td class="num">${fmt(m.blended_per_m,2)}</td>
+     <td class="num">${sv>0?'+':''}$${fmt(sv,2)}</td>
+     <td>${ttags}</td>
+    </tr>`;}).join('')||'<tr><td colspan="10" class="empty">No models in span</td></tr>';
+}
+// The /stats payload does not carry the fuzzy-matched pricing key per model
+// row, so the target is resolved on demand via /pricing/match and shown
+// inline as "→ target via how" (how: override|exact|suffix|segment|contains).
+async function matchModel(btn){
+  const m=STATE.stats.models[+btn.dataset.mi].model;
+  const out=btn.parentElement.querySelector('.match-out');
+  out.textContent='…';
+  try{
+    const r=await api('/pricing/match?model='+encodeURIComponent(m));
+    if(r.matched){
+      const i=r.how.indexOf(':');
+      const how=i<0?r.how:r.how.slice(0,i),target=i<0?'':r.how.slice(i+1);
+      out.textContent='→ '+target+' via '+how;
+    }else{out.textContent='→ no match'}
+  }catch(e){out.textContent='match error'}
+}
+
+// ---------- recent activity (manual refresh only) ----------
+async function loadRecent(){
+  try{
+    STATE.recent=await api('/recent');
+    renderRecent();
+  }catch(e){toast('Recent load failed: '+e.message)}
+}
+function renderRecent(){
+  const items=(STATE.recent?STATE.recent.items:[]).slice(0,200);
+  const tb=$('recentT').querySelector('tbody');
+  tb.innerHTML=items.map(it=>{
+    const t=it.tokens||{};
+    const ci=(t.cached||0)+(t.input||0);
+    const cp=ci?((t.cached||0)/ci*100):0;
+    const dt=new Date((it.ts||0)*1000);
+    const p=n=>String(n).padStart(2,'0');
+    const time=p(dt.getHours())+':'+p(dt.getMinutes())+':'+p(dt.getSeconds());
+    const tier=(it.tou_tier&&it.tou_tier!=='off')?`<span class="tag t-${esc(it.tou_tier)}">${esc(it.tou_tier)}</span>`:'';
+    return `<tr>
+     <td class="small muted">${time}</td>
+     <td>${esc(it.name||it.user_id)}<br/><span class="small muted">${esc(it.email||'')}</span></td>
+     <td>${esc(it.model)}${it.priced===false?' <span class="tag unpriced">unpriced</span>':''}</td>
+     <td class="num">${fmt(t.cached,0)}</td>
+     <td class="num">${fmt(t.input,0)}</td>
+     <td class="num">${fmt(t.output,0)}</td>
+     <td class="num">${fmt(cp,0)}%</td>
+     <td class="num">$${fmt(it.cost_usd,4)}</td>
+     <td>${tier}</td></tr>`;}).join('')||'<tr><td colspan="9" class="empty">No activity recorded yet — send a chat through the filter first.</td></tr>';
+}
+
+// ---------- config sections ----------
+function renderConfig(){
+  $('credits_per_usd').value=STATE.cfg.credits_per_usd;
+  $('quota_period').value=STATE.cfg.quota_period||'daily';
+  $('default_quota_credits').value=STATE.cfg.default_quota_credits??'';
+  const s=STATE.cfg.schedule||{};
+  $('schedule_timezone').value=s.timezone??'';
+  $('night_start_hour').value=s.night_start_hour??22;
+  $('night_end_hour').value=s.night_end_hour??8;
+  $('night_multiplier').value=s.night_multiplier??1;
+  $('weekend_multiplier').value=s.weekend_multiplier??1;
+  const p=STATE.cfg.pricing||{};
+  $('pricing_url').value=p.url||'';
+  $('refresh_hours').value=p.refresh_hours??24;
+  $('default_pricing').value=p.default_pricing?JSON.stringify(p.default_pricing):'';
+  $('mult_now').textContent='Current time multiplier: ×'+(STATE.cfg._time_multiplier??STATE.me.multiplier??1);
+}
+function userGroups(u){
+  return STATE.groups.filter(g=>(g.members||[]).includes(u.id)).map(g=>g.id);
+}
+function resolveQuota(u){
+  const uq=(STATE.cfg.user_quotas||{})[u.id];
+  if(typeof uq==='number'&&uq>0)return {q:uq,src:'user'};
+  const gq=STATE.cfg.group_quotas||{};
+  const vals=userGroups(u).map(g=>gq[g]).filter(v=>typeof v==='number'&&v>0);
+  if(vals.length)return {q:Math.max(...vals),src:'group'};
+  if(typeof STATE.cfg.default_quota_credits==='number'&&STATE.cfg.default_quota_credits>0)return {q:STATE.cfg.default_quota_credits,src:'default'};
+  return {q:null,src:'none'};
+}
+function renderGroups(){
+  const tb=$('groups').querySelector('tbody');tb.innerHTML='';
+  STATE.groups.forEach(g=>{
+    const v=(STATE.cfg.group_quotas||{})[g.id];
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${esc(g.name)}<br/><span class="small muted">${esc(g.id)}</span></td>
+    <td><input data-gq="${esc(g.id)}" type="number" step="0.01" value="${v??''}" placeholder="inherit"/></td>
+    <td class="num">${fmt(g.members?g.members.length:0,0)}</td>`;
+    tb.appendChild(tr);
+  });
+  if(!STATE.groups.length)tb.innerHTML='<tr><td colspan="3" class="empty">No groups</td></tr>';
+}
+function renderUsersQ(){
+  const tb=$('userq').querySelector('tbody');tb.innerHTML='';
+  const cpu=Number(STATE.cfg.credits_per_usd)||1000;
+  const byId={};(STATE.stats?STATE.stats.users:[]).forEach(r=>byId[r.user_id]=r);
+  STATE.users.forEach(u=>{
+    const sr=byId[u.id];
+    const {q,src}=resolveQuota(u);
+    const quota=(sr&&sr.quota)??q;
+    const used=((sr?sr.cost_usd:0)||0)*cpu;
+    const eff=quota*((sr&&sr.multiplier)||STATE.me.multiplier||1);
+    const pct=eff>0?Math.min(100,used/eff*100):null;
+    const cls=pct===null?'':(pct>=100?'bad':pct>=80?'warn':'');
+    const v=(STATE.cfg.user_quotas||{})[u.id];
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${esc(u.name||u.id)}<br/><span class="small muted">${esc(u.email||'')} ${u.role==='admin'?'<span class="tag">admin</span>':''}</span></td>
+    <td><input data-uq="${esc(u.id)}" type="number" step="0.01" value="${v??''}" placeholder="inherit"/></td>
+    <td><span class="tag src-${src}">${esc(src)}</span></td>
+    <td class="num">${fmt(used,1)}</td>
+    <td>${pct===null?'<span class="muted">∞</span>':`<div class="bar"><i class="${cls}" style="width:${pct.toFixed(1)}%"></i></div><span class="pct">${pct.toFixed(1)}%</span>`}</td>`;
+    tb.appendChild(tr);
+  });
+  if(!STATE.users.length)tb.innerHTML='<tr><td colspan="5" class="empty">No users</td></tr>';
+}
+
+// ---------- save ----------
 async function saveConfig(){
- // num: parse a numeric field; 0 survives, empty/NaN falls back to def
- const num=(id,def)=>{const v=parseFloat($(id).value);return isNaN(v)?def:v};
- const gq={},uq={};
- document.querySelectorAll('[data-gq]').forEach(i=>{const v=parseFloat(i.value);if(!isNaN(v)&&v>0)gq[i.dataset.gq]=v});
- document.querySelectorAll('[data-uq]').forEach(i=>{const v=parseFloat(i.value);if(!isNaN(v)&&v>0)uq[i.dataset.uq]=v});
- let dp=null;try{dp=$('default_pricing').value.trim()?JSON.parse($('default_pricing').value):null}catch(e){toast('Fallback pricing is not valid JSON');return}
- const body={
-  credits_per_usd:num('credits_per_usd',1000),
-  quota_period:$('quota_period').value,
-  default_quota_credits:$('default_quota_credits').value===''?null:parseFloat($('default_quota_credits').value),
-  schedule:{timezone:$('schedule_timezone').value.trim()||null,night_start_hour:num('night_start_hour',22),night_end_hour:num('night_end_hour',8),night_multiplier:num('night_multiplier',1),weekend_multiplier:num('weekend_multiplier',1)},
-  pricing:{url:$('pricing_url').value.trim(),refresh_hours:num('refresh_hours',24),default_pricing:dp,overrides:(CFG.pricing||{}).overrides||{}},
-  group_quotas:gq,user_quotas:uq,
- };
- try{await api('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});toast('Config saved');loadAll()}catch(e){toast('Save failed: '+e.message)}
+  const gq={},uq={};
+  document.querySelectorAll('[data-gq]').forEach(i=>{const v=parseFloat(i.value);if(!isNaN(v)&&v>0)gq[i.dataset.gq]=v});
+  document.querySelectorAll('[data-uq]').forEach(i=>{const v=parseFloat(i.value);if(!isNaN(v)&&v>0)uq[i.dataset.uq]=v});
+  let dp=null;
+  try{dp=$('default_pricing').value.trim()?JSON.parse($('default_pricing').value):null}catch(e){toast('Fallback pricing is not valid JSON');return}
+  const body={
+    credits_per_usd:num('credits_per_usd',1000),
+    quota_period:$('quota_period').value,
+    default_quota_credits:$('default_quota_credits').value===''?null:parseFloat($('default_quota_credits').value),
+    schedule:{timezone:$('schedule_timezone').value.trim()||null,night_start_hour:num('night_start_hour',22),night_end_hour:num('night_end_hour',8),night_multiplier:num('night_multiplier',1),weekend_multiplier:num('weekend_multiplier',1)},
+    // overrides: read from the editor when it has been opened; otherwise
+    // keep whatever the config already holds (editor reads are authoritative
+    // only after /pricing?full=1 has loaded once)
+    pricing:{url:$('pricing_url').value.trim(),refresh_hours:num('refresh_hours',24),default_pricing:dp,overrides:STATE.pe.loaded?collectOverrides():((STATE.cfg.pricing||{}).overrides||{})},
+    group_quotas:gq,user_quotas:uq,
+    tou:buildTou(),
+  };
+  try{
+    await api('/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    toast('Config saved');
+    STATE.cfg=await api('/config');
+    STATE.tou=JSON.parse(JSON.stringify(STATE.cfg.tou||{}));
+    renderConfig();renderGroups();renderUsersQ();renderTou();
+    if(STATE.pe.loaded){rebuildPeOrig();renderPricingRows()}
+    loadStats();
+  }catch(e){toast('Save failed: '+e.message)}
 }
 async function refreshPricing(force){
- try{const r=await api('/pricing/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force:!!force})});toast('Pricing '+r.status+' · '+r.models+' models');loadAll()}catch(e){toast('Refresh failed: '+e.message)}
+  try{
+    const r=await api('/pricing/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({force:!!force})});
+    toast('Pricing '+r.status+' · '+r.models+' models');
+    STATE.pricing=await api('/pricing');
+    renderMeta();
+    if(STATE.pe.loaded){rebuildPeOrig();renderPricingRows()}
+  }catch(e){toast('Refresh failed: '+e.message)}
 }
 async function testMatch(){
- const m=$('matchTest').value.trim();if(!m)return;
- try{const r=await api('/pricing/match?model='+encodeURIComponent(m));
-  $('matchResult').innerHTML=r.matched
-   ?`✅ matched via <b>${esc(r.how)}</b> → input $${r.price.input}/1M · cached $${r.price.cached??'–'} · cache_write $${r.price.cache_write??'–'} · output $${r.price.output}/1M`
-   :`❌ no match (fallback pricing applies if configured)`;
- }catch(e){$('matchResult').textContent='match error: '+e.message}
+  const m=$('matchTest').value.trim();if(!m)return;
+  try{
+    const r=await api('/pricing/match?model='+encodeURIComponent(m));
+    $('matchResult').innerHTML=r.matched
+     ?`✅ matched via <b>${esc(r.how)}</b> → input $${r.price.input}/1M · cached $${r.price.cached??'–'} · cache_write $${r.price.cache_write??'–'} · output $${r.price.output}/1M`
+     :`❌ no match (fallback pricing applies if configured)`;
+  }catch(e){$('matchResult').textContent='match error: '+e.message}
 }
-loadAll().catch(e=>toast('Load failed: '+e.message));
+
+// ---------- pricing editor ----------
+$('secPricingEditor').addEventListener('toggle',()=>{if($('secPricingEditor').open&&!STATE.pe.loaded)loadPricingFull()});
+async function loadPricingFull(){
+  try{
+    STATE.pe.full=await api('/pricing?full=1');
+    STATE.pe.loaded=true;
+    STATE.pe.page=0;
+    rebuildPeOrig();
+    renderPricingRows();
+  }catch(e){toast('Pricing table load failed: '+e.message)}
+}
+// baseline snapshot: table entries, with override rows marked manual (the
+// override value is what the editor shows and what wins after a refresh)
+function rebuildPeOrig(){
+  const ov=(STATE.cfg.pricing||{}).overrides||{};
+  const t=STATE.pe.full?(STATE.pe.full.table||{}):{};
+  STATE.pe.orig={};
+  Object.entries(t).forEach(([k,v])=>{
+    const base={input:v.input??null,cached:v.cached??null,cache_write:v.cache_write??null,output:v.output??null};
+    STATE.pe.orig[k]={manual:!!ov[k],cur:{},orig:base,base:base};
+  });
+  Object.entries(ov).forEach(([k,v])=>{
+    const base={input:v.input??null,cached:v.cached??null,cache_write:v.cache_write??null,output:v.output??null};
+    STATE.pe.orig[k]={manual:true,cur:{},orig:base,base:base};
+  });
+}
+function renderPricingRows(){
+  const q=STATE.pe.search;
+  const keys=Object.keys(STATE.pe.orig).filter(k=>k.toLowerCase().includes(q)).sort();
+  const per=50,pages=Math.max(1,Math.ceil(keys.length/per));
+  if(STATE.pe.page>=pages)STATE.pe.page=pages-1;
+  const pageKeys=keys.slice(STATE.pe.page*per,STATE.pe.page*per+per);
+  const tb=$('peRows').querySelector('tbody');
+  tb.innerHTML=pageKeys.map(k=>{
+    const o=STATE.pe.orig[k];
+    const base=o.base;
+    return `<tr>
+     <td>${esc(k)}${o.manual?' <span class="tag manual">manual</span>':''}</td>
+     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="input" value="${esc(pv(o,base,'input'))}" oninput="peEdit(this)"/></td>
+     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="cached" value="${esc(pv(o,base,'cached'))}" oninput="peEdit(this)"/></td>
+     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="cache_write" value="${esc(pv(o,base,'cache_write'))}" oninput="peEdit(this)"/></td>
+     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="output" value="${esc(pv(o,base,'output'))}" oninput="peEdit(this)"/></td>
+    </tr>`;}).join('')||'<tr><td colspan="5" class="empty">No models match the search.</td></tr>';
+  $('pePage').textContent=(STATE.pe.page+1)+' / '+pages+' · '+keys.length+' models';
+  $('pePrev').disabled=STATE.pe.page===0;
+  $('peNext').disabled=STATE.pe.page>=pages-1;
+}
+function peSearch(){STATE.pe.search=$('peSearch').value.trim().toLowerCase();STATE.pe.page=0;renderPricingRows()}
+function pePage(d){STATE.pe.page+=d;renderPricingRows()}
+// prefill helper: current edit if present, else the baseline value
+function pv(o,base,f){return (o.cur[f]!==undefined)?(o.cur[f]):(base[f]??'')}
+function peEdit(inp){
+  const row=STATE.pe.orig[inp.dataset.pk];if(!row)return;
+  const v=parseFloat(inp.value);
+  row.cur[inp.dataset.f]=isNaN(v)?null:v;
+}
+function collectOverrides(){
+  // read the live inputs into row.cur; empty field -> null (keep original)
+  document.querySelectorAll('[data-pk]').forEach(inp=>{
+    const row=STATE.pe.orig[inp.dataset.pk];if(!row)return;
+    const v=parseFloat(inp.value);
+    row.cur[inp.dataset.f]=isNaN(v)?null:v;
+  });
+  const ov={};
+  Object.entries(STATE.pe.orig).forEach(([key,row])=>{
+    const changed=['input','cached','cache_write','output'].some(f=>row.cur[f]!==row.orig[f]);
+    const hasAny=['input','cached','cache_write','output'].some(f=>row.cur[f]!==null&&row.cur[f]!==undefined);
+    if(changed&&hasAny){
+      const out={};
+      ['input','cached','cache_write','output'].forEach(f=>{out[f]=(row.cur[f]??row.orig[f])??null});
+      ov[key]=out;
+    }
+  });
+  return ov;
+}
+
+// ---------- TOU editor ----------
+function renderTou(){
+  const t=STATE.tou||{};
+  $('touEnabled').checked=!!t.enabled;
+  $('touTz').value=t.timezone??'';
+  $('touPolicy').value=t.default_policy||'off';
+  ['peak','offpeak','normal'].forEach(n=>{$('trate_'+n).value=((t.tiers&&t.tiers[n]&&t.tiers[n].rate)!=null)?t.tiers[n].rate:1});
+  ['peak','offpeak','normal'].forEach(n=>renderWins(n));
+  renderProvs();renderTouModels();renderHolidays();
+}
+const DLAB=['Mo','Tu','We','Th','Fr','Sa','Su'];
+const DVAL=[1,2,3,4,5,6,0]; // JS weekday: 0=Sunday
+function winHtml(n,w){
+  return `<div class="win" data-tier="${esc(n)}">
+   ${DVAL.map((d,i)=>`<button type="button" class="chip${(w.days||[]).includes(d)?' on':''}" data-d="${d}" onclick="chip(this)">${DLAB[i]}</button>`).join('')}
+   <input type="time" data-start value="${esc(w.start||'09:00')}"/>
+   <input type="time" data-end value="${esc(w.end||'18:00')}"/>
+   <button class="small" onclick="delWin(this)">remove</button>
+  </div>`;
+}
+function renderWins(n){
+  const box=$('wins_'+n);
+  const wins=(STATE.tou.tiers&&STATE.tou.tiers[n]&&STATE.tou.tiers[n].windows)||[];
+  box.innerHTML=wins.map(w=>winHtml(n,w)).join('');
+}
+function addWin(n){$('wins_'+n).insertAdjacentHTML('beforeend',winHtml(n,{}))}
+function chip(b){b.classList.toggle('on')}
+function delWin(b){b.closest('.win').remove()}
+function provRowHtml(kind,name,p){
+  const nk=kind==='provider'?'pname':'mname',ek=kind==='provider'?'pen':'men',rk=kind==='provider'?'prate':'mrate';
+  return `<div class="prow" data-kind="${kind}">
+   <input type="text" data-${nk} value="${esc(name)}" placeholder="${kind==='provider'?'provider name':'exact model id'}"/>
+   <label class="inline"><input type="checkbox" data-${ek} ${p.enabled?'checked':''}/> enabled</label>
+   ${['peak','offpeak','normal'].map(n=>`<input type="number" step="0.05" min="0" placeholder="${n}" data-${rk}="${n}" value="${esc((p.tiers&&p.tiers[n])?p.tiers[n].rate:'')}"/>`).join('')}
+   <button class="small" onclick="this.closest('.prow').remove()">remove</button>
+  </div>`;
+}
+function renderProvs(){
+  const box=$('provs');box.innerHTML='';
+  Object.entries(STATE.tou.providers||{}).forEach(([name,p])=>{box.insertAdjacentHTML('beforeend',provRowHtml('provider',name,p))});
+}
+function renderTouModels(){
+  const box=$('toumodels');box.innerHTML='';
+  Object.entries(STATE.tou.models||{}).forEach(([name,p])=>{box.insertAdjacentHTML('beforeend',provRowHtml('model',name,p))});
+}
+function addProv(){$('provs').insertAdjacentHTML('beforeend',provRowHtml('provider','',{enabled:true}))}
+function addTouModel(){$('toumodels').insertAdjacentHTML('beforeend',provRowHtml('model','',{enabled:true}))}
+function renderHolidays(){
+  const box=$('holidays');box.innerHTML='';
+  (STATE.tou.holidays||[]).forEach(h=>{
+    box.insertAdjacentHTML('beforeend',`<div class="win"><input type="date" data-holiday value="${esc(h)}"/><button class="small" onclick="this.closest('.win').remove()">remove</button></div>`);
+  });
+  if(!(STATE.tou.holidays||[]).length)box.innerHTML='<p class="hint">No holidays configured.</p>';
+}
+function addHoliday(){
+  $('holidays').insertAdjacentHTML('beforeend',`<div class="win"><input type="date" data-holiday/><button class="small" onclick="this.closest('.win').remove()">remove</button></div>`);
+}
+async function fetchHolidays(){
+  const y=$('holYear').value.trim(),cc=$('holCountry').value.trim().toUpperCase();
+  const DRE=/^\d{4}-\d{2}-\d{2}$/;
+  if(!/^\d{4}$/.test(y)||!cc){toast('Enter a year and a country code');return}
+  try{
+    const r=await fetch('https://date.nager.at/api/v3/PublicHolidays/'+y+'/'+cc);
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const arr=await r.json();
+    const hols=(STATE.tou.holidays||[]).slice();
+    let added=0;
+    (arr||[]).forEach(h=>{
+      const d=String(h&&h.date?h.date:'');
+      if(DRE.test(d)&&!hols.includes(d)){hols.push(d);added++}
+    });
+    hols.sort();
+    STATE.tou.holidays=hols;
+    renderHolidays();
+    toast(added?('Added '+added+' holidays'):'No new holidays in the list');
+  }catch(e){toast('Holiday fetch failed: '+e.message)}
+}
+function buildTou(){
+  const t=JSON.parse(JSON.stringify(STATE.tou));
+  t.enabled=$('touEnabled').checked;
+  t.timezone=$('touTz').value.trim()||null;
+  t.default_policy=$('touPolicy').value;
+  ['peak','offpeak','normal'].forEach(n=>{
+    const tier=t.tiers[n]=(t.tiers[n]||{});
+    const rv=parseFloat($('trate_'+n).value);
+    tier.rate=isNaN(rv)?(tier.rate??1):rv;
+    const wins=[];
+    document.querySelectorAll('.win[data-tier="'+n+'"]').forEach(w=>{
+      const days=[];w.querySelectorAll('.chip.on').forEach(c=>days.push(+c.dataset.d));
+      const start=w.querySelector('[data-start]').value,end=w.querySelector('[data-end]').value;
+      if(start&&end)wins.push({days:days,start:start,end:end});
+    });
+    if(wins.length)tier.windows=wins;else delete tier.windows;
+  });
+  const provs={};
+  document.querySelectorAll('.prow[data-kind="provider"]').forEach(r=>{
+    const name=r.querySelector('[data-pname]').value.trim();if(!name)return;
+    const pt={enabled:r.querySelector('[data-pen]').checked,tiers:{}};
+    ['peak','offpeak','normal'].forEach(n=>{
+      const v=parseFloat(r.querySelector('[data-prate="'+n+'"]').value);
+      if(!isNaN(v))pt.tiers[n]={rate:v};
+    });
+    if(!Object.keys(pt.tiers).length)delete pt.tiers;
+    provs[name]=pt;
+  });
+  t.providers=provs;
+  const mods={};
+  document.querySelectorAll('.prow[data-kind="model"]').forEach(r=>{
+    const name=r.querySelector('[data-mname]').value.trim();if(!name)return;
+    const pt={enabled:r.querySelector('[data-men]').checked,tiers:{}};
+    ['peak','offpeak','normal'].forEach(n=>{
+      const v=parseFloat(r.querySelector('[data-mrate="'+n+'"]').value);
+      if(!isNaN(v))pt.tiers[n]={rate:v};
+    });
+    if(!Object.keys(pt.tiers).length)delete pt.tiers;
+    mods[name]=pt;
+  });
+  t.models=mods;
+  const hols=[];
+  document.querySelectorAll('[data-holiday]').forEach(inp=>{const v=inp.value.trim();if(v&&!hols.includes(v))hols.push(v)});
+  t.holidays=hols;
+  return t;
+}
+
+init();
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 def qk_build_page(api_prefix: str) -> str:
