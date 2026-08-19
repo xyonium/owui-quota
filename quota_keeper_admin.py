@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.3.4
+version: 0.3.5
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1061,6 +1061,7 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 .tag{display:inline-block;font-size:11px;padding:1px 7px;border-radius:99px;border:1px solid var(--line);color:var(--mut);margin:1px 2px 1px 0}
 .tag.src-user{color:var(--acc);border-color:var(--acc)}
 .tag.src-group{color:var(--ok);border-color:var(--ok)}
+.tag.matched{color:var(--ok);border-color:var(--ok)}
 .tag.unpriced{color:var(--warn);border-color:var(--warn)}
 .tag.t-peak{color:var(--warn);border-color:var(--warn)}
 .tag.t-offpeak{color:var(--acc);border-color:var(--acc)}
@@ -1216,8 +1217,8 @@ tr.pe-cleared td{opacity:.45}
  </section>
 
  <section id="secSchedule" hidden>
-  <h2>Time schedule (multipliers)</h2>
-  <p class="hint">Applied at request time. Example: night ×0.5, weekend ×0.5.</p>
+  <h2>Time schedule (quota multipliers)</h2>
+  <p class="hint"><b>Not a price discount.</b> These scale the user's <b>quota ceiling</b> (effective quota = quota × multiplier), NOT the price. Unrelated to TOU below: TOU scales the <b>price</b> of each request, this scales <b>how much users may spend</b> — they multiply different things and can safely coexist (keep both at 1 if you only want TOU pricing). Example: night ×0.5 halves the quota at night.</p>
   <div class="row c3">
    <div><label>Timezone (empty = server TZ)</label><input id="schedule_timezone" placeholder="Asia/Shanghai"/></div>
    <div><label>Night start hour</label><input id="night_start_hour" type="number" min="0" max="23"/></div>
@@ -1881,16 +1882,26 @@ function peRowHtml(k,o){
     dp[f]=(eff&&!eff.alias&&eff.prices[f]!==null&&eff.prices[f]!==undefined)?eff.prices[f]:((o.price||{})[f]);
   });
   const showPrice=eff&&eff.alias?null:dp;
+  // match display: "method: actual-matched-key" for fuzzy strategies
+  // (suffix/segment/contains show the upstream key they landed on; exact
+  // shows just "exact"), alias shows the target chain
+  const howFmt=h=>{
+    const i=h.indexOf(':');
+    const m=i<0?h:h.slice(0,i),t=i<0?'':h.slice(i+1);
+    if(m==='exact')return 'exact';
+    if(m==='override')return 'override';
+    return t?m+': '+t:m;
+  };
   const howTxt=o.cleared?'<span class="muted">cleared</span>'
     :eff&&eff.alias?('alias → '+esc(eff.alias)+(eff.mult!==''&&eff.mult!==null?' ×'+esc(eff.mult):''))
-    :(o.how?esc(o.how):'<span class="tag unpriced">no match</span>');
+    :(o.how?esc(howFmt(o.how)):'<span class="tag unpriced">no match</span>');
   const numVal=f=>{const v=(showPrice||{})[f];return (v===null||v===undefined)?'':v};
   const dis=o.cleared?'disabled':'';
   const adis=o.cleared?'disabled':'';
   return `<tr data-mrow="${esc(k)}"${o.cleared?' class="pe-cleared"':''}>
    <td>${esc(k)}
      ${o.manual?'<span class="tag manual">manual</span>':''}
-     ${(o.price||o.manual)?'<span class="tag src-group">matched ✓</span>':'<span class="tag unpriced">no match</span>'}
+     ${(o.price||o.manual)?'<span class="tag matched">matched ✓</span>':'<span class="tag unpriced">no match</span>'}
      <br/><span class="small muted">used · ${fmt(o.requests,0)} reqs</span></td>
    <td class="small">${howTxt}</td>
    ${['input','cached','cache_write','output'].map(f=>`<td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="${f}" value="${esc(numVal(f))}" ${dis} oninput="peEdit(this)"/></td>`).join('')}

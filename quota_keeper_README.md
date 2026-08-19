@@ -33,11 +33,12 @@
 - 模糊匹配顺序：override → exact → 去日期后缀 → 路径后缀（`openai/gpt-4o` → `gpt-4o`）→ 尾段 → 包含子串；`.` 与 `-` 归一化，自动剥离 `-2024-08-06` / `-20241022` 等日期尾巴。管理页有 "Test match" 输入框实时验证。
 - 无匹配且未配置 fallback pricing 时该模型计 0 成本，并在用量表打 unpriced 标记。
 
-## 分时段
+## 分时段（配额倍数，不是价格折扣）
 
 - `night_start_hour` ~ `night_end_hour`（可跨零点，默认 22~8）为夜间时段；`night_multiplier` 生效。
 - 周六/周日 `weekend_multiplier` 生效；与夜间相乘。
 - 实际生效配额 = 解析出的配额 × 当前时段倍数（例：夜间 ×0.5、周末 ×0.5，周六深夜即 ×0.25）。
+- **与 TOU 的关系（常被混淆）**：这里乘的是**配额上限**（用户最多能花多少），TOU 乘的是**每单价格**（一美元花出去值多少）。两者乘的对象不同、互不覆盖也不重复——如果只想做峰谷定价，把这里的倍数全部保持 1 即可。
 
 ## 分时计价（TOU，DeepSeek 式峰谷价格）
 
@@ -52,7 +53,7 @@
 
 ## 价格覆盖（Pricing Overrides）
 
-- 管理台「Pricing editor」列出的是**你实际使用的模型**（账本 ∪ Open WebUI 已配置模型），不是 2.5k 行的上游全表：每行显示解析出的价格与命中方式（exact/suffix/segment/contains/override/alias）、未计价标记，未匹配/错价的行排在最前。
+- 管理台「Pricing editor」列出的是**实际在用量中出现的模型**（usage 返回的真实上游 id；不含 OWUI 模型库里的冗余/陈旧条目），不是 2.5k 行的上游全表：每行显示解析出的价格、命中方式（`exact` 只显示方法；模糊匹配显示 `suffix/segment/contains: 实际命中的上游 key`；alias 显示 `alias → 目标 ×系数`）与 matched ✓ / no match 徽标，未匹配的行排在最前。
 - 每行两种修法：**直接填价**（input/cached/cache_write/output 每 1M），或**别名 + 系数**——`kimi-k3-256k → alias: kimi-k3 × 0.5` 即按 kimi-k3 价格打 5 折（别名可链式嵌套，防环，最多 8 跳；系数不写 = 1）。
 - 覆盖值三种形态（`pricing.overrides`）：`{"prices": {...}}` 直接定价；`{"alias": "key", "multiplier": m}` 别名；裸价格 dict 为旧格式仍兼容。`null` = 清除该行覆盖（编辑器行尾 clear 按钮）。
 - 覆盖优先级最高，且**永不被上游刷新覆盖**；来自 overrides 的行带「manual」徽标。用量表与 Test match 框显示实际命中的目标（`how` 字段）。
