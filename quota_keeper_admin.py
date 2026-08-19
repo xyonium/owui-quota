@@ -678,26 +678,12 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
     contribution (hour buckets are per-day-per-hour across models and are
     skipped under a model filter).
 
-    `window_start_ts` (epoch seconds, in the config timezone) additionally
-    restricts to a ROLLING window (e.g. now-24h for the 24h span, instead of
-    "today since 00:00"): only hour buckets at/after it count. Days before
-    the window's day are skipped entirely; on the boundary day, hour buckets
-    earlier than the window start hour are dropped and the day-level row gets
-    only the sum of the kept hours (per-model rows are not hour-resolved and
-    are therefore excluded on the boundary day -- hours buckets are not
-    per-model).
-
-    Day-boundary caveat (v0.4.3 fix): the filter stamps day/hour buckets under
-    qk_tou_local_now (TOU timezone) while the window bounds are resolved under
-    qk_local_now (schedule timezone) -- the two can disagree on which calendar
-    day "24h ago" was (e.g. picked right after local midnight, the rolling
-    window starts on the previous UTC day). A rolling 24h window spans at most
-    two days, so only the boundary day can shift: the day BEFORE win_day is
-    still included when its own hour buckets reach >= win_hour (it is then
-    trimmed to those buckets); days strictly after win_day are inside the
-    window and counted whole. When win_hour == 0 the boundary day is kept
-    whole -- with hour buckets absent the day totals are the best
-    approximation, and channels/unpriced stay counted.
+    `window_start_ts` is retained only for signature compatibility -- rolling
+    windows (the "24h" span) are served from recent.json by qk_stats_window,
+    which api_stats routes to; this function ignores the parameter. The old
+    bucket-trimming approach was dropped: it depended on hour buckets,
+    timezone conversions and day-boundary special cases all lining up, and a
+    miss read as a silent 0 (v0.4.3 lesson).
     """
     led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
     users = led.get("users") or {}
@@ -711,21 +697,6 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
     cfg = qk_get_config()
     from_s = from_ or "0000-00-00"
     to_s = to or "9999-99-99"
-    # rolling-window lower bound. The filter stamps day/hour buckets under
-    # qk_tou_local_now (TOU timezone), so resolve the window in the SAME
-    # timezone -- otherwise a browser-local "24h ago" can land on a different
-    # calendar day than the ledger's buckets and whole days get skipped
-    # (the 24h-span-shows-0 bug right after local midnight).
-    win_day, win_day_prev, win_hour = None, None, None
-    if window_start_ts is not None:
-        try:
-            wnow = qk_local_now(cfg)  # browser epoch -> schedule-tz calendar day
-            wstart = datetime.fromtimestamp(float(window_start_ts), wnow.tzinfo)
-            win_day = wstart.strftime("%Y-%m-%d")
-            win_day_prev = (wstart - timedelta(days=1)).strftime("%Y-%m-%d")
-            win_hour = wstart.hour
-        except Exception:
-            win_day, win_day_prev, win_hour = None, None, None
     for uid, u in users.items():
         if user and user not in (uid, (u.get("name") or ""), (u.get("email") or "")):
             continue
@@ -751,43 +722,7 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
                 continue
             drec = drec or {}
             hours = drec.get("hours") or {}
-            win_partial = False  # this day contributes only some hour buckets
-            if win_day is not None:
-                if day == win_day:
-                    # trim the window's boundary day to buckets >= win_hour;
-                    # win_hour == 0 (picked near midnight) keeps the whole day
-                    win_partial = bool(win_hour)
-                elif day < win_day:
-                    # may still be the window's boundary day: the filter
-                    # stamps day/hour buckets under qk_tou_local_now while the
-                    # browser's epoch window_start is resolved under
-                    # qk_local_now, and the two timezones can disagree on
-                    # which calendar day "24h ago" was (24h-span-shows-0 right
-                    # after local midnight). A rolling 24h window spans at
-                    # most two days, so only win_day-1 can shift; keep it when
-                    # its own hour buckets reach into the window, else skip.
-                    if win_hour and day == win_day_prev and hours:
-                        try:
-                            win_partial = max(
-                                int(h) for h in hours if str(h).isdigit()
-                            ) >= win_hour
-                        except ValueError:
-                            win_partial = False
-                    if not win_partial:
-                        continue
-            if win_partial:
-                hours = {
-                    h: hr for h, hr in hours.items()
-                    if str(h).isdigit() and int(h) >= win_hour
-                }
-            # effective per-model map for this day (model filter + rolling
-            # window: hour buckets are not per-model, so on a partial-window
-            # day the model rows cannot be included accurately and are
-            # skipped; the row-level numbers below use the kept hours)
-            if win_partial:
-                day_ms = {}
-            else:
-                day_ms = drec.get("models") or {}
+            day_ms = drec.get("models") or {}
             if model:
                 # filtered: only the matching model's contribution counts for
                 # this day (KPI and per-user rows); hours buckets aggregate
@@ -806,15 +741,6 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
                     row["tokens"][k] += tk
                     kpi["tokens"][k] += tk
                 day_ms = {model: mm}
-            elif win_partial:
-                # rolling window: only the kept hour buckets count
-                row["requests"] += sum((hr or {}).get("requests", 0) or 0 for hr in hours.values())
-                row["cost_usd"] += sum((hr or {}).get("cost_usd", 0) or 0 for hr in hours.values())
-                for hr in hours.values():
-                    for k in ("cached", "input", "output"):
-                        tk = ((hr or {}).get("tokens") or {}).get(k, 0) or 0
-                        row["tokens"][k] += tk
-                        kpi["tokens"][k] += tk
             else:
                 row["requests"] += drec.get("requests", 0)
                 row["cost_usd"] += drec.get("cost_usd", 0) or 0
@@ -881,6 +807,121 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
         "series": [{"bucket": b, "by_model": v} for b, v in sorted(series.items())],
         "users": users_rows,
         "models": sorted(models_rows.values(), key=lambda x: -x["cost_usd"]),
+    }
+
+
+def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
+    """Rolling-window stats ("24h" span) computed from recent.json's per-request
+    epoch timestamps.
+
+    The ledger path (qk_stats window mode) has to trim by calendar day/hour
+    buckets, which means timezone conversions and day-boundary special cases --
+    any one wrong and the span reads 0. recent.json instead carries one epoch
+    `ts` per recorded request, so "the last 24 hours" is a single comparison
+    (ts >= now-86400) with no timezone or bucket arithmetic at all. Trade-off:
+    the ring buffer holds the newest 200 requests, so the result is partial
+    beyond that (flagged via kpi.window_partial); the UI surfaces it.
+    """
+    cfg = qk_get_config()
+    rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+    items = rec.get("items") or []
+    try:
+        wstart = float(window_start_ts)
+    except Exception:
+        wstart = 0.0
+    users_by_id = {uid: (u or {}) for uid, u in
+                   (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}).items()}
+    kpi = {"requests": 0, "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+           "cost_usd": 0.0, "unpriced_requests": 0}
+    series, urows, mrows = {}, {}, {}
+    for it in items:
+        try:
+            ts = float(it.get("ts") or 0)
+        except Exception:
+            continue
+        if ts < wstart:
+            continue
+        uid = it.get("user_id") or ""
+        if user and user not in (uid, it.get("name") or "", it.get("email") or ""):
+            continue
+        m = str(it.get("model") or "unknown")
+        if model and m != model:
+            continue
+        tok = it.get("tokens") or {}
+        cost = float(it.get("cost_usd") or 0.0)
+        priced = it.get("priced", True)
+        chan = it.get("channel") if it.get("channel") in ("webui", "api") else "api"
+        kpi["requests"] += 1
+        kpi["cost_usd"] += cost
+        kpi["unpriced_requests"] += 0 if priced else 1
+        for k in ("cached", "input", "output"):
+            kpi["tokens"][k] += float(tok.get(k) or 0.0)
+        row = urows.get(uid)
+        if row is None:
+            info = users_by_id.get(uid) or {}
+            row = urows[uid] = {
+                "user_id": uid,
+                "name": it.get("name") or info.get("name", ""),
+                "email": it.get("email") or info.get("email", ""),
+                "requests": 0, "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "cost_usd": 0.0, "models": set(), "unpriced_requests": 0,
+                "channels": {"webui": 0, "api": 0},
+            }
+            quota, source = qk_resolve_quota(
+                cfg, {"id": uid},
+                None if group_ids_map is None else group_ids_map.get(uid, []))
+            row["quota"], row["quota_source"] = quota, source
+            row["multiplier"] = qk_time_multiplier(cfg)
+        row["requests"] += 1
+        row["cost_usd"] += cost
+        row["unpriced_requests"] += 0 if priced else 1
+        row["channels"][chan] += 1
+        row["models"].add(m)
+        for k in ("cached", "input", "output"):
+            row["tokens"][k] += float(tok.get(k) or 0.0)
+        mk = mrows.get(m)
+        if mk is None:
+            mk = mrows[m] = {
+                "model": m, "requests": 0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "cost_usd": 0.0, "users": set(), "unpriced_requests": 0,
+                "tou": {"peak": 0, "offpeak": 0, "normal": 0}, "cost_saved_usd": 0.0,
+            }
+        mk["requests"] += 1
+        mk["cost_usd"] += cost
+        mk["users"].add(uid)
+        mk["unpriced_requests"] += 0 if priced else 1
+        tier = it.get("tou_tier")
+        if tier in mk["tou"]:
+            mk["tou"][tier] += 1
+        for k in ("cached", "input", "output"):
+            mk["tokens"][k] += float(tok.get(k) or 0.0)
+        # hourly series keyed by the bucket's LOCAL (schedule-tz) day+hour so
+        # the trend labels line up with the day-based spans
+        bkey = datetime.fromtimestamp(ts, qk_local_now(cfg).tzinfo).strftime("%Y-%m-%dT%H")
+        sb = series.setdefault(bkey, {})
+        sb["_"] = sb.get("_", 0) + cost
+    ci = kpi["tokens"]["cached"] + kpi["tokens"]["input"]
+    kpi["cache_rate"] = (kpi["tokens"]["cached"] / ci) if ci else 0.0
+    oldest = None
+    for it in items:
+        try:
+            oldest = float(it.get("ts") or 0)
+            break
+        except Exception:
+            continue
+    kpi["window_partial"] = bool(oldest is not None and oldest > wstart and len(items) >= 200)
+    for row in urows.values():
+        row["models"] = len(row["models"])
+    for mk in mrows.values():
+        mk["users"] = len(mk["users"])
+        tot = sum(mk["tokens"].values())
+        mk["blended_per_m"] = (mk["cost_usd"] * 1e6 / tot) if tot else 0.0
+    return {
+        "kpi": kpi,
+        "series": [{"bucket": b, "by_model": v} for b, v in sorted(series.items())],
+        "users": list(urows.values()),
+        "models": sorted(mrows.values(), key=lambda x: -x["cost_usd"]),
     }
 
 
@@ -2267,10 +2308,15 @@ async def api_stats(request: Request):
         wstart = float(wstart) if wstart is not None else None
     except Exception:
         wstart = None
+    if wstart is not None:
+        # rolling window (the "24h" span): per-request epoch timestamps from
+        # recent.json -- no calendar-day/hour-bucket trimming, no timezone math
+        return JSONResponse(
+            qk_stats_window(wstart, q.get("user"), q.get("model"), group_ids_map=gmap)
+        )
     return JSONResponse(
         qk_stats(q.get("from"), q.get("to"), q.get("user"), q.get("model"),
-                 q.get("granularity", "day"), group_ids_map=gmap,
-                 window_start_ts=wstart)
+                 q.get("granularity", "day"), group_ids_map=gmap)
     )
 
 

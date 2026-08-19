@@ -560,66 +560,20 @@ def test_stats_quota_uses_group_ids_map(load_admin):
     assert row["quota"] == 777.0 and row["quota_source"] == "group"
 
 
-# ---- rolling 24h window (v0.3.1) ----------------------------------------------
+# ---- rolling 24h window (v0.3.1 ledger trim; replaced in v0.4.4) --------------
+#
+# The ledger bucket-trimming approach to the rolling window was removed: it
+# needed hour buckets, timezone conversions and day-boundary special cases to
+# all line up, and any miss read as a silent 0. The 24h span is now served
+# from recent.json's per-request epoch timestamps by qk_stats_window (routed
+# in api_stats); qk_stats keeps window_start_ts only as an ignored parameter.
 
 
-def test_stats_rolling_window(load_admin, monkeypatch):
-    from datetime import datetime as _dt, timezone as _tz
-    from pathlib import Path
-    from tests.conftest import write_json
-
-    adm = load_admin()
-    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"name": "A", "email": "a@x", "days": {
-        "2026-08-18": {
-            "requests": 3, "cost_usd": 3.0,
-            "tokens": {"cached": 0.0, "input": 30.0, "output": 0.0},
-            "hours": {
-                "8": {"requests": 1, "cost_usd": 1.0, "tokens": {"cached": 0.0, "input": 10.0, "output": 0.0}},
-                "15": {"requests": 2, "cost_usd": 2.0, "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0}},
-            },
-            "models": {"m/x": {"requests": 3, "cost_usd": 3.0, "unpriced_requests": 0,
-                                "tokens": {"cached": 0.0, "input": 30.0, "output": 0.0}}},
-        },
-        "2026-08-19": {
-            "requests": 5, "cost_usd": 5.0,
-            "tokens": {"cached": 0.0, "input": 50.0, "output": 0.0},
-            "hours": {
-                "9": {"requests": 5, "cost_usd": 5.0, "tokens": {"cached": 0.0, "input": 50.0, "output": 0.0}},
-            },
-            "models": {"m/x": {"requests": 5, "cost_usd": 5.0, "unpriced_requests": 0,
-                                "tokens": {"cached": 0.0, "input": 50.0, "output": 0.0}}},
-        },
-    }}}})
-    # pin "now" to 2026-08-19 12:00 UTC; window starts 2026-08-18 12:00 -> the
-    # 8:00 bucket of yesterday (1 req / $1) must be excluded, everything else kept
-    monkeypatch.setattr(adm, "qk_local_now", lambda cfg: _dt(2026, 8, 19, 12, 0, tzinfo=_tz.utc))
-    ws = _dt(2026, 8, 18, 12, 0, tzinfo=_tz.utc).timestamp()
-
-    out = adm.qk_stats(from_="2026-08-18", to="2026-08-19",
-                       granularity="hour", window_start_ts=ws)
-    assert out["kpi"]["requests"] == 7  # 2 (yesterday 15:00) + 5 (today 9:00)
-    assert abs(out["kpi"]["cost_usd"] - 7.0) < 1e-9
-    buckets = [s["bucket"] for s in out["series"]]
-    assert buckets == ["2026-08-18T15", "2026-08-19T09"]
-    row = out["users"][0]
-    assert row["requests"] == 7
-
-    # without the window, the same range reports the full two days
-    out2 = adm.qk_stats(from_="2026-08-18", to="2026-08-19", granularity="hour")
-    assert out2["kpi"]["requests"] == 8
-
-
-def test_stats_rolling_window_hour_zero(load_admin, monkeypatch):
-    """Regression: 24h selected shortly after local midnight showed 0 rows.
-
-    Window starts yesterday at 00:xx local, so win_hour == 0. The filter
-    writes hour buckets ONLY under qk_tou_local_now (tou.timezone); with a
-    config timezone ahead of UTC (Asia/Shanghai), day buckets flip to the new
-    day while win_day still points at yesterday -> "before window day" skips
-    everything. The day written by the filter at 00:16 local IS inside the
-    rolling 24h window and must be counted whole (hour resolution cannot
-    prove otherwise), and yesterday's day must stay included via win_hour=0.
-    """
+def test_stats_window_24h(load_admin, monkeypatch):
+    """24h span = pure timestamp filter over recent.json. No day/hour buckets,
+    no timezone math: items with ts >= now-86400 are in, older ones are out,
+    even when they were recorded on a different calendar day."""
+    import time as _time
     from datetime import datetime as _dt, timedelta as _td, timezone as _tz
     from pathlib import Path
     from tests.conftest import write_json
@@ -627,29 +581,68 @@ def test_stats_rolling_window_hour_zero(load_admin, monkeypatch):
     CST = _tz(_td(hours=8))
     adm = load_admin()
     write_json(Path(adm.QK_CONFIG_PATH), {"schedule": {"timezone": "Asia/Shanghai"}})
-    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"name": "A", "email": "a@x", "days": {
-        # written by the filter at 2026-08-20 00:16 Asia/Shanghai
-        "2026-08-20": {
-            "requests": 2, "cost_usd": 2.0,
-            "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0},
-            "channels": {"webui": 2, "api": 0},
-            "hours": {
-                "0": {"requests": 2, "cost_usd": 2.0, "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0}},
-            },
-            "models": {"m/x": {"requests": 2, "cost_usd": 2.0, "unpriced_requests": 0,
-                                "channels": {"webui": 2, "api": 0},
-                                "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0}}},
-        },
-    }}}})
-    # stats reads days in the schedule timezone: "now" is just after midnight
     monkeypatch.setattr(adm, "qk_local_now",
                         lambda cfg: _dt(2026, 8, 20, 0, 16, tzinfo=CST))
-    # browser picked 24h at 2026-08-20 00:16 local -> window_start epoch
-    ws = _dt(2026, 8, 19, 0, 16, tzinfo=CST).timestamp()
+    # "now" for the window is 2026-08-20 00:16 CST; items recorded across the
+    # UTC day boundary (2026-08-19 evening local ... wait, CST 00:16 = UTC 16:16
+    # previous day) must all still count -- this is the exact scenario that
+    # showed 0 with the bucket approach.
+    now_ts = _dt(2026, 8, 20, 0, 16, tzinfo=CST).timestamp()
+    items = [
+        {"ts": now_ts - 3600, "user_id": "u1", "name": "A", "email": "a@x",
+         "model": "m/x", "tokens": {"cached": 0.0, "input": 100.0, "output": 50.0},
+         "cost_usd": 0.01, "tou_tier": "normal", "priced": True, "channel": "webui"},
+        {"ts": now_ts - 23 * 3600, "user_id": "u1", "name": "A", "email": "a@x",
+         "model": "m/y", "tokens": {"cached": 10.0, "input": 90.0, "output": 40.0},
+         "cost_usd": 0.02, "tou_tier": "peak", "priced": False, "channel": "api"},
+        # 25h ago: outside the window, must be excluded
+        {"ts": now_ts - 25 * 3600, "user_id": "u1", "name": "A", "email": "a@x",
+         "model": "m/x", "tokens": {"cached": 0.0, "input": 5.0, "output": 5.0},
+         "cost_usd": 99.0, "tou_tier": "normal", "priced": True, "channel": "webui"},
+    ]
+    write_json(Path(adm.QK_RECENT_PATH), {"items": items})
+    write_json(Path(adm.QK_LEDGER_PATH),
+               {"users": {"u1": {"name": "A", "email": "a@x", "days": {}}}})
 
-    out = adm.qk_stats(from_="2026-08-19", to="2026-08-20",
-                       granularity="hour", window_start_ts=ws)
+    out = adm.qk_stats_window(now_ts - 86400)
     assert out["kpi"]["requests"] == 2
-    assert out["users"] and out["users"][0]["requests"] == 2
-    assert out["users"][0]["channels"] == {"webui": 2, "api": 0}
-    assert out["models"] and out["models"][0]["requests"] == 2
+    assert abs(out["kpi"]["cost_usd"] - 0.03) < 1e-9
+    assert out["kpi"]["unpriced_requests"] == 1
+    assert out["kpi"]["tokens"]["input"] == 190.0
+    row = out["users"][0]
+    assert row["requests"] == 2
+    assert row["channels"] == {"webui": 1, "api": 1}
+    assert row["quota_source"] == "none"  # resolved from config, no quota set
+    models = {m["model"]: m for m in out["models"]}
+    assert models["m/x"]["requests"] == 1
+    assert models["m/y"]["tou"]["peak"] == 1
+    assert models["m/y"]["unpriced_requests"] == 1
+    # series bucketed by local hour: item2 at 01:16 local yesterday
+    assert any(b["bucket"].endswith("T01") for b in out["series"])
+    # filters still apply
+    assert adm.qk_stats_window(now_ts - 86400, model="m/y")["kpi"]["requests"] == 1
+    assert adm.qk_stats_window(now_ts - 86400, user="nobody")["kpi"]["requests"] == 0
+
+
+def test_stats_window_partial_flag(load_admin, monkeypatch):
+    """kpi.window_partial tells the UI when the 200-entry ring buffer cannot
+    cover the whole window."""
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    adm = load_admin()
+    write_json(Path(adm.QK_RECENT_PATH), {"items": [
+        {"ts": 1_000_000.0, "user_id": "u1", "name": "A", "email": "a@x",
+         "model": "m/x", "tokens": {}, "cost_usd": 0.0, "channel": "api"}
+        for _ in range(200)
+    ]})
+    out = adm.qk_stats_window(500_000.0)  # window starts before the oldest item
+    assert out["kpi"]["window_partial"] is True
+    out2 = adm.qk_stats_window(1_000_001.0)  # window fully inside the buffer
+    assert out2["kpi"]["window_partial"] is False
+    # buffer not full: nothing could have been evicted, never partial
+    write_json(Path(adm.QK_RECENT_PATH), {"items": [
+        {"ts": 1_000_000.0, "user_id": "u1", "name": "A", "email": "a@x",
+         "model": "m/x", "tokens": {}, "cost_usd": 0.0, "channel": "api"}
+    ]})
+    assert adm.qk_stats_window(500_000.0)["kpi"]["window_partial"] is False
