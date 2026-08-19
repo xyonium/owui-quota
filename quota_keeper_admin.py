@@ -686,6 +686,18 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
     only the sum of the kept hours (per-model rows are not hour-resolved and
     are therefore excluded on the boundary day -- hours buckets are not
     per-model).
+
+    Day-boundary caveat (v0.4.3 fix): the filter stamps day/hour buckets under
+    qk_tou_local_now (TOU timezone) while the window bounds are resolved under
+    qk_local_now (schedule timezone) -- the two can disagree on which calendar
+    day "24h ago" was (e.g. picked right after local midnight, the rolling
+    window starts on the previous UTC day). A rolling 24h window spans at most
+    two days, so only the boundary day can shift: the day BEFORE win_day is
+    still included when its own hour buckets reach >= win_hour (it is then
+    trimmed to those buckets); days strictly after win_day are inside the
+    window and counted whole. When win_hour == 0 the boundary day is kept
+    whole -- with hour buckets absent the day totals are the best
+    approximation, and channels/unpriced stay counted.
     """
     led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
     users = led.get("users") or {}
@@ -699,15 +711,21 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
     cfg = qk_get_config()
     from_s = from_ or "0000-00-00"
     to_s = to or "9999-99-99"
-    # rolling-window lower bound, resolved in the config timezone
-    win_day, win_hour = None, None
+    # rolling-window lower bound. The filter stamps day/hour buckets under
+    # qk_tou_local_now (TOU timezone), so resolve the window in the SAME
+    # timezone -- otherwise a browser-local "24h ago" can land on a different
+    # calendar day than the ledger's buckets and whole days get skipped
+    # (the 24h-span-shows-0 bug right after local midnight).
+    win_day, win_day_prev, win_hour = None, None, None
     if window_start_ts is not None:
         try:
-            wnow = qk_local_now(cfg)
+            wnow = qk_local_now(cfg)  # browser epoch -> schedule-tz calendar day
             wstart = datetime.fromtimestamp(float(window_start_ts), wnow.tzinfo)
-            win_day, win_hour = wstart.strftime("%Y-%m-%d"), wstart.hour
+            win_day = wstart.strftime("%Y-%m-%d")
+            win_day_prev = (wstart - timedelta(days=1)).strftime("%Y-%m-%d")
+            win_hour = wstart.hour
         except Exception:
-            win_day, win_hour = None, None
+            win_day, win_day_prev, win_hour = None, None, None
     for uid, u in users.items():
         if user and user not in (uid, (u.get("name") or ""), (u.get("email") or "")):
             continue
@@ -735,10 +753,28 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
             hours = drec.get("hours") or {}
             win_partial = False  # this day contributes only some hour buckets
             if win_day is not None:
-                if day < win_day:
-                    continue
-                if day == win_day and win_hour is not None and win_hour > 0:
-                    win_partial = True
+                if day == win_day:
+                    # trim the window's boundary day to buckets >= win_hour;
+                    # win_hour == 0 (picked near midnight) keeps the whole day
+                    win_partial = bool(win_hour)
+                elif day < win_day:
+                    # may still be the window's boundary day: the filter
+                    # stamps day/hour buckets under qk_tou_local_now while the
+                    # browser's epoch window_start is resolved under
+                    # qk_local_now, and the two timezones can disagree on
+                    # which calendar day "24h ago" was (24h-span-shows-0 right
+                    # after local midnight). A rolling 24h window spans at
+                    # most two days, so only win_day-1 can shift; keep it when
+                    # its own hour buckets reach into the window, else skip.
+                    if win_hour and day == win_day_prev and hours:
+                        try:
+                            win_partial = max(
+                                int(h) for h in hours if str(h).isdigit()
+                            ) >= win_hour
+                        except ValueError:
+                            win_partial = False
+                    if not win_partial:
+                        continue
             if win_partial:
                 hours = {
                     h: hr for h, hr in hours.items()

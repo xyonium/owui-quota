@@ -607,3 +607,49 @@ def test_stats_rolling_window(load_admin, monkeypatch):
     # without the window, the same range reports the full two days
     out2 = adm.qk_stats(from_="2026-08-18", to="2026-08-19", granularity="hour")
     assert out2["kpi"]["requests"] == 8
+
+
+def test_stats_rolling_window_hour_zero(load_admin, monkeypatch):
+    """Regression: 24h selected shortly after local midnight showed 0 rows.
+
+    Window starts yesterday at 00:xx local, so win_hour == 0. The filter
+    writes hour buckets ONLY under qk_tou_local_now (tou.timezone); with a
+    config timezone ahead of UTC (Asia/Shanghai), day buckets flip to the new
+    day while win_day still points at yesterday -> "before window day" skips
+    everything. The day written by the filter at 00:16 local IS inside the
+    rolling 24h window and must be counted whole (hour resolution cannot
+    prove otherwise), and yesterday's day must stay included via win_hour=0.
+    """
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    write_json(Path(adm.QK_CONFIG_PATH), {"schedule": {"timezone": "Asia/Shanghai"}})
+    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"name": "A", "email": "a@x", "days": {
+        # written by the filter at 2026-08-20 00:16 Asia/Shanghai
+        "2026-08-20": {
+            "requests": 2, "cost_usd": 2.0,
+            "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0},
+            "channels": {"webui": 2, "api": 0},
+            "hours": {
+                "0": {"requests": 2, "cost_usd": 2.0, "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0}},
+            },
+            "models": {"m/x": {"requests": 2, "cost_usd": 2.0, "unpriced_requests": 0,
+                                "channels": {"webui": 2, "api": 0},
+                                "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0}}},
+        },
+    }}}})
+    # stats reads days in the schedule timezone: "now" is just after midnight
+    monkeypatch.setattr(adm, "qk_local_now",
+                        lambda cfg: _dt(2026, 8, 20, 0, 16, tzinfo=CST))
+    # browser picked 24h at 2026-08-20 00:16 local -> window_start epoch
+    ws = _dt(2026, 8, 19, 0, 16, tzinfo=CST).timestamp()
+
+    out = adm.qk_stats(from_="2026-08-19", to="2026-08-20",
+                       granularity="hour", window_start_ts=ws)
+    assert out["kpi"]["requests"] == 2
+    assert out["users"] and out["users"][0]["requests"] == 2
+    assert out["users"][0]["channels"] == {"webui": 2, "api": 0}
+    assert out["models"] and out["models"][0]["requests"] == 2
