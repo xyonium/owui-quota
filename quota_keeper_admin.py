@@ -1064,6 +1064,8 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 .tag.t-offpeak{color:var(--acc);border-color:var(--acc)}
 .tag.t-normal{color:var(--ok);border-color:var(--ok)}
 .tag.manual{color:var(--acc);border-color:var(--acc)}
+.tag.ch-webui{color:var(--ok);border-color:var(--ok)}
+.tag.ch-api{color:var(--acc);border-color:var(--acc)}
 .toast{position:fixed;right:18px;bottom:18px;padding:10px 16px;border-radius:10px;background:var(--card);border:1px solid var(--line);box-shadow:0 8px 30px rgba(0,0,0,.4);opacity:0;transition:.25s;z-index:99}
 .toast.show{opacity:1}
 .admin-only{display:none}
@@ -1195,11 +1197,11 @@ tr.pe-cleared td{opacity:.45}
   <div class="scroll">
   <table id="recentT">
    <thead><tr>
-    <th>Time</th><th>User</th><th>Model</th>
+    <th>Time</th><th>User</th><th>Model</th><th title="webui = sent from the Open WebUI page (chat_id present); api = direct API call">Via</th>
     <th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th>
     <th class="num">Cache%</th><th class="num">Cost $</th><th>Tier</th>
    </tr></thead>
-   <tbody><tr><td colspan="9" class="empty">Press Refresh to load.</td></tr></tbody>
+   <tbody><tr><td colspan="10" class="empty">Press Refresh to load.</td></tr></tbody>
   </table></div>
  </section>
 
@@ -1691,16 +1693,18 @@ function renderRecent(){
     const p=n=>String(n).padStart(2,'0');
     const time=p(dt.getHours())+':'+p(dt.getMinutes())+':'+p(dt.getSeconds());
     const tier=(it.tou_tier&&it.tou_tier!=='off')?`<span class="tag t-${esc(it.tou_tier)}">${esc(it.tou_tier)}</span>`:'';
+    const chan=it.channel==='webui'?'webui':'api';
     return `<tr>
      <td class="small muted">${time}</td>
      <td>${esc(it.name||it.user_id)}<br/><span class="small muted">${esc(it.email||'')}</span></td>
      <td>${esc(it.model)}${it.priced===false?' <span class="tag unpriced">unpriced</span>':''}</td>
+     <td><span class="tag ch-${chan}">${chan}</span></td>
      <td class="num">${fmt(t.cached,0)}</td>
      <td class="num">${fmt(t.input,0)}</td>
      <td class="num">${fmt(t.output,0)}</td>
      <td class="num">${fmt(cp,0)}%</td>
      <td class="num">$${fmt(it.cost_usd,4)}</td>
-     <td>${tier}</td></tr>`;}).join('')||'<tr><td colspan="9" class="empty">No activity recorded yet — send a chat through the filter first.</td></tr>';
+     <td>${tier}</td></tr>`;}).join('')||'<tr><td colspan="10" class="empty">No activity recorded yet — send a chat through the filter first.</td></tr>';
 }
 
 // ---------- config sections ----------
