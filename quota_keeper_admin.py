@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.3.3
+version: 0.3.4
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -56,6 +56,8 @@ DEFAULT_CONFIG = {
     "group_quotas": {},
     "ledger_retention_days": 400,
     "pricing": {
+        # one URL string, or a list merged in order (first source wins on
+        # conflicts); LiteLLM flat and models.dev nested formats both work
         "url": DEFAULT_PRICING_URL,
         "refresh_hours": 24,
         "default_pricing": None,
@@ -177,6 +179,12 @@ def qk_validate_config(cfg) -> list:
     if pri is not None and not isinstance(pri, dict):
         errs.append("pricing must be an object")
     if isinstance(pri, dict):
+        u = pri.get("url")
+        if u is not None and not (
+            isinstance(u, str)
+            or (isinstance(u, list) and all(isinstance(x, str) for x in u))
+        ):
+            errs.append("pricing.url must be a string or a list of strings")
         ov = pri.get("overrides")
         if ov is not None and not isinstance(ov, dict):
             errs.append("pricing.overrides must be an object")
@@ -377,13 +385,21 @@ def _qk_variants(m: str):
     return out
 
 
-def qk_fetch_pricing(url: str, timeout: int = 30) -> dict:
+def qk_fetch_pricing(url: str, timeout: int = 30, table: dict = None) -> dict:
+    """Fetch one pricing source and merge it into `table` (a fresh dict when
+    omitted). Existing keys win: when several sources are configured the
+    FIRST listed source's entry for a model id is kept (source priority).
+
+    Auto-detected formats: LiteLLM flat (key -> per-token costs) and
+    models.dev nested (provider -> models -> per-1M costs). Prices are
+    normalized to per-1M tokens."""
     import requests
 
+    if table is None:
+        table = {}
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
     raw = r.json()
-    table = {}
 
     def is_litellm(d) -> bool:
         if not isinstance(d, dict) or not d:
@@ -411,7 +427,7 @@ def qk_fetch_pricing(url: str, timeout: int = 30) -> dict:
                 "cache_write": tok("cache_creation_input_token_cost"),
             }
             if entry["input"] is not None or entry["output"] is not None:
-                table[str(name).strip().lower()] = entry
+                table.setdefault(str(name).strip().lower(), entry)
     else:
         # models.dev style: {provider: {"models": {name: {"cost": per-1M}}}}
         for prov, pdata in (raw or {}).items():
@@ -431,7 +447,7 @@ def qk_fetch_pricing(url: str, timeout: int = 30) -> dict:
                     "cache_write": pm("cache_write"),
                 }
                 if entry["input"] is not None or entry["output"] is not None:
-                    table[f"{prov}/{name}".strip().lower()] = entry
+                    table.setdefault(f"{prov}/{name}".strip().lower(), entry)
                     table.setdefault(str(name).strip().lower(), entry)
     if not table:
         raise ValueError("unrecognized pricing format")
@@ -523,10 +539,17 @@ def qk_refresh_pricing(force: bool = False) -> dict:
         age = time.time() - float(cache.get("fetched_at") or 0)
         if age < interval * 3600:
             return {"status": "cached", "models": len(cache.get("table") or {})}
-    url = pconf.get("url") or DEFAULT_PRICING_URL
-    table = qk_fetch_pricing(url)
+    # pricing.url accepts one URL or a list (first source wins on conflicts)
+    urls = pconf.get("url") or DEFAULT_PRICING_URL
+    if isinstance(urls, str):
+        urls = [urls]
+    urls = [u for u in urls if isinstance(u, str) and u.strip()] or [DEFAULT_PRICING_URL]
+    table = {}
+    for u in urls:
+        table = qk_fetch_pricing(u.strip(), table=table)
     payload = {
-        "url": url,
+        "url": urls[0] if len(urls) == 1 else urls,
+        "sources": urls,
         "fetched_at": time.time(),
         "fetched_at_iso": datetime.now(_dt_timezone.utc).isoformat(),
         "models": len(table),
@@ -1209,9 +1232,9 @@ tr.pe-cleared td{opacity:.45}
 
  <section id="secPricing" hidden>
   <h2>Pricing source</h2>
-  <p class="hint">Supports LiteLLM model_prices_and_context_window.json (per-token converted to per-1M) and models.dev format. Match order: override → exact → date-stripped → path suffix → segment → contains.</p>
+  <p class="hint">Supports LiteLLM model_prices_and_context_window.json (per-token converted to per-1M) and models.dev format. <b>Multiple sources</b>: one URL per line (or a JSON list) — they merge in order and the FIRST source wins when the same model id appears in several. Match order: override → exact → date-stripped → path suffix → segment → contains.</p>
   <div class="row c2">
-   <div><label>Pricing URL</label><input id="pricing_url"/></div>
+   <div><label>Pricing URL(s), one per line</label><textarea id="pricing_url" rows="2"></textarea></div>
    <div><label>Refresh interval (hours)</label><input id="refresh_hours" type="number" min="0" step="1"/></div>
   </div>
   <label>Fallback pricing per 1M tokens when no match (JSON, optional)</label>
@@ -1701,7 +1724,7 @@ function renderConfig(){
   $('night_multiplier').value=s.night_multiplier??1;
   $('weekend_multiplier').value=s.weekend_multiplier??1;
   const p=STATE.cfg.pricing||{};
-  $('pricing_url').value=p.url||'';
+  $('pricing_url').value=Array.isArray(p.url)?p.url.join('\n'):(p.url||'');
   $('refresh_hours').value=p.refresh_hours??24;
   $('default_pricing').value=p.default_pricing?JSON.stringify(p.default_pricing):'';
   $('mult_now').textContent='Current time multiplier: ×'+(STATE.cfg._time_multiplier??STATE.me.multiplier??1);
@@ -1769,7 +1792,7 @@ async function saveConfig(){
     // overrides: read from the editor when it has been opened; otherwise
     // keep whatever the config already holds (editor reads are authoritative
     // only after /pricing?full=1 has loaded once)
-    pricing:{url:$('pricing_url').value.trim(),refresh_hours:num('refresh_hours',24),default_pricing:dp,overrides:STATE.pe.loaded?collectOverrides():((STATE.cfg.pricing||{}).overrides||{})},
+    pricing:{url:(()=>{const lines=$('pricing_url').value.split('\n').map(s=>s.trim()).filter(Boolean);return lines.length<=1?(lines[0]||''):lines})(),refresh_hours:num('refresh_hours',24),default_pricing:dp,overrides:STATE.pe.loaded?collectOverrides():((STATE.cfg.pricing||{}).overrides||{})},
     group_quotas:gq,user_quotas:uq,
     tou:buildTou(),
   };

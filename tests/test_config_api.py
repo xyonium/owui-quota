@@ -195,3 +195,56 @@ def test_models_endpoint_aggregates_used_and_available(admin_client, monkeypatch
     # /api/models entries with no usage are NOT listed (the editor only shows
     # models that actually appear in usage records)
     assert "prx.free" not in items
+
+
+# ---- multi-source pricing (v0.3.4) --------------------------------------------
+
+
+def test_fetch_pricing_merges_sources_first_wins(admin_client, monkeypatch):
+    import types as _t
+
+    c, adm = _app(admin_client)
+    calls = []
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._p = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._p
+
+    # source 1: LiteLLM flat (per-token); source 2: models.dev nested (per-1M)
+    payloads = {
+        "u1": {"gpt-x": {"input_cost_per_token": 1e-6, "output_cost_per_token": 2e-6}},
+        "u2": {"moonshotai": {"models": {"kimi-k3": {"cost": {"input": 3.0, "output": 15.0, "cache_read": 0.3}}}},
+               "zai": {"models": {"glm-5.2": {"cost": {"input": 1.4, "output": 4.4, "cache_read": 0.26}}}},
+        }}
+
+    def fake_get(url, timeout=30):
+        calls.append(url)
+        return FakeResp(payloads[url])
+
+    monkeypatch.setitem(__import__("sys").modules, "requests", _t.SimpleNamespace(get=fake_get))
+    table = {}
+    table = adm.qk_fetch_pricing("u1", table=table)
+    table = adm.qk_fetch_pricing("u2", table=table)
+    assert table["gpt-x"] == {"input": 1.0, "output": 2.0, "cached": None, "cache_write": None}
+    assert table["moonshotai/kimi-k3"]["input"] == 3.0
+    assert table["kimi-k3"]["output"] == 15.0  # bare key also registered
+    assert table["glm-5.2"]["cached"] == 0.26
+
+    # conflict: first source wins
+    payloads["u3"] = {"other": {"models": {"kimi-k3": {"cost": {"input": 99.0, "output": 99.0}}}}}
+    table = adm.qk_fetch_pricing("u3", table=table)
+    assert table["kimi-k3"]["input"] == 3.0  # NOT overwritten by u3
+
+
+def test_validate_pricing_url_list(admin_client):
+    c, adm = _app(admin_client)
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"url": ["https://a", "https://b"]}}).status_code == 200
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"url": 123}}).status_code == 400

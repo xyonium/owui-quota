@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.3.1
+version: 0.3.4
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -56,10 +56,12 @@ DEFAULT_CONFIG = {
     "group_quotas": {},                 # group_id -> credits (max wins among groups)
     "ledger_retention_days": 400,
     "pricing": {
+        # one URL string, or a list merged in order (first source wins on
+        # conflicts); LiteLLM flat and models.dev nested formats both work
         "url": DEFAULT_PRICING_URL,
         "refresh_hours": 24,
-        "default_pricing": None,        # {"input":..,"cached":..,"output":..} per 1M tokens
-        "overrides": {},                # model -> same shape, absolute priority
+        "default_pricing": None,
+        "overrides": {},
     },
     "schedule": {
         "timezone": None,               # None -> $TZ -> UTC
@@ -200,6 +202,12 @@ def qk_validate_config(cfg) -> list:
     if pri is not None and not isinstance(pri, dict):
         errs.append("pricing must be an object")
     if isinstance(pri, dict):
+        u = pri.get("url")
+        if u is not None and not (
+            isinstance(u, str)
+            or (isinstance(u, list) and all(isinstance(x, str) for x in u))
+        ):
+            errs.append("pricing.url must be a string or a list of strings")
         ov = pri.get("overrides")
         if ov is not None and not isinstance(ov, dict):
             errs.append("pricing.overrides must be an object")

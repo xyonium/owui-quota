@@ -29,7 +29,7 @@
 
 - 成本按 token 细分：`cached / input / output / cache_write`，全部计入 cost（USD）。
 - `credits_per_usd` 默认 1000，即 1000 credits = $1。
-- 价格来源默认 LiteLLM 的 `model_prices_and_context_window.json`（每 token 价格自动换算为每 1M），也支持 models.dev 嵌套格式；可改 URL。
+- 价格来源默认 LiteLLM 的 `model_prices_and_context_window.json`（每 token 价格自动换算为每 1M），也支持 models.dev 嵌套格式；可改 URL。**v0.3.4 起支持多数据源**：`pricing.url` 可填多个（每行一个 URL 或 JSON list），按顺序合并、同一模型 id 冲突时**第一个源生效**。例：默认 LiteLLM 表没有 moonshotai/zai 官方裸键（kimi-k3、glm-5.2 等只在 azure_ai/ 等第三方前缀下），可追加 `https://models.dev/api.json` 补官方价。
 - 模糊匹配顺序：override → exact → 去日期后缀 → 路径后缀（`openai/gpt-4o` → `gpt-4o`）→ 尾段 → 包含子串；`.` 与 `-` 归一化，自动剥离 `-2024-08-06` / `-20241022` 等日期尾巴。管理页有 "Test match" 输入框实时验证。
 - 无匹配且未配置 fallback pricing 时该模型计 0 成本，并在用量表打 unpriced 标记。
 
