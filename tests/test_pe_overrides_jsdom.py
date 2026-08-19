@@ -232,6 +232,9 @@ for (const id of ['secDash','secUsers','secModels','secRecent','secGeneral','sec
                   'secPricing','secGroups','secUserq','secPricingEditor','secTou','secPersonal'])
   add(id, 'div');
 add('userq', 'table', '<tbody></tbody>');
+add('kpis', 'div'); add('trend', 'div'); add('trendLegend', 'div');
+add('uRank', 'table', '<tbody></tbody>'); add('modelsT', 'table', '<tbody></tbody>');
+add('recentT', 'table', '<tbody></tbody>'); add('qUser', 'input');
 add('groups', 'table', '<tbody></tbody>');
 add('toast', 'div');
 add('peSearch', 'input');

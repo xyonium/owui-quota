@@ -155,10 +155,9 @@ bedrock.us-east-1/anthropic.claude-3-5-haiku→contains / totally-unknown→None
 `user_quotas[uid] > 0` → user；否则所属 groups 在 group_quotas 中的正值取 **max** → group；否则 default > 0 → default；否则 None（不限）。
 组列表来源：`user["group_ids"]`（Open WebUI 注入）优先，缺失时 fallback `open_webui.models.groups.Groups.get_groups_by_member_id(uid)`（**在 Filter 进程内可用；沙箱测试无此模块**）。
 
-### 5.4 时段倍数 qk_time_multiplier
+### 5.4 ~~时段倍数 qk_time_multiplier~~（v0.4.0 已移除，恒 1）
 
-`mult = 1`；周六/周日(weekday≥5) 且 weekend_multiplier≠1 → ×w；处于 [night_start, night_end)（支持跨零点：ns>ne 时 `h>=ns or h<ne`）且 night_multiplier≠1 → ×n。
-生效配额 = 解析配额 × mult。mult<1 表示收紧，>1 放宽。已验证：Sat23:00(0.5×0.5)=0.25、Mon23:00=0.5、Mon12:00=1.0。
+**移除原因**：配额周期是天/月而倍数按小时切换——白天已用超闸的用户在 22:00 闸门降到一半时被立即断供（不是"夜间少给"，是"夜间断供"，8:00 又自动恢复）；且与 TOU 方向相反（同为 ×0.5，一个限量一个降价），极易混淆。决定删除：函数保留但恒返回 1.0（兼容 `/me`、`/stats`、inlet 的既有引用与响应字段），`DEFAULT_CONFIG.schedule` 只剩 `timezone`（账本日界 + TOU 兜底时区，v0.4.0 起默认 `Asia/Shanghai`）；validator 对遗留 night/weekend 键忽略不报错；inlet 的 `eff<=0` 死分支删除；UI 的 Time schedule 区块缩为单个 Timezone 输入。已验证：`test_schedule_multipliers_removed_always_one`。
 
 ### 5.5 价格拉取 qk_fetch_pricing（admin 独有）
 

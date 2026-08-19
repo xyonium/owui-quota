@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.3.5
+version: 0.4.0
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -64,11 +64,7 @@ DEFAULT_CONFIG = {
         "overrides": {},
     },
     "schedule": {
-        "timezone": None,
-        "night_start_hour": 22,
-        "night_end_hour": 8,
-        "night_multiplier": 1.0,
-        "weekend_multiplier": 1.0,
+        "timezone": "Asia/Shanghai",               # None -> $TZ -> UTC (ledger day keys & TOU fallback TZ)
     },
     "tou": {
         "enabled": False,
@@ -168,13 +164,8 @@ def qk_validate_config(cfg) -> list:
     sch = cfg.get("schedule")
     if sch is not None and not isinstance(sch, dict):
         errs.append("schedule must be an object")
-    if isinstance(sch, dict):
-        for k in ("night_start_hour", "night_end_hour"):
-            if k in sch and not (isinstance(sch[k], int) and not isinstance(sch[k], bool) and 0 <= sch[k] <= 23):
-                errs.append(f"schedule.{k} must be int 0-23")
-        for k in ("night_multiplier", "weekend_multiplier"):
-            if k in sch and not (_QK_NUM(sch[k]) and sch[k] >= 0):
-                errs.append(f"schedule.{k} must be number >= 0")
+    # night/weekend multiplier keys were removed in v0.4.0; legacy keys left
+    # in config.json are ignored (not an error).
     pri = cfg.get("pricing")
     if pri is not None and not isinstance(pri, dict):
         errs.append("pricing must be an object")
@@ -561,31 +552,12 @@ def qk_refresh_pricing(force: bool = False) -> dict:
 
 
 def qk_time_multiplier(cfg: dict) -> float:
-    now = qk_local_now(cfg)
-    sch = cfg.get("schedule") or {}
-    mult = 1.0
-    wm_raw = sch.get("weekend_multiplier", 1.0)
-    try:
-        wm = float(wm_raw) if _num(wm_raw) else 1.0
-    except Exception:
-        wm = 1.0
-    nm_raw = sch.get("night_multiplier", 1.0)
-    try:
-        nm = float(nm_raw) if _num(nm_raw) else 1.0
-    except Exception:
-        nm = 1.0
-    if now.weekday() >= 5 and wm != 1.0:
-        mult *= wm
-    try:
-        ns = int(sch.get("night_start_hour", 22))
-        ne = int(sch.get("night_end_hour", 8))
-    except Exception:
-        ns, ne = 22, 8
-    h = now.hour
-    in_night = (h >= ns or h < ne) if ns > ne else (ns <= h < ne)
-    if in_night and nm != 1.0:
-        mult *= nm
-    return mult
+    """Deprecated night/weekend quota multipliers: removed in v0.4.0 (a
+    time-varying quota ceiling hard-blocks users mid-period when the
+    multiplier drops below their already-spent amount -- confusing and
+    near-useless next to TOU pricing). Always 1; the schedule config key
+    remains only for `timezone`."""
+    return 1.0
 
 
 def qk_user_group_ids(user: dict):
@@ -1217,18 +1189,11 @@ tr.pe-cleared td{opacity:.45}
  </section>
 
  <section id="secSchedule" hidden>
-  <h2>Time schedule (quota multipliers)</h2>
-  <p class="hint"><b>Not a price discount.</b> These scale the user's <b>quota ceiling</b> (effective quota = quota × multiplier), NOT the price. Unrelated to TOU below: TOU scales the <b>price</b> of each request, this scales <b>how much users may spend</b> — they multiply different things and can safely coexist (keep both at 1 if you only want TOU pricing). Example: night ×0.5 halves the quota at night.</p>
+  <h2>Timezone</h2>
+  <p class="hint">The timezone used for ledger day boundaries (daily/monthly quota periods) and as the fallback for TOU windows (TOU has its own optional timezone below). Defaults to Asia/Shanghai; set to empty to use the server TZ. The old night/weekend quota multipliers were removed in v0.4.0 — use TOU pricing for time-of-day economics.</p>
   <div class="row c3">
-   <div><label>Timezone (empty = server TZ)</label><input id="schedule_timezone" placeholder="Asia/Shanghai"/></div>
-   <div><label>Night start hour</label><input id="night_start_hour" type="number" min="0" max="23"/></div>
-   <div><label>Night end hour</label><input id="night_end_hour" type="number" min="0" max="23"/></div>
+   <div><label>Timezone</label><input id="schedule_timezone" placeholder="Asia/Shanghai"/></div>
   </div>
-  <div class="row c2">
-   <div><label>Night multiplier (1 = off)</label><input id="night_multiplier" type="number" step="0.05"/></div>
-   <div><label>Weekend multiplier (1 = off)</label><input id="weekend_multiplier" type="number" step="0.05"/></div>
-  </div>
-  <p class="hint" id="mult_now"></p>
  </section>
 
  <section id="secPricing" hidden>
@@ -1720,15 +1685,10 @@ function renderConfig(){
   $('default_quota_credits').value=STATE.cfg.default_quota_credits??'';
   const s=STATE.cfg.schedule||{};
   $('schedule_timezone').value=s.timezone??'';
-  $('night_start_hour').value=s.night_start_hour??22;
-  $('night_end_hour').value=s.night_end_hour??8;
-  $('night_multiplier').value=s.night_multiplier??1;
-  $('weekend_multiplier').value=s.weekend_multiplier??1;
   const p=STATE.cfg.pricing||{};
   $('pricing_url').value=Array.isArray(p.url)?p.url.join('\n'):(p.url||'');
   $('refresh_hours').value=p.refresh_hours??24;
   $('default_pricing').value=p.default_pricing?JSON.stringify(p.default_pricing):'';
-  $('mult_now').textContent='Current time multiplier: ×'+(STATE.cfg._time_multiplier??STATE.me.multiplier??1);
 }
 function userGroups(u){
   return STATE.groups.filter(g=>(g.members||[]).includes(u.id)).map(g=>g.id);
@@ -1789,7 +1749,7 @@ async function saveConfig(){
     credits_per_usd:num('credits_per_usd',1000),
     quota_period:$('quota_period').value,
     default_quota_credits:$('default_quota_credits').value===''?null:parseFloat($('default_quota_credits').value),
-    schedule:{timezone:$('schedule_timezone').value.trim()||null,night_start_hour:num('night_start_hour',22),night_end_hour:num('night_end_hour',8),night_multiplier:num('night_multiplier',1),weekend_multiplier:num('weekend_multiplier',1)},
+    schedule:{timezone:$('schedule_timezone').value.trim()||null},
     // overrides: read from the editor when it has been opened; otherwise
     // keep whatever the config already holds (editor reads are authoritative
     // only after /pricing?full=1 has loaded once)

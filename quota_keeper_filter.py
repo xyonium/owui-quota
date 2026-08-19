@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.3.4
+version: 0.4.0
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -64,11 +64,7 @@ DEFAULT_CONFIG = {
         "overrides": {},
     },
     "schedule": {
-        "timezone": None,               # None -> $TZ -> UTC
-        "night_start_hour": 22,
-        "night_end_hour": 8,
-        "night_multiplier": 1.0,        # quota * multiplier at night (e.g. 0.5)
-        "weekend_multiplier": 1.0,      # quota * multiplier on Sat/Sun
+        "timezone": "Asia/Shanghai",               # None -> $TZ -> UTC (ledger day keys & TOU fallback TZ)
     },
     "tou": {
         "enabled": False,
@@ -191,13 +187,8 @@ def qk_validate_config(cfg) -> list:
     sch = cfg.get("schedule")
     if sch is not None and not isinstance(sch, dict):
         errs.append("schedule must be an object")
-    if isinstance(sch, dict):
-        for k in ("night_start_hour", "night_end_hour"):
-            if k in sch and not (isinstance(sch[k], int) and not isinstance(sch[k], bool) and 0 <= sch[k] <= 23):
-                errs.append(f"schedule.{k} must be int 0-23")
-        for k in ("night_multiplier", "weekend_multiplier"):
-            if k in sch and not (_QK_NUM(sch[k]) and sch[k] >= 0):
-                errs.append(f"schedule.{k} must be number >= 0")
+    # night/weekend multiplier keys were removed in v0.4.0; legacy keys left
+    # in config.json are ignored (not an error).
     pri = cfg.get("pricing")
     if pri is not None and not isinstance(pri, dict):
         errs.append("pricing must be an object")
@@ -783,31 +774,12 @@ def qk_resolve_quota(cfg: dict, user: dict, group_ids=None):
 
 
 def qk_time_multiplier(cfg: dict) -> float:
-    sch = cfg.get("schedule") or {}
-    now = qk_local_now(cfg)
-    mult = 1.0
-    wm_raw = sch.get("weekend_multiplier", 1.0)
-    try:
-        wm = float(wm_raw) if _num(wm_raw) else 1.0
-    except Exception:
-        wm = 1.0
-    nm_raw = sch.get("night_multiplier", 1.0)
-    try:
-        nm = float(nm_raw) if _num(nm_raw) else 1.0
-    except Exception:
-        nm = 1.0
-    if now.weekday() >= 5 and wm != 1.0:
-        mult *= wm
-    try:
-        ns = int(sch.get("night_start_hour", 22))
-        ne = int(sch.get("night_end_hour", 8))
-    except Exception:
-        ns, ne = 22, 8
-    h = now.hour
-    in_night = (h >= ns or h < ne) if ns > ne else (ns <= h < ne)
-    if in_night and nm != 1.0:
-        mult *= nm
-    return mult
+    """Deprecated night/weekend quota multipliers: removed in v0.4.0 (a
+    time-varying quota ceiling hard-blocks users mid-period when the
+    multiplier drops below their already-spent amount -- confusing and
+    near-useless next to TOU pricing). Always 1; the schedule config key
+    remains only for `timezone`."""
+    return 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -891,16 +863,8 @@ class Filter:
             quota, source = qk_resolve_quota(cfg, user, gids)
             if quota is None:
                 return body  # unlimited
-            mult = qk_time_multiplier(cfg)
+            mult = qk_time_multiplier(cfg)  # always 1 since v0.4.0
             eff = quota * mult
-            if eff <= 0:
-                # multiplier zeroed the quota (e.g. night_multiplier=0): a
-                # hard block, not unlimited
-                raise QuotaBlocked(
-                    "Quota temporarily disabled: effective quota is 0 "
-                    "(time multiplier = {}). Contact admin to adjust the "
-                    "schedule multipliers.".format(round(mult, 3))
-                )
             try:
                 cpu_ = float(cfg.get("credits_per_usd") or 1000.0)
             except Exception:

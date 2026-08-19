@@ -37,8 +37,11 @@ def test_bad_schema_400(admin_client):
 
 def test_numeric_bounds(admin_client):
     c, adm = _app(admin_client)
-    r = c.post("/api/v1/quota-keeper/config", json={"schedule": {"night_start_hour": 99}})
+    r = c.post("/api/v1/quota-keeper/config", json={"credits_per_usd": 0})
     assert r.status_code == 400
+    # legacy schedule multiplier keys are ignored (removed feature), not 400
+    r = c.post("/api/v1/quota-keeper/config", json={"schedule": {"night_start_hour": 99}})
+    assert r.status_code == 200
 
 
 def test_non_json_body_400(admin_client):
