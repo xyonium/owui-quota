@@ -164,7 +164,33 @@ def test_overrides_save_preserves_non_visible_rows():
     // -> must NOT be emitted.
     const rc = STATE.pe.orig['zebra/model-ccc'];
     rc.cur = {prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''};
+    // alias scenario: give bbb an alias, save, then (fresh load, untouched
+    // rows) save again -- the second save must NOT wipe the alias with a
+    // direct-prices override (the v0.3.0 bug: upstream-priced rows were
+    // re-emitted because undefined !== 1.0 on missing fields)
+    STATE.pe.orig['zebra/model-bbb'].cur = {prices:{input:null,cached:null,cache_write:null,output:null},alias:'kimi-k3',mult:0.5};
     saveConfig();
+    await new Promise(r2 => setTimeout(r2, 60));
+    const ov1 = (window.FAKE.posted.pricing || {}).overrides || {};
+    if (!(ov1['zebra/model-bbb'] && ov1['zebra/model-bbb'].alias === 'kimi-k3'))
+      throw new Error('alias not emitted: ' + JSON.stringify(ov1));
+    // simulate the post-save state: cfg now holds the alias AND /models
+    // reports it (the live round-trip the editor sees after a real save),
+    // then re-save WITHOUT touching anything
+    window.FAKE.cfg.pricing.overrides = ov1;
+    window.FAKE.models.items.find(it => it.model === 'zebra/model-bbb').override = ov1['zebra/model-bbb'];
+    STATE.cfg = window.FAKE.cfg;
+    STATE.pe.data = window.FAKE.models;
+    rebuildPeOrig();
+    saveConfig();
+    await new Promise(r2 => setTimeout(r2, 60));
+    const ov2 = (window.FAKE.posted.pricing || {}).overrides || {};
+    if (!(ov2['zebra/model-bbb'] && ov2['zebra/model-bbb'].alias === 'kimi-k3'))
+      throw new Error('alias wiped on second save: ' + JSON.stringify(ov2));
+    if (ov2['zebra/model-ccc'] || ov2['zebra/model-aaa'] && ov2['zebra/model-aaa'].prices === undefined)
+      throw new Error('untouched rows emitted: ' + JSON.stringify(ov2));
+    window.__result = 'OK overrides=' + JSON.stringify(ov2);
+    return;
     await new Promise(r2 => setTimeout(r2, 60));
     const body = window.FAKE.posted;
     if (!body) throw new Error('no /config POST recorded');

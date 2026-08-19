@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.3.1
+version: 0.3.2
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1862,7 +1862,7 @@ function peRowHtml(k,o){
     :eff&&eff.alias?('alias → '+esc(eff.alias)+(eff.mult!==''&&eff.mult!==null?' ×'+esc(eff.mult):''))
     :(o.how?esc(o.how):'<span class="tag unpriced">no match</span>');
   const numVal=f=>{const v=(showPrice||{})[f];return (v===null||v===undefined)?'':v};
-  const dis=o.cleared||!!(eff&&eff.alias)?'disabled':'';
+  const dis=o.cleared?'disabled':'';
   const adis=o.cleared?'disabled':'';
   return `<tr data-mrow="${esc(k)}"${o.cleared?' class="pe-cleared"':''}>
    <td>${esc(k)}
@@ -1913,9 +1913,13 @@ function collectOverrides(){
   //  - cleared manual row          -> emit null (deep-merge tombstone)
   //  - alias set                   -> {alias, multiplier?} (multiplier omitted
   //    when blank -> backend treats it as 1)
-  //  - prices differ from upstream -> {prices:{...}}
-  //  - manual row re-emitted even if unchanged (preservation across saves)
-  //  - unedited non-manual rows    -> never emitted
+  //  - edited rows with any price  -> {prices:{...}} (cur is only populated
+  //    by peEdit, so an untouched upstream row never emits -- the previous
+  //    "changed vs upstream" float-equality check re-emitted every
+  //    upstream-priced row as an override and wiped the row's alias on any
+  //    later save)
+  //  - unedited rows               -> never emitted (existing overrides are
+  //    preserved because the POST deep-merges into the stored config)
   const ov={};
   Object.entries(STATE.pe.orig).forEach(([k,o])=>{
     if(o.cleared){ov[k]=null;return}
@@ -1927,15 +1931,11 @@ function collectOverrides(){
       ov[k]=out;
       return;
     }
+    if(!o.cur)return; // untouched rows never emit (deep-merge preserves stored overrides)
     const p=eff.prices||{};
     const hasVal=Object.values(p).some(v=>v!==null&&v!==undefined);
     if(!hasVal)return;
-    // compare against the *current effective* price; only a real change
-    // turns a non-manual row into an override (editing one field while the
-    // others stay at the resolved values does not dirty the row)
-    const base=o.price||null;
-    const changed=!base||['input','cached','cache_write','output'].some(f=>(p[f]??null)!==(base[f]??null));
-    if(o.manual||changed)ov[k]={prices:p};
+    ov[k]={prices:p};
   });
   return ov;
 }
