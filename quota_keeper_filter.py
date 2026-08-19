@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.3.0
+version: 0.3.1
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -552,12 +552,15 @@ def qk_prune_ledger(led: dict, cfg: dict) -> None:
 
 
 def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True,
-                    now: datetime = None) -> None:
+                    now: datetime = None, channel: str = "api") -> None:
     """Record one usage event. count_request=False marks a partial-usage
     topup for an id that already recorded: tokens/cost still accumulate but
     the request counters (day/hours/models) are not incremented again.
     `now` overrides the current time (also picks the TOU tier/day key);
-    default is the TOU-aware local now."""
+    default is the TOU-aware local now. `channel` is "webui" when the request
+    came through the web UI (non-empty __metadata__.chat_id), else "api" --
+    used by the dashboard's per-user webui/api split for reconciling
+    against Open WebUI's own analytics."""
     uid = (user or {}).get("id")
     if not uid:
         return
@@ -596,6 +599,8 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         )
         if count_request:
             d["requests"] = d.get("requests", 0) + 1
+            dch = d.setdefault("channels", {"webui": 0, "api": 0})
+            dch[channel if channel in dch else "api"] = dch.get(channel if channel in dch else "api", 0) + 1
         d["cost_usd"] = round(d.get("cost_usd", 0.0) + cost, 8)
         dtou = d.setdefault("tou", {"peak": 0, "offpeak": 0, "normal": 0})
         if count_request and tier in dtou:
@@ -633,6 +638,8 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         if count_request:
             mm["requests"] = mm.get("requests", 0) + 1
             mm["unpriced_requests"] = mm.get("unpriced_requests", 0) + (0 if priced else 1)
+            mch = mm.setdefault("channels", {"webui": 0, "api": 0})
+            mch[channel if channel in mch else "api"] = mch.get(channel if channel in mch else "api", 0) + 1
         mm["cost_usd"] = round(mm.get("cost_usd", 0.0) + cost, 8)
         mtou = mm.setdefault("tou", {"peak": 0, "offpeak": 0, "normal": 0})
         if count_request and tier in mtou:
@@ -663,6 +670,7 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
                     "cost_usd": cost,
                     "tou_tier": tier,
                     "priced": priced,
+                    "channel": channel,
                 }
             )
             del items[:-200]
@@ -839,20 +847,20 @@ class Filter:
             self._seen.popitem(last=False)
         return True
 
-    def _record(self, user: dict, model: str, tok: dict, rid: str = "") -> None:
+    def _record(self, user: dict, model: str, tok: dict, rid: str = "", channel: str = "api") -> None:
         # orphan (no user yet) is stashed WITHOUT marking seen, so the same
         # response id can be adopted and recorded later by outlet()/stream()
         uid = (user or {}).get("id")
         if not uid:
             rid = rid or f"{time.time_ns()}"
-            self._orphan[rid] = {"model": model, "tok": tok, "ts": time.time()}
+            self._orphan[rid] = {"model": model, "tok": tok, "ts": time.time(), "channel": channel}
             while len(self._orphan) > 256:
                 self._orphan.popitem(last=False)
             return
         rid = rid or f"{time.time_ns()}"
         if not self._mark_seen(rid):
             return
-        qk_record_usage(user, model, tok)
+        qk_record_usage(user, model, tok, channel=channel)
 
     # -- enforcement ----------------------------------------------------------
 
@@ -944,15 +952,16 @@ class Filter:
                 return event
             rid = str(ev.get("id") or f"stream-{time.time_ns()}")
             model = str(ev.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+            chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"
             if rid in self._seen:
                 # Later partial usage for an already-recorded id: contribute
                 # its own fields additively (no new request). Anthropic sends
                 # input in message_start and cumulative output in
                 # message_delta, so plain addition matches the real totals;
                 # input is counted once from the first event.
-                qk_record_usage(__user__ or {}, model, tok, count_request=False)
+                qk_record_usage(__user__ or {}, model, tok, count_request=False, channel=chan)
                 return event
-            self._record(__user__ or {}, model, tok, rid)
+            self._record(__user__ or {}, model, tok, rid, channel=chan)
         except Exception as e:
             log.warning("quota-keeper stream error: %s", e)
         return event
@@ -971,19 +980,20 @@ class Filter:
                 tok = qk_normalize_usage((choices[0] or {}).get("usage"))
             rid = str(body.get("id") or "")
             model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+            chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"
             if tok is not None:
-                self._record(__user__ or {}, model, tok, rid)
+                self._record(__user__ or {}, model, tok, rid, channel=chan)
             elif rid and (__user__ or {}).get("id") and rid in self._orphan:
                 # adopt usage stashed by stream() when user info was missing
                 # there (independent of estimate_unreported_tokens)
                 ent = self._orphan.pop(rid)
-                qk_record_usage(__user__, ent["model"], ent["tok"])
+                qk_record_usage(__user__, ent["model"], ent["tok"], channel=ent.get("channel") or chan)
             elif self.valves.estimate_unreported_tokens and (__user__ or {}).get("id"):
                 ch = (body.get("choices") or [{}])[0]
                 content = str((ch.get("message") or {}).get("content") or "")
                 if content:
                     est = {"cached": 0.0, "input": 0.0, "output": len(content) / 4.0, "cache_write": 0.0}
-                    self._record(__user__, model, est, rid or f"est-{time.time_ns()}")
+                    self._record(__user__, model, est, rid or f"est-{time.time_ns()}", channel=chan)
         except Exception as e:
             log.warning("quota-keeper outlet error: %s", e)
         return body

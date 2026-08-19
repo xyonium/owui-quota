@@ -110,6 +110,7 @@ Open WebUI 实例
 - `priced` 由 `unpriced_requests`（每请求计数，v0.2.0 取代旧的 sticky "与"累积）派生：`mm["priced"] = mm.get("unpriced_requests",0) == 0`，语义向后兼容（出现过一次 unpriced 即 false）。`count_request=False` 的增量（Anthropic 部分 usage 合并的 topup）不递增任何请求计数、不递增 unpriced。
 - `tou`：逐日/逐模型记录各档请求数（peak/offpeak/normal）；`cost_saved_usd` = 按 normal 价应计成本 − 实际成本（TOU rate 折扣额）。
 - 旧账本缺这些字段时全部按 0/缺省读（向后兼容，无迁移）。
+- v0.3.1 新增 `channels:{webui,api}`（天级 + 逐模型，仅请求计数）：`__metadata__.chat_id` 非空记为 webui，否则 api（直连 API 无 chat 上下文）；topup 不递增。recent.json 每条也带 `channel` 字段。dashboard 用户排行表 WebUI 列由此聚合，用于与 OWUI 自带 analytics 对账；24h 跨度为滚动窗口（`window_start_ts`，仅按 hours 桶计，边界天的 per-model 行因 hours 桶非 per-model 而跳过——见 qk_stats docstring）。
 
 ### recent.json 结构（v0.2.0，dashboard「最近动态」）
 
@@ -277,7 +278,7 @@ v0.2.1 修复记录（真实实例首验发现）：
 ## 10. 快速上手（给 coding agent）
 
 1. 环境要求：Open WebUI ≥ 0.10.0（Event primitive + `__app__` 注入；Filter 部分兼容 0.6+）。
-2. 复现测试：仓库 `tests/` 的 70 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾；页面 JS 以 **AST 求值**（而非原始切片）取 QK_PAGE 后过 `node --check` 与 jsdom（v0.2.7 教训：Python 会吃掉 JS 里的 `\n` 转义）。
+2. 复现测试：仓库 `tests/` 的 73 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾；页面 JS 以 **AST 求值**（而非原始切片）取 QK_PAGE 后过 `node --check` 与 jsdom（v0.2.7 教训：Python 会吃掉 JS 里的 `\n` 转义）。
 3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6/5.7 中标注"两文件各一份"的）必须同步双文件，diff 检查。
 4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 四个 JSON（config/ledger/pricing_cache/recent）。
 5. 日志：全部 `log.warning/log.info`，前缀 `quota-keeper`，`docker logs` 可过滤。

@@ -558,3 +558,52 @@ def test_stats_quota_uses_group_ids_map(load_admin):
     out = adm.qk_stats(group_ids_map={"u1": ["g1"]})
     row = next(r for r in out["users"] if r["user_id"] == "u1")
     assert row["quota"] == 777.0 and row["quota_source"] == "group"
+
+
+# ---- rolling 24h window (v0.3.1) ----------------------------------------------
+
+
+def test_stats_rolling_window(load_admin, monkeypatch):
+    from datetime import datetime as _dt, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    adm = load_admin()
+    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"name": "A", "email": "a@x", "days": {
+        "2026-08-18": {
+            "requests": 3, "cost_usd": 3.0,
+            "tokens": {"cached": 0.0, "input": 30.0, "output": 0.0},
+            "hours": {
+                "8": {"requests": 1, "cost_usd": 1.0, "tokens": {"cached": 0.0, "input": 10.0, "output": 0.0}},
+                "15": {"requests": 2, "cost_usd": 2.0, "tokens": {"cached": 0.0, "input": 20.0, "output": 0.0}},
+            },
+            "models": {"m/x": {"requests": 3, "cost_usd": 3.0, "unpriced_requests": 0,
+                                "tokens": {"cached": 0.0, "input": 30.0, "output": 0.0}}},
+        },
+        "2026-08-19": {
+            "requests": 5, "cost_usd": 5.0,
+            "tokens": {"cached": 0.0, "input": 50.0, "output": 0.0},
+            "hours": {
+                "9": {"requests": 5, "cost_usd": 5.0, "tokens": {"cached": 0.0, "input": 50.0, "output": 0.0}},
+            },
+            "models": {"m/x": {"requests": 5, "cost_usd": 5.0, "unpriced_requests": 0,
+                                "tokens": {"cached": 0.0, "input": 50.0, "output": 0.0}}},
+        },
+    }}}})
+    # pin "now" to 2026-08-19 12:00 UTC; window starts 2026-08-18 12:00 -> the
+    # 8:00 bucket of yesterday (1 req / $1) must be excluded, everything else kept
+    monkeypatch.setattr(adm, "qk_local_now", lambda cfg: _dt(2026, 8, 19, 12, 0, tzinfo=_tz.utc))
+    ws = _dt(2026, 8, 18, 12, 0, tzinfo=_tz.utc).timestamp()
+
+    out = adm.qk_stats(from_="2026-08-18", to="2026-08-19",
+                       granularity="hour", window_start_ts=ws)
+    assert out["kpi"]["requests"] == 7  # 2 (yesterday 15:00) + 5 (today 9:00)
+    assert abs(out["kpi"]["cost_usd"] - 7.0) < 1e-9
+    buckets = [s["bucket"] for s in out["series"]]
+    assert buckets == ["2026-08-18T15", "2026-08-19T09"]
+    row = out["users"][0]
+    assert row["requests"] == 7
+
+    # without the window, the same range reports the full two days
+    out2 = adm.qk_stats(from_="2026-08-18", to="2026-08-19", granularity="hour")
+    assert out2["kpi"]["requests"] == 8

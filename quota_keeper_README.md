@@ -59,7 +59,7 @@
 
 ## 管理台（admin 视角 /quota）
 
-- 6 张 KPI 卡（请求数 / tokens / 成本 USD / credits / 缓存率 / unpriced 请求），其中成本与 credits 带 7 天 sparkline；时间跨度选择 24h / 7d / 30d / 90d / 自定义（存 localStorage，24h 内走小时粒度）。
+- 6 张 KPI 卡（请求数 / tokens / 成本 USD / credits / 缓存率 / unpriced 请求），其中成本与 credits 带 7 天 sparkline；时间跨度选择 24h / 7d / 30d / 90d / 自定义（存 localStorage，24h 走小时粒度且为**滚动 24 小时**——从当前时刻往前推 24h，不是自然日 0 点起算）。用户排行表带 **WebUI 列**（按 `__metadata__.chat_id` 区分 web UI 与直接 API 请求，可与 Open WebUI 自带 analytics 对账；v0.3.1 前的历史数据无渠道标记，记为 0）。
 - 堆叠趋势图（按模型分色，≤8 色 + Others）、用户排行表（搜索 + 可排序列 + 点击下钻该用户的 per-model 明细）、模型表（混合 $/M、unpriced 徽标、TOU 徽标、匹配目标按钮）。
 - 最近动态（`/recent`，最近 200 条响应，手动刷新）、TOU 编辑器（档位 / 时间窗 / 提供方 / 模型 exact-or-glob / 节假日，节假日支持一键从 date.nager.at 拉取）、CSV 导出（前端生成）。
 - **无任何自动刷新/轮询**：数据在打开页面或点手动刷新/改筛选时加载，聚合在服务端 `/stats` 按需完成，页面不下载原始 ledger。

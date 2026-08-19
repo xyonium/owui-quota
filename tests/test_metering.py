@@ -114,3 +114,46 @@ def test_stream_sse_string_with_usage_prefix(qk):
     led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
     day = list(led["users"]["u1"]["days"])[0]
     assert led["users"]["u1"]["days"][day]["requests"] == 1
+
+
+# ---- webui/api channel split (v0.3.1) ------------------------------------------
+
+
+def test_channels_recorded_per_day_and_model(qk, tmp_path):
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    u = {"id": "u1", "name": "A", "email": "a@x"}
+    qk.qk_record_usage(u, "m/x", {"cached": 1, "input": 2, "output": 3, "cache_write": 0}, channel="webui")
+    qk.qk_record_usage(u, "m/x", {"cached": 1, "input": 2, "output": 3, "cache_write": 0}, channel="webui")
+    qk.qk_record_usage(u, "m/x", {"cached": 1, "input": 2, "output": 3, "cache_write": 0})  # default api
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    day = next(iter(led["users"]["u1"]["days"].values()))
+    assert day["channels"] == {"webui": 2, "api": 1}
+    assert day["models"]["m/x"]["channels"] == {"webui": 2, "api": 1}
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {})
+    assert [i["channel"] for i in rec["items"]] == ["webui", "webui", "api"]
+
+
+def test_stats_channels_aggregated(load_admin):
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    adm = load_admin()
+    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"name": "A", "email": "a@x", "days": {
+        "2026-08-19": {
+            "requests": 3, "cost_usd": 0.0,
+            "channels": {"webui": 2, "api": 1},
+            "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+            "models": {"m/x": {"requests": 3, "channels": {"webui": 2, "api": 1},
+                                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0}}},
+        },
+    }}}})
+    out = adm.qk_stats()
+    assert out["users"][0]["channels"] == {"webui": 2, "api": 1}
+    # legacy ledger rows without the channels field aggregate to zero, not a crash
+    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"name": "A", "email": "a@x", "days": {
+        "2026-08-19": {"requests": 1, "cost_usd": 0.0, "models": {}},
+    }}}})
+    out = adm.qk_stats()
+    assert out["users"][0]["channels"] == {"webui": 0, "api": 0}

@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.3.0
+version: 0.3.1
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -646,7 +646,8 @@ def qk_resolve_quota(cfg: dict, user: dict, group_ids=None):
 # ==== stats aggregation (reads the ledger for serving; filter never calls it) ====
 
 
-def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", group_ids_map=None):
+def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
+             group_ids_map=None, window_start_ts=None):
     """Aggregate ledger usage into KPI/series/users/models views.
 
     Filters: `from_`/`to` are inclusive "YYYY-MM-DD" day bounds, `user` matches
@@ -656,6 +657,15 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", grou
     filter restricts KPI, per-user and series day buckets to that model's
     contribution (hour buckets are per-day-per-hour across models and are
     skipped under a model filter).
+
+    `window_start_ts` (epoch seconds, in the config timezone) additionally
+    restricts to a ROLLING window (e.g. now-24h for the 24h span, instead of
+    "today since 00:00"): only hour buckets at/after it count. Days before
+    the window's day are skipped entirely; on the boundary day, hour buckets
+    earlier than the window start hour are dropped and the day-level row gets
+    only the sum of the kept hours (per-model rows are not hour-resolved and
+    are therefore excluded on the boundary day -- hours buckets are not
+    per-model).
     """
     led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
     users = led.get("users") or {}
@@ -669,6 +679,15 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", grou
     cfg = qk_get_config()
     from_s = from_ or "0000-00-00"
     to_s = to or "9999-99-99"
+    # rolling-window lower bound, resolved in the config timezone
+    win_day, win_hour = None, None
+    if window_start_ts is not None:
+        try:
+            wnow = qk_local_now(cfg)
+            wstart = datetime.fromtimestamp(float(window_start_ts), wnow.tzinfo)
+            win_day, win_hour = wstart.strftime("%Y-%m-%d"), wstart.hour
+        except Exception:
+            win_day, win_hour = None, None
     for uid, u in users.items():
         if user and user not in (uid, (u.get("name") or ""), (u.get("email") or "")):
             continue
@@ -681,6 +700,7 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", grou
             "cost_usd": 0.0,
             "models": set(),
             "unpriced_requests": 0,
+            "channels": {"webui": 0, "api": 0},
         }
         quota, source = qk_resolve_quota(
             cfg, {"id": uid},
@@ -692,7 +712,26 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", grou
             if not (from_s <= day <= to_s):
                 continue
             drec = drec or {}
-            day_ms = drec.get("models") or {}
+            hours = drec.get("hours") or {}
+            win_partial = False  # this day contributes only some hour buckets
+            if win_day is not None:
+                if day < win_day:
+                    continue
+                if day == win_day and win_hour is not None and win_hour > 0:
+                    win_partial = True
+            if win_partial:
+                hours = {
+                    h: hr for h, hr in hours.items()
+                    if str(h).isdigit() and int(h) >= win_hour
+                }
+            # effective per-model map for this day (model filter + rolling
+            # window: hour buckets are not per-model, so on a partial-window
+            # day the model rows cannot be included accurately and are
+            # skipped; the row-level numbers below use the kept hours)
+            if win_partial:
+                day_ms = {}
+            else:
+                day_ms = drec.get("models") or {}
             if model:
                 # filtered: only the matching model's contribution counts for
                 # this day (KPI and per-user rows); hours buckets aggregate
@@ -703,17 +742,32 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", grou
                 row["requests"] += mm.get("requests", 0)
                 row["cost_usd"] += mm.get("cost_usd", 0) or 0
                 row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
+                for cname, cnt in ((mm.get("channels") or {}).items()):
+                    if cname in row["channels"]:
+                        row["channels"][cname] += cnt or 0
                 for k in ("cached", "input", "output"):
                     tk = (mm.get("tokens") or {}).get(k, 0) or 0
                     row["tokens"][k] += tk
                     kpi["tokens"][k] += tk
                 day_ms = {model: mm}
+            elif win_partial:
+                # rolling window: only the kept hour buckets count
+                row["requests"] += sum((hr or {}).get("requests", 0) or 0 for hr in hours.values())
+                row["cost_usd"] += sum((hr or {}).get("cost_usd", 0) or 0 for hr in hours.values())
+                for hr in hours.values():
+                    for k in ("cached", "input", "output"):
+                        tk = ((hr or {}).get("tokens") or {}).get(k, 0) or 0
+                        row["tokens"][k] += tk
+                        kpi["tokens"][k] += tk
             else:
                 row["requests"] += drec.get("requests", 0)
                 row["cost_usd"] += drec.get("cost_usd", 0) or 0
                 row["unpriced_requests"] += sum(
                     (m2.get("unpriced_requests") or 0) for m2 in day_ms.values()
                 )
+                for cname, cnt in ((drec.get("channels") or {}).items()):
+                    if cname in row["channels"]:
+                        row["channels"][cname] += cnt or 0
                 for k in ("cached", "input", "output"):
                     tk = (drec.get("tokens") or {}).get(k, 0) or 0
                     row["tokens"][k] += tk
@@ -745,7 +799,7 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", grou
                 if granularity != "hour":
                     sb = series.setdefault(day, {})
                     sb[m] = sb.get(m, 0) + (mm.get("cost_usd", 0) or 0)
-            for h, hrec in ((drec.get("hours") or {}).items()):
+            for h, hrec in hours.items():
                 if granularity == "hour" and not model:
                     try:
                         bkey = f"{day}T{int(h):02d}"
@@ -1088,6 +1142,7 @@ tr.pe-cleared td{opacity:.45}
    <thead><tr>
     <th>User</th>
     <th class="num sortable" data-sort="requests" onclick="toggleSort('requests')">Requests</th>
+    <th class="num" title="requests with a web-UI chat_id (vs direct API) -- compare against Open WebUI analytics">WebUI</th>
     <th class="num sortable" data-sort="tokens" onclick="toggleSort('tokens')">Tokens</th>
     <th class="num sortable" data-sort="cost_usd" onclick="toggleSort('cost_usd')">Cost $</th>
     <th class="num sortable" data-sort="credits" onclick="toggleSort('credits')">Credits</th>
@@ -1369,7 +1424,9 @@ function spanDates(){
   const days={'24h':0,'7d':6,'30d':29,'90d':89}[k]??6;
   const now=new Date(),from=new Date(now);
   from.setDate(now.getDate()-days);
-  return {from:isoDay(from),to:isoDay(now),gran:k==='24h'?'hour':'day'};
+  const out={from:isoDay(from),to:isoDay(now),gran:k==='24h'?'hour':'day'};
+  if(k==='24h')out.window_start=Math.floor(Date.now()/1000)-86400; // rolling 24h, not "since 00:00"
+  return out;
 }
 function initSpanUI(){
   document.querySelectorAll('.spans button').forEach(b=>b.classList.toggle('active',b.dataset.span===STATE.span.key));
@@ -1403,6 +1460,7 @@ async function loadStats(){
   STATE.filter.user=$('fUser').value.trim();
   STATE.filter.model=$('fModel').value;
   const qs=new URLSearchParams({from:sp.from,to:sp.to,granularity:sp.gran});
+  if(sp.window_start)qs.set('window_start',sp.window_start);
   if(STATE.filter.user)qs.set('user',STATE.filter.user);
   if(STATE.filter.model)qs.set('model',STATE.filter.model);
   STATE.drill={}; // drill-down cache is span/filter-scoped: invalidate on reload
@@ -1508,12 +1566,13 @@ function renderUsers(){
     return `<tr class="clickable" data-uid="${esc(r.user_id)}" onclick="toggleDrill(this)">
      <td>${esc(r.name||r.user_id)}<br/><span class="small muted">${esc(r.email||'')}</span></td>
      <td class="num">${fmt(r.requests,0)}</td>
+     <td class="num" title="api: ${fmt((r.channels||{}).api||0,0)}">${fmt((r.channels||{}).webui||0,0)}</td>
      <td class="num">${fmt(tok(r),0)}</td>
      <td class="num">$${fmt(r.cost_usd,2)}</td>
      <td class="num">${fmt((r.cost_usd||0)*cpu,0)}</td>
      <td>${pp===null?'<span class="muted">∞</span>':`<div class="bar"><i class="${cls}" style="width:${Math.min(pp,100).toFixed(1)}%"></i></div><span class="pct">${pp.toFixed(1)}%</span>`}</td>
      <td><span class="tag src-${r.quota_source||'none'}">${esc(r.quota_source||'none')}</span></td>
-    </tr>`;}).join('')||'<tr><td colspan="7" class="empty">No users in span</td></tr>';
+    </tr>`;}).join('')||'<tr><td colspan="8" class="empty">No users in span</td></tr>';
 }
 function renderSortInd(){
   document.querySelectorAll('#uRank th.sortable').forEach(th=>{
@@ -1530,11 +1589,11 @@ async function toggleDrill(tr){
   if(data===undefined){
     const sp=spanDates();
     const dr=document.createElement('tr');dr.className='drill';
-    dr.innerHTML='<td colspan="7" class="empty">loading…</td>';
+    dr.innerHTML='<td colspan="8" class="empty">loading…</td>';
     tr.after(dr);
     try{
       data=await api(`/stats?user=${encodeURIComponent(uid)}&from=${sp.from}&to=${sp.to}&granularity=day`);
-    }catch(e){dr.innerHTML=`<td colspan="7" class="empty">${esc(e.message)}</td>`;return}
+    }catch(e){dr.innerHTML=`<td colspan="8" class="empty">${esc(e.message)}</td>`;return}
     STATE.drill[uid]=data;
     dr.remove();
   }
@@ -1543,7 +1602,7 @@ async function toggleDrill(tr){
     return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(t.input,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(m.cost_usd,2)}</td></tr>`;
   }).join('')||'<tr><td colspan="6" class="empty">No usage in span</td></tr>';
   const dr=document.createElement('tr');dr.className='drill';
-  dr.innerHTML=`<td colspan="7"><table style="max-width:760px"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th></tr></thead><tbody>${rows}</tbody></table></td>`;
+  dr.innerHTML=`<td colspan="8"><table style="max-width:760px"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th></tr></thead><tbody>${rows}</tbody></table></td>`;
   tr.after(dr);
 }
 function exportCsv(){
@@ -2144,9 +2203,15 @@ async def api_stats(request: Request):
     q = request.query_params
     led_users = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {})
     gmap = await qk_group_ids_map(led_users.keys())
+    wstart = q.get("window_start")
+    try:
+        wstart = float(wstart) if wstart is not None else None
+    except Exception:
+        wstart = None
     return JSONResponse(
         qk_stats(q.get("from"), q.get("to"), q.get("user"), q.get("model"),
-                 q.get("granularity", "day"), group_ids_map=gmap)
+                 q.get("granularity", "day"), group_ids_map=gmap,
+                 window_start_ts=wstart)
     )
 
 
