@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.4
+version: 0.2.5
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -950,6 +950,7 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 .prow input[type=text]{width:230px;padding:6px 8px}
 .prow input[type=number]{width:90px;padding:6px 8px}
 .prow input[type=checkbox]{width:auto}
+.fatal{margin:0 0 18px;padding:12px 16px;border:1px solid var(--bad);border-radius:10px;color:var(--bad);background:rgba(248,113,113,.08);white-space:pre-wrap;word-break:break-all}
 </style>
 </head>
 <body>
@@ -961,6 +962,7 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
  <button id="btnRefresh" class="primary admin-only" onclick="refreshPricing(true)">Refresh pricing</button>
 </header>
 <main>
+ <div class="fatal" id="fatal" hidden></div>
  <section id="secPersonal" hidden></section>
 
  <section id="secDash" hidden>
@@ -1161,6 +1163,10 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(msg,ms=2200){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),ms)}
+// persistent, unmissable load-failure banner (the 2.2s toast was too easy to
+// miss and a blank page with no visible cause is undebuggable)
+function showFatal(msg){const b=$('fatal');if(!b)return;b.textContent=msg;b.hidden=false}
+window.addEventListener('error',e=>{try{showFatal('JS error: '+(e.message||e.type)+' @line '+(e.lineno||'?'))}catch(_){}});
 async function api(path,opts){const r=await fetch('__QK_API_PREFIX__'+path,opts);if(!r.ok){throw new Error(await r.text()||r.status)}return r.json()}
 function fmt(n,d=2){if(n===null||n===undefined||isNaN(n))return '–';return Number(n).toLocaleString(undefined,{maximumFractionDigits:d})}
 // num: zero-safe number parse — 0 survives, empty/NaN falls back to def
@@ -1193,7 +1199,7 @@ async function init(){
     if((STATE.me.user||{}).role!=='admin'){renderPersonal();return}
     document.querySelectorAll('.admin-only').forEach(el=>el.classList.remove('admin-only'));
     await loadAdmin();
-  }catch(e){toast('Load failed: '+e.message)}
+  }catch(e){showFatal('Load failed: '+e.message)}
 }
 async function loadAdmin(){
   // tolerant loader: one failing endpoint (e.g. a gateway rate-limit 403 on
