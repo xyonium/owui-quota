@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.3
+version: 0.2.4
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1892,7 +1892,9 @@ def _mount_guard(app, page_path: str, api_prefix: str) -> int:
         page_path, include_in_schema=False, dependencies=[Depends(_require_admin)]
     )
     async def _qk_page(request: Request):
-        return HTMLResponse(qk_build_page(api_prefix))
+        # no-store: a cached page keeps the OLD JS after a plugin update
+        # (stale all-or-nothing loader = blank page again)
+        return HTMLResponse(qk_build_page(api_prefix), headers={"Cache-Control": "no-store"})
 
     router.include_router(qk_router, prefix=api_prefix)
 

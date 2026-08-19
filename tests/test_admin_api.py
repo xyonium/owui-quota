@@ -68,3 +68,19 @@ def test_page_route_requires_admin(load_admin):
     _mount(app, adm)
     c = TestClient(app)
     assert c.get("/quota").status_code == 401
+
+
+def test_page_served_with_no_store(load_admin, monkeypatch):
+    # A cached page keeps the OLD JS after a plugin update (stale loader =
+    # blank page), so the page must be served Cache-Control: no-store.
+    from tests.conftest import _stub_webui_auth
+
+    _stub_webui_auth(monkeypatch)
+    adm = load_admin()
+    app = FastAPI()
+    _mount(app, adm)
+    c = TestClient(app)
+    r = c.get("/quota")
+    assert r.status_code == 200
+    assert r.headers.get("cache-control") == "no-store"
+    assert "Quota Keeper" in r.text

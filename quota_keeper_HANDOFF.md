@@ -273,7 +273,7 @@ v0.2.1 修复记录（真实实例首验发现）：
 ## 10. 快速上手（给 coding agent）
 
 1. 环境要求：Open WebUI ≥ 0.10.0（Event primitive + `__app__` 注入；Filter 部分兼容 0.6+）。
-2. 复现测试：仓库 `tests/` 的 58 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
+2. 复现测试：仓库 `tests/` 的 59 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
 3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6/5.7 中标注"两文件各一份"的）必须同步双文件，diff 检查。
 4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 四个 JSON（config/ledger/pricing_cache/recent）。
 5. 日志：全部 `log.warning/log.info`，前缀 `quota-keeper`，`docker logs` 可过滤。

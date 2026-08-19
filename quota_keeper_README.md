@@ -132,7 +132,8 @@
 | 浏览器显示 404，但 curl 看到 `200` + HTML | **SPA 遮蔽**（v0.2.0 的 bug）：OWUI 在 import 时就把前端兜底挂到 `/`（`spa-static-files`），插件启动时 append 的路由排在其后永不命中；`/quota` 返回 SPA 外壳，由前端路由显示 404 | admin 函数升级到 >= 0.2.2（路由改为插入 `spa-static-files` mount 之前，方案同 prune 插件）。保存代码即自动重挂载，无需重启；也可以重启容器 |
 | 路由通了但页面/接口全部 `401`，detail 为 `auth failed: 'Request' object has no attribute 'role'` | v0.2.1 的 auth 兼容 bug：OWUI 的 `get_verified_user` 是 FastAPI 依赖函数（收 **user** 不是 request），按 request 调用导致全端点 401 | admin 函数升级到 >= 0.2.2（改为手动驱动 `bearer_security` -> `get_current_user` -> `get_verified_user` 真实链路，兼容新旧签名） |
 | 保存新代码后页面/接口还是旧行为 | Starlette 不能原地替换 handler，旧路由残留在路由表 | >= 0.2.1 保存后自动按路径清陈旧路由再重挂载；更旧的版本只能重启容器 |
-| 页面只有标题、正文空白；网络面板里部分 `/api/v1/quota-keeper/*` 返回 9 字节纯文本 `403 Forbidden` | **前置网关/WAF 限流**（非插件问题）：实测该域名突发 8 连请求约一半被 403、每秒 1 次也偶发；页面加载是 4 路并发，任一被拦旧版会整页空白 | 在网关（WAF/反代）上放松对该域名的限流；>= 0.2.3 起单个接口失败只弹 toast 提示，其余区块照常渲染 |
+| 更新插件后页面仍空白/仍旧行为 | 浏览器缓存了旧版页面 HTML（旧 JS 是全有或全无加载，任一接口失败即空白） | **硬刷新**（Ctrl/Cmd+Shift+R）；>= 0.2.4 起页面带 `Cache-Control: no-store` 杜绝此问题 |
+| 页面只有标题、正文空白；网络面板里部分 `/api/v1/quota-keeper/*` 返回 9 字节纯文本 `403 Forbidden` | **前置网关拦截**（非插件问题）：实测该域名按 IP/限流策略拦截，突发 8 连请求约一半 403；页面加载是 4 路并发，任一被拦旧版会整页空白 | 调整网关的 IP 白名单/限流规则；或绕过域名直连容器/LAN 地址访问 `/quota`；>= 0.2.3 起单个接口失败只弹 toast 提示，其余区块照常渲染 |
 | 管理台「用户」「组」列表为空，或组配额不生效；日志有 `users fetch failed: 'coroutine' object is not iterable` | OWUI >= 0.10 的 models 层全面 async 化（`get_users` 变协程且返回分页 dict、`get_groups` 必填 `filter`、`UserModel` 不再有 `group_ids`），v0.2.0-0.2.2 的同步调用全部落空 | **两个函数文件都**升级到 >= 0.2.3（filter 的组配额解析也在此修复） |
 | 改了 `route_prefix` / `api_prefix` Valve | 保存 Valve 即触发重挂载，**新路径立即生效**；旧前缀路由找不到归属、残留在路由表直到重启（无害空壳） | 重启容器清掉旧前缀 |
 | 重启容器后全部 404 且日志没有 quota-keeper 行 | Event 函数未启用，或 OWUI < 0.10 不支持 Event 类型 | 启用函数 / 升级 OWUI |
