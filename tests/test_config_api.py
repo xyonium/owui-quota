@@ -251,3 +251,36 @@ def test_validate_pricing_url_list(admin_client):
                   json={"pricing": {"url": ["https://a", "https://b"]}}).status_code == 200
     assert c.post("/api/v1/quota-keeper/config",
                   json={"pricing": {"url": 123}}).status_code == 400
+
+
+# ---- zero-price rows are not a match (v0.4.1) ---------------------------------
+
+
+def test_zero_price_table_row_is_unpriced(admin_client, monkeypatch):
+    import types as _t
+    import sys
+
+    c, adm = _app(admin_client)
+
+    class FakeResp:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            # models.dev plan-tier provider with $0 prices + a real one
+            return {
+                "kimi-for-coding": {"models": {"k3-256k": {"cost": {"input": 0, "output": 0}}}},
+                "moonshotai": {"models": {"kimi-k3": {"cost": {"input": 3.0, "output": 15.0}}}},
+            }
+
+    monkeypatch.setitem(sys.modules, "requests", _t.SimpleNamespace(get=lambda url, timeout=30: FakeResp()))
+    table = adm.qk_fetch_pricing("u")
+    # the $0 row is skipped at fetch time...
+    assert "k3-256k" not in table
+    assert table["kimi-k3"]["input"] == 3.0
+    # ...and even if a $0 row slips in, find_pricing treats it as unpriced
+    price, how = adm.qk_find_pricing("k3-256k", {"k3-256k": {"input": 0, "output": 0}}, None)
+    assert price is None and how is None
+    # a real price still matches normally
+    price, how = adm.qk_find_pricing("k3-256k", {"k3-256k": {"input": 1.5, "output": 8.0}}, None)
+    assert price == {"input": 1.5, "output": 8.0} and how == "exact:k3-256k"

@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.0
+version: 0.4.1
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -413,6 +413,8 @@ def _qk_scale_price(price, mult):
 def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None):
     """override -> exact -> path-suffix -> tail-segment -> contains (all on
     raw and date-stripped variants). Returns (price|None, how|None).
+    A matched entry whose input+output are both 0 counts as NOT priced
+    (returns None): plan-tier/free $0 rows would otherwise meter 0 forever.
 
     Override value shapes (a None value means "cleared" and is skipped):
       legacy direct:  {"input": x, "cached": y, "cache_write": z, "output": w}
@@ -475,7 +477,10 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
                 return table[best[1]], best[0] + ":" + best[1]
         return None, None
 
-    return resolve(m, 0)
+    price, how = resolve(m, 0)
+    if price is not None and ((price.get("input") or 0) + (price.get("output") or 0)) <= 0:
+        return None, None  # zero-priced match = unpriced (do not meter 0 silently)
+    return price, how
 
 
 def qk_normalize_usage(u) -> Optional[dict]:

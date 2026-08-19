@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.4.0
+version: 0.4.1
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -383,7 +383,10 @@ def qk_fetch_pricing(url: str, timeout: int = 30, table: dict = None) -> dict:
 
     Auto-detected formats: LiteLLM flat (key -> per-token costs) and
     models.dev nested (provider -> models -> per-1M costs). Prices are
-    normalized to per-1M tokens."""
+    normalized to per-1M tokens. Zero-priced rows (models.dev free/
+    plan-tier providers like kimi-for-coding / zai-coding-plan) are
+    skipped: a $0 entry would shadow a real price from another source and
+    meter 0 forever."""
     import requests
 
     if table is None:
@@ -417,8 +420,9 @@ def qk_fetch_pricing(url: str, timeout: int = 30, table: dict = None) -> dict:
                 "cached": tok("cache_read_input_token_cost"),
                 "cache_write": tok("cache_creation_input_token_cost"),
             }
-            if entry["input"] is not None or entry["output"] is not None:
-                table.setdefault(str(name).strip().lower(), entry)
+            if (entry["input"] or 0) + (entry["output"] or 0) <= 0:
+                continue  # zero-priced row
+            table.setdefault(str(name).strip().lower(), entry)
     else:
         # models.dev style: {provider: {"models": {name: {"cost": per-1M}}}}
         for prov, pdata in (raw or {}).items():
@@ -437,9 +441,10 @@ def qk_fetch_pricing(url: str, timeout: int = 30, table: dict = None) -> dict:
                     "cached": pm("cache_read"),
                     "cache_write": pm("cache_write"),
                 }
-                if entry["input"] is not None or entry["output"] is not None:
-                    table.setdefault(f"{prov}/{name}".strip().lower(), entry)
-                    table.setdefault(str(name).strip().lower(), entry)
+                if (entry["input"] or 0) + (entry["output"] or 0) <= 0:
+                    continue  # zero-priced row (free/plan tier)
+                table.setdefault(f"{prov}/{name}".strip().lower(), entry)
+                table.setdefault(str(name).strip().lower(), entry)
     if not table:
         raise ValueError("unrecognized pricing format")
     return table
@@ -456,6 +461,8 @@ def _qk_scale_price(price, mult):
 def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None):
     """override -> exact -> path-suffix -> tail-segment -> contains (all on
     raw and date-stripped variants). Returns (price|None, how|None).
+    A matched entry whose input+output are both 0 counts as NOT priced
+    (returns None): plan-tier/free $0 rows would otherwise meter 0 forever.
 
     Override value shapes (a None value means "cleared" and is skipped):
       legacy direct:  {"input": x, "cached": y, "cache_write": z, "output": w}
@@ -518,7 +525,10 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
                 return table[best[1]], best[0] + ":" + best[1]
         return None, None
 
-    return resolve(m, 0)
+    price, how = resolve(m, 0)
+    if price is not None and ((price.get("input") or 0) + (price.get("output") or 0)) <= 0:
+        return None, None  # zero-priced match = unpriced (do not meter 0 silently)
+    return price, how
 
 
 def qk_refresh_pricing(force: bool = False) -> dict:
