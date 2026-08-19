@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.4.1
+version: 0.4.2
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -546,8 +546,17 @@ def qk_refresh_pricing(force: bool = False) -> dict:
         urls = [urls]
     urls = [u for u in urls if isinstance(u, str) and u.strip()] or [DEFAULT_PRICING_URL]
     table = {}
+    errors = []
     for u in urls:
-        table = qk_fetch_pricing(u.strip(), table=table)
+        try:
+            table = qk_fetch_pricing(u.strip(), table=table)
+        except Exception as e:
+            # a single unreachable source (DNS/proxy blip) must not kill the
+            # whole refresh -- the rest still merge and the error is reported
+            errors.append(f"{u.strip()}: {e}")
+            log.warning("quota-keeper pricing source failed: %s", errors[-1])
+    if not table:
+        raise ValueError("all pricing sources failed: " + " | ".join(errors))
     payload = {
         "url": urls[0] if len(urls) == 1 else urls,
         "sources": urls,
@@ -556,9 +565,15 @@ def qk_refresh_pricing(force: bool = False) -> dict:
         "models": len(table),
         "table": table,
     }
+    if errors:
+        payload["errors"] = errors
     with qk_lock():
         qk_atomic_write(QK_PRICING_PATH, payload)
-    return {"status": "refreshed", "models": len(table), "url": url}
+    out = {"status": "refreshed", "models": len(table), "url": urls[0] if len(urls) == 1 else urls}
+    if errors:
+        out["status"] = "partial"
+        out["errors"] = errors
+    return out
 
 
 def qk_time_multiplier(cfg: dict) -> float:
