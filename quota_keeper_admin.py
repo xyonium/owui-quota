@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.3.2
+version: 0.3.3
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1241,7 +1241,7 @@ tr.pe-cleared td{opacity:.45}
 
  <details id="secPricingEditor" hidden>
   <summary>Pricing editor (your models → match &amp; overrides)</summary>
-  <p class="hint">Lists models actually used (ledger) plus models configured in Open WebUI — not the whole 2.5k-row upstream table. Each row shows the resolved per-1M price and how it matched (exact / suffix / segment / contains / override / alias). Two ways to fix an unmatched or mispriced model: <b>direct prices</b> (input/cached/cache_write/output per 1M), or an <b>alias</b> to another model key with a <b>multiplier</b> (e.g. <code>kimi-k3-256k → alias kimi-k3 × 0.5</code>). Overrides are saved into <code>pricing.overrides</code> and survive upstream refreshes.</p>
+  <p class="hint">Lists models actually seen in usage (the real upstream model ids) — not the upstream price table, not Open WebUI's model registry (aliases/stale entries nobody calls). Each row shows whether the model currently resolves to a price and how (exact / suffix / segment / contains / override / alias). Two ways to fix a <b>no match</b> row: <b>direct prices</b> (per 1M), or an <b>alias</b> to an existing upstream key with a <b>multiplier</b> (e.g. <code>k3-256k → alias azure_ai/fw-kimi-k3 × 0.5</code>; the alias target must exist in the upstream table — use Test match to check). Overrides are saved into <code>pricing.overrides</code> and survive upstream refreshes.</p>
   <div class="pe-tools">
    <input type="search" id="peSearch" placeholder="search model" oninput="peSearch()"/>
    <label class="inline"><input type="checkbox" id="peOnlyUnpriced" onchange="peSearch()" style="width:auto"/> only unpriced</label>
@@ -1830,7 +1830,7 @@ function rebuildPeOrig(){
     }
     STATE.pe.orig[it.model]={
       manual:!!it.override,cleared:false,cur:null,base:base,
-      how:it.how||'',price:it.price||null,used:!!it.used,available:!!it.available,
+      how:it.how||'',price:it.price||null,used:!!it.used,
       requests:it.requests||0,unpriced_requests:it.unpriced_requests||0,
     };
   });
@@ -1867,8 +1867,8 @@ function peRowHtml(k,o){
   return `<tr data-mrow="${esc(k)}"${o.cleared?' class="pe-cleared"':''}>
    <td>${esc(k)}
      ${o.manual?'<span class="tag manual">manual</span>':''}
-     ${o.unpriced_requests>0?'<span class="tag unpriced">unpriced×'+o.unpriced_requests+'</span>':''}
-     <br/><span class="small muted">${o.used?('used · '+fmt(o.requests,0)+' reqs'):'configured'}${o.available?'':' · not in /api/models'}</span></td>
+     ${(o.price||o.manual)?'<span class="tag src-group">matched ✓</span>':'<span class="tag unpriced">no match</span>'}
+     <br/><span class="small muted">used · ${fmt(o.requests,0)} reqs</span></td>
    <td class="small">${howTxt}</td>
    ${['input','cached','cache_write','output'].map(f=>`<td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="${f}" value="${esc(numVal(f))}" ${dis} oninput="peEdit(this)"/></td>`).join('')}
    <td><input class="pe-alias" type="text" placeholder="e.g. kimi-k3" data-pk="${esc(k)}" data-f="alias" value="${esc(cur.alias||'')}" ${adis} oninput="peEdit(this)"/></td>
@@ -2268,11 +2268,11 @@ async def api_refresh(request: Request):
 
 @qk_router.get("/models", dependencies=[Depends(_require_admin)])
 async def api_models(request: Request):
-    """Models actually in play on this instance: everything used (ledger)
-    plus everything configured in OWUI /api/models, each with the resolved
-    price, the matching strategy, and the configured override (if any).
-    Backs the pricing editor -- it edits real usage, not the 2.5k-row
-    upstream table."""
+    """Models actually used (from the ledger's usage records -- these are
+    the real upstream model ids), each with the resolved price, the
+    matching strategy, and the configured override (if any). Backs the
+    pricing editor; OWUI's /api/models is intentionally NOT included (it
+    mixes aliases, duplicates and stale entries nobody calls)."""
     cfg = qk_get_config()
     ov = ((cfg.get("pricing") or {}).get("overrides")) or {}
     table = (qk_load_json(QK_PRICING_PATH, {}) or {}).get("table") or {}
@@ -2288,18 +2288,7 @@ async def api_models(request: Request):
                 row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
                 row["cost_usd"] += mm.get("cost_usd", 0) or 0
 
-    available = []
-    try:
-        from open_webui.models.models import Models
-
-        res = Models.get_all_models()
-        if asyncio.iscoroutine(res):
-            res = await res
-        available = [str(m.id) for m in (res or []) if getattr(m, "id", None)]
-    except Exception as e:
-        log.info("quota-keeper models list fetch failed: %s", e)
-
-    ids = sorted(set(used) | set(available), key=str.lower)
+    ids = sorted(used, key=str.lower)
     items = []
     for m in ids:
         price, how = qk_find_pricing(m, table, ov)
@@ -2313,8 +2302,7 @@ async def api_models(request: Request):
         items.append(
             {
                 "model": m,
-                "used": m in used,
-                "available": m in available,
+                "used": True,
                 "requests": u.get("requests", 0),
                 "unpriced_requests": u.get("unpriced_requests", 0),
                 "cost_usd": u.get("cost_usd", 0.0),

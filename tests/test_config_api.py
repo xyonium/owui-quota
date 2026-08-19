@@ -188,9 +188,10 @@ def test_models_endpoint_aggregates_used_and_available(admin_client, monkeypatch
     k = items["kimi-k3-256k"]
     # ledger history predates the override: 16 requests were recorded unpriced;
     # the /models row keeps that history while NOW resolving via the alias
-    assert k["used"] and k["available"] and k["requests"] == 16 and k["unpriced_requests"] == 16
+    assert k["used"] and k["requests"] == 16 and k["unpriced_requests"] == 16
     assert k["matched"] and k["price"] == {"input": 1.0, "output": 4.0}
     assert k["override"] == {"alias": "kimi-k3", "multiplier": 0.5}
     assert items["gpt-4o"]["matched"] and items["gpt-4o"]["price"]["input"] == 5.0
-    # available-only model shows up without usage
-    assert items["prx.free"]["available"] and not items["prx.free"]["used"]
+    # /api/models entries with no usage are NOT listed (the editor only shows
+    # models that actually appear in usage records)
+    assert "prx.free" not in items
