@@ -32,9 +32,35 @@ pytestmark = pytest.mark.skipif(
 
 
 def _extract_page_js() -> str:
-    src = ADMIN.read_text(encoding="utf-8")
-    page = src.split('QK_PAGE = """', 1)[1].split('"""', 1)[0]
+    """The page JS as PYTHON EVALUATES the QK_PAGE literal (escape processing
+    applied) -- raw file slicing would miss that a source-level \\n inside a
+    non-raw triple-quoted string becomes a real newline in the served HTML,
+    which is a SyntaxError for JS (the v0.2.6 blank-page bug)."""
+    import ast
+
+    tree = ast.parse(ADMIN.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", "") == "QK_PAGE":
+            page = node.value.value
+            break
+    else:
+        raise AssertionError("QK_PAGE assignment not found")
     return page.split("<script>", 1)[1].split("</script>", 1)[0]
+
+
+def test_served_page_js_parses():
+    """node --check on the served page script. Any Python-eaten escape
+    (\\n -> raw newline inside a JS regex/string) blanks the whole page in
+    real browsers while raw-slicing harnesses stay green -- pin it here."""
+    import subprocess
+    import tempfile
+
+    js = _extract_page_js()
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+        f.write(js)
+        path = f.name
+    r = subprocess.run([NODE, "--check", path], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
 
 
 def test_overrides_save_preserves_non_visible_rows():

@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.6
+version: 0.2.7
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -850,7 +850,7 @@ async def qk_group_ids_map(uids):
 
 # ==== UI HTML (self-contained, no build step) ====
 
-QK_PAGE = """<!doctype html>
+QK_PAGE = r"""<!doctype html>
 <html lang="zh">
 <head>
 <meta charset="utf-8"/>
