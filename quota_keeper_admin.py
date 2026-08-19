@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.7
+version: 0.3.0
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -11,6 +11,7 @@ import re
 import json
 import time
 import asyncio
+import fnmatch
 import logging
 import threading
 from datetime import datetime, timedelta, timezone as _dt_timezone
@@ -79,7 +80,10 @@ DEFAULT_CONFIG = {
         "holidays": [],                  # "YYYY-MM-DD" -> whole day offpeak
         "default_policy": "off",         # off | normal
         "providers": {},                 # "<first path segment>": {"enabled": bool, "tiers": {name: {"rate": x}}}
-        "models": {},                    # exact model id: {"enabled": bool, "tiers": {...}}
+        # keys: exact model id, or a * glob (fnmatch, case-insensitive), e.g.
+        # "*deepseek*" matches any id containing it; exact keys beat globs,
+        # longer glob patterns beat shorter ones
+        "models": {},
     },
 }
 
@@ -145,6 +149,8 @@ def qk_deep_merge(base, patch):
 
 _QK_NUM = lambda v: not isinstance(v, bool) and isinstance(v, (int, float))
 
+QK_PRICE_FIELDS = ("input", "cached", "cache_write", "output")
+
 
 def qk_validate_config(cfg) -> list:
     errs = []
@@ -170,6 +176,32 @@ def qk_validate_config(cfg) -> list:
     pri = cfg.get("pricing")
     if pri is not None and not isinstance(pri, dict):
         errs.append("pricing must be an object")
+    if isinstance(pri, dict):
+        ov = pri.get("overrides")
+        if ov is not None and not isinstance(ov, dict):
+            errs.append("pricing.overrides must be an object")
+        elif isinstance(ov, dict):
+            for k, v in ov.items():
+                if v is None:
+                    continue  # tombstone: cleared by a later POST's deep merge
+                if not isinstance(v, dict):
+                    errs.append(f"pricing.overrides.{k} must be an object or null")
+                    continue
+                if "alias" in v:
+                    if not isinstance(v.get("alias"), str) or not v["alias"].strip():
+                        errs.append(f"pricing.overrides.{k}.alias must be a non-empty string")
+                    mult = v.get("multiplier")
+                    if mult is not None and not (_QK_NUM(mult) and mult > 0):
+                        errs.append(f"pricing.overrides.{k}.multiplier must be a positive number")
+                else:
+                    pr = v.get("prices") if "prices" in v else v
+                    if not isinstance(pr, dict):
+                        errs.append(f"pricing.overrides.{k}.prices must be an object")
+                        continue
+                    for f in QK_PRICE_FIELDS:
+                        fv = pr.get(f)
+                        if fv is not None and not (_QK_NUM(fv) and fv >= 0):
+                            errs.append(f"pricing.overrides.{k}.{f} must be a number >= 0")
     tou = cfg.get("tou")
     if tou is not None and not isinstance(tou, dict):
         errs.append("tou must be an object")
@@ -249,14 +281,26 @@ def qk_tou_local_now(cfg: dict) -> datetime:
 
 
 def qk_tou_resolve_policy(cfg: dict, model_id: str):
-    """models[exact] -> providers[first segment] -> default_policy. Returns policy dict or None (off)."""
+    """models[exact] -> models[glob] (keys containing '*', fnmatch, longest
+    pattern first) -> providers[first segment] -> default_policy.
+    Returns a policy dict or None (off)."""
     tou = cfg.get("tou") or {}
     if not tou.get("enabled"):
         return None
     mid = str(model_id or "").strip().lower()
-    mpol = (tou.get("models") or {}).get(mid)
+    models = tou.get("models") or {}
+    mpol = models.get(mid)
     if isinstance(mpol, dict):
         return mpol if mpol.get("enabled", True) else None
+    globs = [
+        (str(k).strip().lower(), v)
+        for k, v in models.items()
+        if isinstance(v, dict) and "*" in str(k)
+    ]
+    # longest pattern first so *deepseek-chat* beats *deepseek*
+    for pat, v in sorted(globs, key=lambda kv: -len(kv[0])):
+        if fnmatch.fnmatchcase(mid, pat):
+            return v if v.get("enabled", True) else None
     prov = mid.split("/")[0] if "/" in mid else "_default"
     ppol = (tou.get("providers") or {}).get(prov)
     if isinstance(ppol, dict):
@@ -394,40 +438,80 @@ def qk_fetch_pricing(url: str, timeout: int = 30) -> dict:
     return table
 
 
+def _qk_scale_price(price, mult):
+    return {
+        f: (float(v) * mult if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+        for f, v in (price or {}).items()
+        if f in QK_PRICE_FIELDS
+    }
+
+
 def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None):
+    """override -> exact -> path-suffix -> tail-segment -> contains (all on
+    raw and date-stripped variants). Returns (price|None, how|None).
+
+    Override value shapes (a None value means "cleared" and is skipped):
+      legacy direct:  {"input": x, "cached": y, "cache_write": z, "output": w}
+      wrapped direct: {"prices": {...same...}}
+      alias:          {"alias": "<model key>", "multiplier": m}
+    Alias targets resolve through the same matching chain (table lookup AND
+    nested overrides, up to 8 hops, cycle-safe); multiplier scales the
+    resolved per-1M prices (default 1)."""
     m = (model_id or "").strip().lower()
     if not m:
         return None, None
-    vs = _qk_variants(m)
     ov = {str(k).strip().lower(): v for k, v in (overrides or {}).items()}
-    for cand in vs:
-        if cand in ov:
-            return ov[cand], "override:" + cand
-    if table:
+
+    def resolve(mid, depth):
+        if depth > 8:
+            return None, None
+        vs = _qk_variants(mid)
         for cand in vs:
-            if cand in table:
-                return table[cand], "exact:" + cand
-        best = None
-        for cand in vs:
-            for k in table:
-                if cand.endswith("/" + k) and (best is None or len(k) > len(best[1])):
-                    best = ("suffix", k)
-        if best:
-            return table[best[1]], best[0] + ":" + best[1]
-        for cand in vs:
-            segs = cand.split("/")
-            for i in range(len(segs)):
-                tail = "/".join(segs[i:])
-                if tail in table:
-                    return table[tail], "segment:" + tail
-        best = None
-        for cand in vs:
-            for k in table:
-                if len(k) >= 4 and k in cand and (best is None or len(k) > len(best[1])):
-                    best = ("contains", k)
-        if best:
-            return table[best[1]], best[0] + ":" + best[1]
-    return None, None
+            spec = ov.get(cand)
+            if not isinstance(spec, dict):
+                continue
+            if "alias" in spec or "prices" in spec:
+                if "alias" in spec:
+                    target = str(spec.get("alias") or "").strip().lower()
+                    if target and target != cand:
+                        base, how = resolve(target, depth + 1)
+                        if base is not None:
+                            mult = spec.get("multiplier")
+                            mult = float(mult) if isinstance(mult, (int, float)) and not isinstance(mult, bool) else 1.0
+                            return _qk_scale_price(base, mult), "alias:" + target + ("*" + str(mult) if mult != 1.0 else "")
+                else:
+                    p = spec.get("prices")
+                    if isinstance(p, dict):
+                        return p, "override:" + cand
+            else:  # legacy direct price dict
+                return spec, "override:" + cand
+        if table:
+            for cand in vs:
+                if cand in table:
+                    return table[cand], "exact:" + cand
+            best = None
+            for cand in vs:
+                for k in table:
+                    if cand.endswith("/" + k) and (best is None or len(k) > len(best[1])):
+                        best = ("suffix", k)
+            if best:
+                return table[best[1]], best[0] + ":" + best[1]
+            for cand in vs:
+                segs = cand.split("/")
+                for i in range(len(segs)):
+                    tail = "/".join(segs[i:])
+                    if tail in table:
+                        return table[tail], "segment:" + tail
+            best = None
+            for cand in vs:
+                for k in table:
+                    if len(k) >= 4 and k in cand and (best is None or len(k) > len(best[1])):
+                        best = ("contains", k)
+            if best:
+                return table[best[1]], best[0] + ":" + best[1]
+        return None, None
+
+    return resolve(m, 0)
 
 
 def qk_refresh_pricing(force: bool = False) -> dict:
@@ -935,7 +1019,10 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 .pe-tools{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
 .pe-tools input[type=search]{width:280px;padding:6px 8px}
 .pe-tools button{padding:6px 12px}
-.pe-num{width:120px;padding:6px 8px}
+.pe-num{width:110px;padding:6px 8px}
+.pe-alias{width:150px;padding:6px 8px}
+.pe-mult{width:64px;padding:6px 8px}
+tr.pe-cleared td{opacity:.45}
 .pageinfo{font-size:12px;color:var(--mut)}
 .scroll{overflow:auto;max-height:440px}
 /* TOU editor */
@@ -1098,19 +1185,22 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
  </section>
 
  <details id="secPricingEditor" hidden>
-  <summary>Pricing editor (upstream table → per-1M overrides)</summary>
-  <p class="hint">Rows are prefilled from the cached upstream table; override rows carry a manual badge. Save collects edited rows into pricing.overrides and POSTs /config (deep merge preserves the rest of the config). Overrides win over the next upstream refresh.</p>
+  <summary>Pricing editor (your models → match &amp; overrides)</summary>
+  <p class="hint">Lists models actually used (ledger) plus models configured in Open WebUI — not the whole 2.5k-row upstream table. Each row shows the resolved per-1M price and how it matched (exact / suffix / segment / contains / override / alias). Two ways to fix an unmatched or mispriced model: <b>direct prices</b> (input/cached/cache_write/output per 1M), or an <b>alias</b> to another model key with a <b>multiplier</b> (e.g. <code>kimi-k3-256k → alias kimi-k3 × 0.5</code>). Overrides are saved into <code>pricing.overrides</code> and survive upstream refreshes.</p>
   <div class="pe-tools">
-   <input type="search" id="peSearch" placeholder="search model key" oninput="peSearch()"/>
-   <button onclick="loadPricingFull()">Refresh table</button>
+   <input type="search" id="peSearch" placeholder="search model" oninput="peSearch()"/>
+   <label class="inline"><input type="checkbox" id="peOnlyUnpriced" onchange="peSearch()" style="width:auto"/> only unpriced</label>
+   <button onclick="loadPricingFull()">Refresh</button>
    <button class="primary" onclick="saveConfig()">Save overrides</button>
    <span class="pageinfo" id="pePage"></span>
-   <button onclick="pePage(-1)" id="pePrev">‹ prev</button>
-   <button onclick="pePage(1)" id="peNext">next ›</button>
   </div>
   <div class="scroll">
   <table id="peRows">
-   <thead><tr><th>Model key</th><th class="num">input</th><th class="num">cached</th><th class="num">cache_write</th><th class="num">output</th></tr></thead>
+   <thead><tr>
+    <th>Model</th><th>Match</th>
+    <th class="num">input $/1M</th><th class="num">cached $/1M</th><th class="num">cache_write $/1M</th><th class="num">output $/1M</th>
+    <th>Alias to key</th><th class="num">× mult</th><th></th>
+   </tr></thead>
    <tbody></tbody>
   </table></div>
  </details>
@@ -1137,7 +1227,7 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
   <h3>Providers (first path segment)</h3>
   <div id="provs"></div>
   <button class="small" onclick="addProv()">+ provider</button>
-  <h3>Model overrides (exact model id)</h3>
+  <h3>Model overrides (exact id or * glob, e.g. *deepseek*)</h3>
   <div id="toumodels"></div>
   <button class="small" onclick="addTouModel()">+ model override</button>
   <h3>Holidays (whole day cheapest tier)</h3>
@@ -1193,7 +1283,7 @@ const STATE={
   sort:(()=>{const p=localStorage.getItem('qk_sort')||'cost_usd:desc';const i=p.indexOf(':');return {col:i<0?'cost_usd':p.slice(0,i),dir:p.slice(i+1)==='asc'?'asc':'desc'}})(),
   filter:{user:'',model:''},
   drill:{},            // user_id -> /stats drilldown payload cache
-  pe:{loaded:false,page:0,search:'',full:null,orig:{}}, // pricing editor state
+  pe:{loaded:false,search:'',data:null,orig:{}}, // pricing editor state
   tou:null,            // live editable copy of cfg.tou
 };
 
@@ -1657,78 +1747,136 @@ async function testMatch(){
 $('secPricingEditor').addEventListener('toggle',()=>{if($('secPricingEditor').open&&!STATE.pe.loaded)loadPricingFull()});
 async function loadPricingFull(){
   try{
-    STATE.pe.full=await api('/pricing?full=1');
+    STATE.pe.data=await api('/models');
     STATE.pe.loaded=true;
-    STATE.pe.page=0;
     rebuildPeOrig();
     renderPricingRows();
-  }catch(e){toast('Pricing table load failed: '+e.message)}
+    if(STATE.pe.data&&!STATE.pe.data.pricing_fetched)toast('Upstream pricing table not fetched yet - matches may be empty');
+  }catch(e){toast('Models load failed: '+e.message)}
 }
-// baseline snapshot: table entries, with override rows marked manual (the
-// override value is what the editor shows and what wins after a refresh)
+// STATE.pe.orig[model] = {manual, cleared, cur:{prices, alias, mult},
+//   base:{prices, alias, mult}, how, price, used, available, requests,
+//   unpriced_requests}
+// cur is only populated on edit (or when an override exists, so clear can
+// restore); collectOverrides is DOM-independent.
 function rebuildPeOrig(){
-  const ov=(STATE.cfg.pricing||{}).overrides||{};
-  const t=STATE.pe.full?(STATE.pe.full.table||{}):{};
+  const items=(STATE.pe.data&&STATE.pe.data.items)||[];
   STATE.pe.orig={};
-  Object.entries(t).forEach(([k,v])=>{
-    const base={input:v.input??null,cached:v.cached??null,cache_write:v.cache_write??null,output:v.output??null};
-    STATE.pe.orig[k]={manual:!!ov[k],cur:{},orig:base,base:base};
+  items.forEach(it=>{
+    let base={prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''};
+    const o=it.override;
+    if(o){
+      if(o.alias!==undefined&&o.alias!==null){base.alias=o.alias;base.mult=(o.multiplier!==undefined&&o.multiplier!==null)?o.multiplier:'';}
+      else{const p=(o.prices&&typeof o.prices==='object')?o.prices:o;base.prices={input:p.input??null,cached:p.cached??null,cache_write:p.cache_write??null,output:p.output??null};}
+    }
+    STATE.pe.orig[it.model]={
+      manual:!!it.override,cleared:false,cur:null,base:base,
+      how:it.how||'',price:it.price||null,used:!!it.used,available:!!it.available,
+      requests:it.requests||0,unpriced_requests:it.unpriced_requests||0,
+    };
   });
-  Object.entries(ov).forEach(([k,v])=>{
-    const base={input:v.input??null,cached:v.cached??null,cache_write:v.cache_write??null,output:v.output??null};
-    STATE.pe.orig[k]={manual:true,cur:{},orig:base,base:base};
+}
+function peEff(o){
+  if(o.cleared)return null;
+  if(!o.cur)return o.manual?o.base:null;
+  // merge edits over the base so untouched fields keep their values (an
+  // alias edit must not wipe stored direct prices, and one price edit must
+  // not null out the other three)
+  const b=o.base,c=o.cur;
+  // fall back per field: stored override first, then the resolved upstream
+  // price (sparse edits must not null out fields the user left untouched)
+  const fb=f=>c.prices[f]??b.prices[f]??((o.price||{})[f]??null);
+  return {prices:{input:fb('input'),cached:fb('cached'),cache_write:fb('cache_write'),output:fb('output')},
+          alias:c.alias!==''?c.alias:b.alias,mult:(c.mult!==''&&c.mult!==null)?c.mult:b.mult};
+}
+function peRowHtml(k,o){
+  const eff=peEff(o);
+  const cur=o.cur||o.base;
+  // display falls back to the resolved (upstream) price per field, so the
+  // inputs always show the full effective row instead of the sparse edit
+  const dp={};
+  ['input','cached','cache_write','output'].forEach(f=>{
+    dp[f]=(eff&&!eff.alias&&eff.prices[f]!==null&&eff.prices[f]!==undefined)?eff.prices[f]:((o.price||{})[f]);
   });
+  const showPrice=eff&&eff.alias?null:dp;
+  const howTxt=o.cleared?'<span class="muted">cleared</span>'
+    :eff&&eff.alias?('alias → '+esc(eff.alias)+(eff.mult!==''&&eff.mult!==null?' ×'+esc(eff.mult):''))
+    :(o.how?esc(o.how):'<span class="tag unpriced">no match</span>');
+  const numVal=f=>{const v=(showPrice||{})[f];return (v===null||v===undefined)?'':v};
+  const dis=o.cleared||!!(eff&&eff.alias)?'disabled':'';
+  const adis=o.cleared?'disabled':'';
+  return `<tr data-mrow="${esc(k)}"${o.cleared?' class="pe-cleared"':''}>
+   <td>${esc(k)}
+     ${o.manual?'<span class="tag manual">manual</span>':''}
+     ${o.unpriced_requests>0?'<span class="tag unpriced">unpriced×'+o.unpriced_requests+'</span>':''}
+     <br/><span class="small muted">${o.used?('used · '+fmt(o.requests,0)+' reqs'):'configured'}${o.available?'':' · not in /api/models'}</span></td>
+   <td class="small">${howTxt}</td>
+   ${['input','cached','cache_write','output'].map(f=>`<td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="${f}" value="${esc(numVal(f))}" ${dis} oninput="peEdit(this)"/></td>`).join('')}
+   <td><input class="pe-alias" type="text" placeholder="e.g. kimi-k3" data-pk="${esc(k)}" data-f="alias" value="${esc(cur.alias||'')}" ${adis} oninput="peEdit(this)"/></td>
+   <td><input class="pe-mult" type="number" step="0.05" min="0" placeholder="1" data-pk="${esc(k)}" data-f="mult" value="${esc(cur.mult===''||cur.mult===null?'':cur.mult)}" ${adis} oninput="peEdit(this)"/></td>
+   <td>${o.manual&&!o.cleared?`<button class="small" onclick="peClear('${esc(k)}')">clear</button>`:''}${o.cleared?`<button class="small" onclick="peUndo('${esc(k)}')">undo</button>`:''}</td>
+  </tr>`;
 }
 function renderPricingRows(){
-  const q=STATE.pe.search;
-  const keys=Object.keys(STATE.pe.orig).filter(k=>k.toLowerCase().includes(q)).sort();
-  const per=50,pages=Math.max(1,Math.ceil(keys.length/per));
-  if(STATE.pe.page>=pages)STATE.pe.page=pages-1;
-  const pageKeys=keys.slice(STATE.pe.page*per,STATE.pe.page*per+per);
-  const tb=$('peRows').querySelector('tbody');
-  tb.innerHTML=pageKeys.map(k=>{
+  const q=STATE.pe.search,onlyU=$('peOnlyUnpriced').checked;
+  let keys=Object.keys(STATE.pe.orig).filter(k=>{
+    if(q&&!k.toLowerCase().includes(q))return false;
     const o=STATE.pe.orig[k];
-    const base=o.base;
-    return `<tr>
-     <td>${esc(k)}${o.manual?' <span class="tag manual">manual</span>':''}</td>
-     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="input" value="${esc(pv(o,base,'input'))}" oninput="peEdit(this)"/></td>
-     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="cached" value="${esc(pv(o,base,'cached'))}" oninput="peEdit(this)"/></td>
-     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="cache_write" value="${esc(pv(o,base,'cache_write'))}" oninput="peEdit(this)"/></td>
-     <td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="output" value="${esc(pv(o,base,'output'))}" oninput="peEdit(this)"/></td>
-    </tr>`;}).join('')||'<tr><td colspan="5" class="empty">No models match the search.</td></tr>';
-  $('pePage').textContent=(STATE.pe.page+1)+' / '+pages+' · '+keys.length+' models';
-  $('pePrev').disabled=STATE.pe.page===0;
-  $('peNext').disabled=STATE.pe.page>=pages-1;
+    if(onlyU&&!(o.unpriced_requests>0||(!o.price&&!o.manual&&!o.cleared)))return false;
+    return true;
+  }).sort((a,b)=>{
+    const oa=STATE.pe.orig[a],ob=STATE.pe.orig[b];
+    const ua=(oa.unpriced_requests>0||(!oa.price&&!oa.manual))?0:1;
+    const ub=(ob.unpriced_requests>0||(!ob.price&&!ob.manual))?0:1;
+    if(ua!==ub)return ua-ub;
+    if((oa.used?0:1)!==(ob.used?0:1))return (oa.used?0:1)-(ob.used?0:1);
+    return a.toLowerCase()<b.toLowerCase()?-1:1;
+  });
+  const tb=$('peRows').querySelector('tbody');
+  tb.innerHTML=keys.map(k=>peRowHtml(k,STATE.pe.orig[k])).join('')||'<tr><td colspan="9" class="empty">No models match the filter.</td></tr>';
+  $('pePage').textContent=keys.length+' models';
 }
-function peSearch(){STATE.pe.search=$('peSearch').value.trim().toLowerCase();STATE.pe.page=0;renderPricingRows()}
-function pePage(d){STATE.pe.page+=d;renderPricingRows()}
-// prefill helper: current edit if present, else the baseline value
-function pv(o,base,f){return (o.cur[f]!==undefined)?(o.cur[f]):(base[f]??'')}
+function peSearch(){STATE.pe.search=$('peSearch').value.trim().toLowerCase();renderPricingRows()}
 function peEdit(inp){
-  const row=STATE.pe.orig[inp.dataset.pk];if(!row)return;
-  const v=parseFloat(inp.value);
-  row.cur[inp.dataset.f]=isNaN(v)?null:v;
+  const o=STATE.pe.orig[inp.dataset.pk];if(!o)return;
+  if(!o.cur)o.cur=JSON.parse(JSON.stringify(o.base));
+  const f=inp.dataset.f;
+  if(f==='alias'){o.cur.alias=inp.value.trim();}
+  else if(f==='mult'){o.cur.mult=inp.value===''?'':parseFloat(inp.value);}
+  else{const v=parseFloat(inp.value);o.cur.prices[f]=isNaN(v)?null:v;}
+  o.cleared=false;
 }
+function peClear(k){const o=STATE.pe.orig[k];if(!o)return;o.cleared=true;renderPricingRows()}
+function peUndo(k){const o=STATE.pe.orig[k];if(!o)return;o.cleared=false;renderPricingRows()}
 function collectOverrides(){
-  // DOM-independent: iterate every row in STATE.pe.orig (all table keys from
-  // /pricing?full=1 plus existing overrides). peEdit keeps row.cur in sync on
-  // input events, so rows not currently in the DOM (other pages / filtered by
-  // search) keep their edits and their baseline values.
+  // DOM-independent: iterate STATE.pe.orig (every used/configured model).
   // Emission rules:
-  //  - a row with an existing override is always re-emitted (preservation)
-  //  - a row is emitted only when its effective values differ from baseline
-  //    (a cleared field falls back to orig: upstream baseline for table rows,
-  //    the stored override for manual rows) and at least one effective value
-  //    is non-empty
-  //  - unedited baseline rows are never emitted
-  const FIELDS=['input','cached','cache_write','output'];
+  //  - cleared manual row          -> emit null (deep-merge tombstone)
+  //  - alias set                   -> {alias, multiplier?} (multiplier omitted
+  //    when blank -> backend treats it as 1)
+  //  - prices differ from upstream -> {prices:{...}}
+  //  - manual row re-emitted even if unchanged (preservation across saves)
+  //  - unedited non-manual rows    -> never emitted
   const ov={};
-  Object.entries(STATE.pe.orig).forEach(([key,row])=>{
-    const out={};
-    FIELDS.forEach(f=>{out[f]=(row.cur[f]??row.orig[f])??null});
-    const changed=FIELDS.some(f=>out[f]!==row.orig[f]);
-    const hasVal=FIELDS.some(f=>out[f]!==null&&out[f]!==undefined);
-    if(hasVal&&(row.manual||changed))ov[key]=out;
+  Object.entries(STATE.pe.orig).forEach(([k,o])=>{
+    if(o.cleared){ov[k]=null;return}
+    const eff=peEff(o);
+    if(!eff)return;
+    if(eff.alias){
+      const out={alias:eff.alias};
+      if(eff.mult!==''&&eff.mult!==null&&!isNaN(eff.mult))out.multiplier=Number(eff.mult);
+      ov[k]=out;
+      return;
+    }
+    const p=eff.prices||{};
+    const hasVal=Object.values(p).some(v=>v!==null&&v!==undefined);
+    if(!hasVal)return;
+    // compare against the *current effective* price; only a real change
+    // turns a non-manual row into an override (editing one field while the
+    // others stay at the resolved values does not dirty the row)
+    const base=o.price||null;
+    const changed=!base||['input','cached','cache_write','output'].some(f=>(p[f]??null)!==(base[f]??null));
+    if(o.manual||changed)ov[k]={prices:p};
   });
   return ov;
 }
@@ -2051,6 +2199,67 @@ async def api_refresh(request: Request):
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@qk_router.get("/models", dependencies=[Depends(_require_admin)])
+async def api_models(request: Request):
+    """Models actually in play on this instance: everything used (ledger)
+    plus everything configured in OWUI /api/models, each with the resolved
+    price, the matching strategy, and the configured override (if any).
+    Backs the pricing editor -- it edits real usage, not the 2.5k-row
+    upstream table."""
+    cfg = qk_get_config()
+    ov = ((cfg.get("pricing") or {}).get("overrides")) or {}
+    table = (qk_load_json(QK_PRICING_PATH, {}) or {}).get("table") or {}
+
+    used = {}  # model -> {"requests": n, "unpriced_requests": n, "cost_usd": x}
+    led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {})
+    for u in led.values():
+        for d in (u.get("days") or {}).values():
+            for m, mm in ((d or {}).get("models") or {}).items():
+                row = used.setdefault(m, {"requests": 0, "unpriced_requests": 0, "cost_usd": 0.0})
+                mm = mm or {}
+                row["requests"] += mm.get("requests", 0) or 0
+                row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
+                row["cost_usd"] += mm.get("cost_usd", 0) or 0
+
+    available = []
+    try:
+        from open_webui.models.models import Models
+
+        res = Models.get_all_models()
+        if asyncio.iscoroutine(res):
+            res = await res
+        available = [str(m.id) for m in (res or []) if getattr(m, "id", None)]
+    except Exception as e:
+        log.info("quota-keeper models list fetch failed: %s", e)
+
+    ids = sorted(set(used) | set(available), key=str.lower)
+    items = []
+    for m in ids:
+        price, how = qk_find_pricing(m, table, ov)
+        spec = None
+        ml = m.strip().lower()
+        for k, v in ov.items():
+            if str(k).strip().lower() == ml and v is not None:
+                spec = v
+                break
+        u = used.get(m) or {}
+        items.append(
+            {
+                "model": m,
+                "used": m in used,
+                "available": m in available,
+                "requests": u.get("requests", 0),
+                "unpriced_requests": u.get("unpriced_requests", 0),
+                "cost_usd": u.get("cost_usd", 0.0),
+                "matched": price is not None,
+                "how": how,
+                "price": price,
+                "override": spec,
+            }
+        )
+    return JSONResponse({"items": items, "pricing_fetched": bool(table)})
 
 
 @qk_router.get("/pricing/match", dependencies=[Depends(_require_admin)])

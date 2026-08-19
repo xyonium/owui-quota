@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.2.3
+version: 0.3.0
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -11,6 +11,7 @@ import re
 import json
 import time
 import asyncio
+import fnmatch
 import logging
 import threading
 from contextlib import contextmanager
@@ -79,7 +80,10 @@ DEFAULT_CONFIG = {
         "holidays": [],                  # "YYYY-MM-DD" -> whole day offpeak
         "default_policy": "off",         # off | normal
         "providers": {},                 # "<first path segment>": {"enabled": bool, "tiers": {name: {"rate": x}}}
-        "models": {},                    # exact model id: {"enabled": bool, "tiers": {...}}
+        # keys: exact model id, or a * glob (fnmatch, case-insensitive), e.g.
+        # "*deepseek*" matches any id containing it; exact keys beat globs,
+        # longer glob patterns beat shorter ones
+        "models": {},
     },
 }
 
@@ -195,6 +199,32 @@ def qk_validate_config(cfg) -> list:
     pri = cfg.get("pricing")
     if pri is not None and not isinstance(pri, dict):
         errs.append("pricing must be an object")
+    if isinstance(pri, dict):
+        ov = pri.get("overrides")
+        if ov is not None and not isinstance(ov, dict):
+            errs.append("pricing.overrides must be an object")
+        elif isinstance(ov, dict):
+            for k, v in ov.items():
+                if v is None:
+                    continue  # tombstone: cleared by a later POST's deep merge
+                if not isinstance(v, dict):
+                    errs.append(f"pricing.overrides.{k} must be an object or null")
+                    continue
+                if "alias" in v:
+                    if not isinstance(v.get("alias"), str) or not v["alias"].strip():
+                        errs.append(f"pricing.overrides.{k}.alias must be a non-empty string")
+                    mult = v.get("multiplier")
+                    if mult is not None and not (_QK_NUM(mult) and mult > 0):
+                        errs.append(f"pricing.overrides.{k}.multiplier must be a positive number")
+                else:
+                    pr = v.get("prices") if "prices" in v else v
+                    if not isinstance(pr, dict):
+                        errs.append(f"pricing.overrides.{k}.prices must be an object")
+                        continue
+                    for f in QK_PRICE_FIELDS:
+                        fv = pr.get(f)
+                        if fv is not None and not (_QK_NUM(fv) and fv >= 0):
+                            errs.append(f"pricing.overrides.{k}.{f} must be a number >= 0")
     tou = cfg.get("tou")
     if tou is not None and not isinstance(tou, dict):
         errs.append("tou must be an object")
@@ -274,14 +304,26 @@ def qk_tou_local_now(cfg: dict) -> datetime:
 
 
 def qk_tou_resolve_policy(cfg: dict, model_id: str):
-    """models[exact] -> providers[first segment] -> default_policy. Returns policy dict or None (off)."""
+    """models[exact] -> models[glob] (keys containing '*', fnmatch, longest
+    pattern first) -> providers[first segment] -> default_policy.
+    Returns a policy dict or None (off)."""
     tou = cfg.get("tou") or {}
     if not tou.get("enabled"):
         return None
     mid = str(model_id or "").strip().lower()
-    mpol = (tou.get("models") or {}).get(mid)
+    models = tou.get("models") or {}
+    mpol = models.get(mid)
     if isinstance(mpol, dict):
         return mpol if mpol.get("enabled", True) else None
+    globs = [
+        (str(k).strip().lower(), v)
+        for k, v in models.items()
+        if isinstance(v, dict) and "*" in str(k)
+    ]
+    # longest pattern first so *deepseek-chat* beats *deepseek*
+    for pat, v in sorted(globs, key=lambda kv: -len(kv[0])):
+        if fnmatch.fnmatchcase(mid, pat):
+            return v if v.get("enabled", True) else None
     prov = mid.split("/")[0] if "/" in mid else "_default"
     ppol = (tou.get("providers") or {}).get(prov)
     if isinstance(ppol, dict):
@@ -361,42 +403,80 @@ def _qk_variants(m: str):
     return out
 
 
+def _qk_scale_price(price, mult):
+    return {
+        f: (float(v) * mult if isinstance(v, (int, float)) and not isinstance(v, bool) else None)
+        for f, v in (price or {}).items()
+        if f in QK_PRICE_FIELDS
+    }
+
+
 def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None):
     """override -> exact -> path-suffix -> tail-segment -> contains (all on
-    raw and date-stripped variants). Returns (price|None, how|None)."""
+    raw and date-stripped variants). Returns (price|None, how|None).
+
+    Override value shapes (a None value means "cleared" and is skipped):
+      legacy direct:  {"input": x, "cached": y, "cache_write": z, "output": w}
+      wrapped direct: {"prices": {...same...}}
+      alias:          {"alias": "<model key>", "multiplier": m}
+    Alias targets resolve through the same matching chain (table lookup AND
+    nested overrides, up to 8 hops, cycle-safe); multiplier scales the
+    resolved per-1M prices (default 1)."""
     m = (model_id or "").strip().lower()
     if not m:
         return None, None
-    vs = _qk_variants(m)
     ov = {str(k).strip().lower(): v for k, v in (overrides or {}).items()}
-    for cand in vs:
-        if cand in ov:
-            return ov[cand], "override:" + cand
-    if table:
+
+    def resolve(mid, depth):
+        if depth > 8:
+            return None, None
+        vs = _qk_variants(mid)
         for cand in vs:
-            if cand in table:
-                return table[cand], "exact:" + cand
-        best = None
-        for cand in vs:
-            for k in table:
-                if cand.endswith("/" + k) and (best is None or len(k) > len(best[1])):
-                    best = ("suffix", k)
-        if best:
-            return table[best[1]], best[0] + ":" + best[1]
-        for cand in vs:
-            segs = cand.split("/")
-            for i in range(len(segs)):
-                tail = "/".join(segs[i:])
-                if tail in table:
-                    return table[tail], "segment:" + tail
-        best = None
-        for cand in vs:
-            for k in table:
-                if len(k) >= 4 and k in cand and (best is None or len(k) > len(best[1])):
-                    best = ("contains", k)
-        if best:
-            return table[best[1]], best[0] + ":" + best[1]
-    return None, None
+            spec = ov.get(cand)
+            if not isinstance(spec, dict):
+                continue
+            if "alias" in spec or "prices" in spec:
+                if "alias" in spec:
+                    target = str(spec.get("alias") or "").strip().lower()
+                    if target and target != cand:
+                        base, how = resolve(target, depth + 1)
+                        if base is not None:
+                            mult = spec.get("multiplier")
+                            mult = float(mult) if isinstance(mult, (int, float)) and not isinstance(mult, bool) else 1.0
+                            return _qk_scale_price(base, mult), "alias:" + target + ("*" + str(mult) if mult != 1.0 else "")
+                else:
+                    p = spec.get("prices")
+                    if isinstance(p, dict):
+                        return p, "override:" + cand
+            else:  # legacy direct price dict
+                return spec, "override:" + cand
+        if table:
+            for cand in vs:
+                if cand in table:
+                    return table[cand], "exact:" + cand
+            best = None
+            for cand in vs:
+                for k in table:
+                    if cand.endswith("/" + k) and (best is None or len(k) > len(best[1])):
+                        best = ("suffix", k)
+            if best:
+                return table[best[1]], best[0] + ":" + best[1]
+            for cand in vs:
+                segs = cand.split("/")
+                for i in range(len(segs)):
+                    tail = "/".join(segs[i:])
+                    if tail in table:
+                        return table[tail], "segment:" + tail
+            best = None
+            for cand in vs:
+                for k in table:
+                    if len(k) >= 4 and k in cand and (best is None or len(k) > len(best[1])):
+                        best = ("contains", k)
+            if best:
+                return table[best[1]], best[0] + ":" + best[1]
+        return None, None
+
+    return resolve(m, 0)
 
 
 def qk_normalize_usage(u) -> Optional[dict]:

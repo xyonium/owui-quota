@@ -77,3 +77,120 @@ def test_get_config_recovers_from_list_config(admin_client):
     assert isinstance(body, dict)
     assert body["credits_per_usd"] == 1000.0
     assert body["pricing"]["refresh_hours"] == 24
+
+
+# ---- pricing override schema: alias + multiplier (v0.3.0) --------------------
+
+
+def _find(adm, model, table, ov):
+    return adm.qk_find_pricing(model, table, ov)
+
+
+def test_alias_override_resolves_through_table(admin_client):
+    c, adm = _app(admin_client)
+    table = {"kimi-k3": {"input": 2.0, "output": 8.0, "cached": 0.5}}
+    ov = {"kimi-k3-256k": {"alias": "kimi-k3", "multiplier": 0.5}}
+    price, how = _find(adm, "kimi-k3-256k", table, ov)
+    assert price == {"input": 1.0, "output": 4.0, "cached": 0.25}
+    assert how.startswith("alias:kimi-k3")
+
+
+def test_alias_without_multiplier_and_nested_alias(admin_client):
+    c, adm = _app(admin_client)
+    table = {"a/base": {"input": 4.0, "output": 4.0}}
+    ov = {"b": {"alias": "a/base"}, "c": {"alias": "b", "multiplier": 2}}
+    assert _find(adm, "b", table, ov)[0] == {"input": 4.0, "output": 4.0}
+    assert _find(adm, "c", table, ov)[0] == {"input": 8.0, "output": 8.0}
+
+
+def test_alias_cycle_safe_and_missing_target(admin_client):
+    c, adm = _app(admin_client)
+    ov = {"x": {"alias": "y"}, "y": {"alias": "x"}}
+    assert _find(adm, "x", {}, ov) == (None, None)
+    assert _find(adm, "x", {}, {"x": {"alias": "ghost"}}) == (None, None)
+
+
+def test_wrapped_prices_and_legacy_direct_and_null(admin_client):
+    c, adm = _app(admin_client)
+    table = {}
+    ov = {
+        "w": {"prices": {"input": 1.0, "output": 2.0}},
+        "l": {"input": 3.0, "output": 6.0},
+        "n": None,
+    }
+    assert _find(adm, "w", table, ov)[0] == {"input": 1.0, "output": 2.0}
+    assert _find(adm, "l", table, ov)[0] == {"input": 3.0, "output": 6.0}
+    price, how = _find(adm, "n", table, ov)
+    assert price is None  # null override = cleared, does not match
+
+
+def test_override_validation(admin_client):
+    c, adm = _app(admin_client)
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": {"alias": "a/base", "multiplier": 0.5}}}}).status_code == 200
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": {"alias": "", "multiplier": 1}}}}).status_code == 400
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": {"alias": "x", "multiplier": 0}}}}).status_code == 400
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": "junk"}}}).status_code == 400
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": {"prices": {"input": -1}}}}}).status_code == 400
+    # null tombstone is legal (clears an override on the deep-merge)
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": None}}}).status_code == 200
+
+
+def test_models_endpoint_aggregates_used_and_available(admin_client, monkeypatch):
+    import sys
+    import types as _t
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    c, adm = _app(admin_client)
+    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"days": {
+        "2026-08-18": {"models": {
+            "kimi-k3-256k": {"requests": 16, "unpriced_requests": 16, "cost_usd": 0.0},
+            "gpt-4o": {"requests": 2, "unpriced_requests": 0, "cost_usd": 0.1},
+        }}
+    }}}})
+    write_json(Path(adm.QK_PRICING_PATH),
+               {"table": {"kimi-k3": {"input": 2.0, "output": 8.0}, "gpt-4o": {"input": 5.0, "output": 15.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH),
+               {"pricing": {"overrides": {"kimi-k3-256k": {"alias": "kimi-k3", "multiplier": 0.5}}}})
+
+    # stub open_webui.models.models.Models.get_all_models (async in current OWUI)
+    ow = _t.ModuleType("open_webui")
+    models_mod = _t.ModuleType("open_webui.models")
+    mmm = _t.ModuleType("open_webui.models.models")
+
+    class _M:
+        def __init__(self, id):
+            self.id = id
+
+    class Models:
+        @staticmethod
+        async def get_all_models(*a, **kw):
+            return [_M("kimi-k3-256k"), _M("prx.free")]
+
+    mmm.Models = Models
+    ow.models = models_mod
+    models_mod.models = mmm
+    monkeypatch.setitem(sys.modules, "open_webui", ow)
+    monkeypatch.setitem(sys.modules, "open_webui.models", models_mod)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", mmm)
+
+    r = c.get("/api/v1/quota-keeper/models")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["pricing_fetched"] is True
+    items = {it["model"]: it for it in body["items"]}
+    k = items["kimi-k3-256k"]
+    # ledger history predates the override: 16 requests were recorded unpriced;
+    # the /models row keeps that history while NOW resolving via the alias
+    assert k["used"] and k["available"] and k["requests"] == 16 and k["unpriced_requests"] == 16
+    assert k["matched"] and k["price"] == {"input": 1.0, "output": 4.0}
+    assert k["override"] == {"alias": "kimi-k3", "multiplier": 0.5}
+    assert items["gpt-4o"]["matched"] and items["gpt-4o"]["price"]["input"] == 5.0
+    # available-only model shows up without usage
+    assert items["prx.free"]["available"] and not items["prx.free"]["used"]

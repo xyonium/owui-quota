@@ -130,3 +130,50 @@ def test_record_applies_tou_and_saves(qk, monkeypatch):
     assert abs(mm["cost_usd"] - 2.0) < 1e-9        # 1M input x $1 x peak 2.0
     assert mm["tou"]["peak"] == 1
     assert abs(mm.get("cost_saved_usd", 0) + 1.0) < 1e-9  # saved = -(extra paid)
+
+
+# ---- TOU model globs (v0.3.0) ------------------------------------------------
+
+
+def _tou_cfg(models):
+    return {
+        "tou": {
+            "enabled": True,
+            "tiers": {"peak": {"rate": 2.0}, "offpeak": {"rate": 0.5}, "normal": {"rate": 1.0}},
+            "holidays": [],
+            "default_policy": "off",
+            "providers": {},
+            "models": models,
+        }
+    }
+
+
+def test_tou_models_glob_match(qk):
+    cfg = _tou_cfg({"*deepseek*": {"enabled": True, "tiers": {"peak": {"rate": 3.0}}}})
+    pol = qk.qk_tou_resolve_policy(cfg, "prx/deepseek-v4-pro")
+    assert pol is not None and pol["tiers"]["peak"]["rate"] == 3.0
+    # non-matching model stays off (default_policy off)
+    assert qk.qk_tou_resolve_policy(cfg, "prx/gpt-4o") is None
+
+
+def test_tou_exact_key_beats_glob(qk):
+    cfg = _tou_cfg({
+        "*deepseek*": {"enabled": True, "tiers": {"peak": {"rate": 3.0}}},
+        "prx/deepseek-v4-pro": {"enabled": True, "tiers": {"peak": {"rate": 9.0}}},
+    })
+    pol = qk.qk_tou_resolve_policy(cfg, "prx/deepseek-v4-pro")
+    assert pol["tiers"]["peak"]["rate"] == 9.0
+
+
+def test_tou_longer_glob_wins(qk):
+    cfg = _tou_cfg({
+        "*deepseek*": {"enabled": True, "tiers": {"peak": {"rate": 3.0}}},
+        "*deepseek-v4-pro*": {"enabled": True, "tiers": {"peak": {"rate": 7.0}}},
+    })
+    pol = qk.qk_tou_resolve_policy(cfg, "prx/deepseek-v4-pro-x")
+    assert pol["tiers"]["peak"]["rate"] == 7.0
+
+
+def test_tou_glob_disabled_means_off(qk):
+    cfg = _tou_cfg({"*deepseek*": {"enabled": False}})
+    assert qk.qk_tou_resolve_policy(cfg, "prx/deepseek-v4-pro") is None

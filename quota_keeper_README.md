@@ -42,24 +42,26 @@
 ## 分时计价（TOU，DeepSeek 式峰谷价格）
 
 - 配置 `tou.enabled` 开启；`tou` 下分 `peak / offpeak / normal` 三档，每档一个 `rate` 倍数和若干时间窗 `windows`（`days` 用 JS 星期号 0=周日…6=周六，`start/end` 为 HH:MM，可跨零点）。
-- 命中规则：`models[精确模型 id]` → `providers[模型 id 首段]` → `default_policy`。`holidays` 里的日期全天强制 offpeak（无 offpeak 档则取最低 rate 档）。
+- 命中规则：`models[精确 id]` → `models[* 通配]`（键含 `*` 时按 fnmatch 匹配，如 `*deepseek*` 匹配任何包含它的模型 id；精确键优先，长 pattern 优先）→ `providers[模型 id 首段]` → `default_policy`。`holidays` 里的日期全天强制 offpeak（无 offpeak 档则取最低 rate 档）。
 - `default_policy` 语义（针对未在 `providers`/`models` 里配置的模型）：
   - `"off"`：未配置 provider 的模型不参与峰谷计费（rate 恒为 1，账本标记 tier=off）。**建议保持 off**。
   - `"normal"`：未配置 provider 的模型按全局 `tiers` 窗口参与计费（仍会命中 peak/offpeak 窗口，只是无 provider 级覆盖）。
-- 时间窗 `days` 为空列表（或缺省）表示每天。
+- 时间窗 `days` 为空列表（或缺省）表示每天。**normal 档不配时间窗 = 全天候兜底**：未命中 peak/offpeak 任何窗口的时间一律走 normal 的 rate；`rate=1` 即原价（不折不加）。
 - 命中档位的 rate 乘以**整单价格**（cached+input+cache_write+output，DeepSeek 风格），与配额倍数（`schedule`）互不影响——前者改价格、后者改配额上限。
 - 账本逐日/逐模型记录各档请求数 `tou` 与折扣金额 `cost_saved_usd`（= 按 normal 价算的成本 − 实际成本）；`/me` 与管理台显示当前用户所处档位。
 
 ## 价格覆盖（Pricing Overrides）
 
-- 管理台「价格」区是缓存价格表的可搜索、分页表格：每行显示匹配目标 key、per-1M 四价（input/cached/cache_write/output），支持行内编辑保存到 `pricing.overrides`。
+- 管理台「Pricing editor」列出的是**你实际使用的模型**（账本 ∪ Open WebUI 已配置模型），不是 2.5k 行的上游全表：每行显示解析出的价格与命中方式（exact/suffix/segment/contains/override/alias）、未计价标记，未匹配/错价的行排在最前。
+- 每行两种修法：**直接填价**（input/cached/cache_write/output 每 1M），或**别名 + 系数**——`kimi-k3-256k → alias: kimi-k3 × 0.5` 即按 kimi-k3 价格打 5 折（别名可链式嵌套，防环，最多 8 跳；系数不写 = 1）。
+- 覆盖值三种形态（`pricing.overrides`）：`{"prices": {...}}` 直接定价；`{"alias": "key", "multiplier": m}` 别名；裸价格 dict 为旧格式仍兼容。`null` = 清除该行覆盖（编辑器行尾 clear 按钮）。
 - 覆盖优先级最高，且**永不被上游刷新覆盖**；来自 overrides 的行带「manual」徽标。用量表与 Test match 框显示实际命中的目标（`how` 字段）。
 
 ## 管理台（admin 视角 /quota）
 
 - 6 张 KPI 卡（请求数 / tokens / 成本 USD / credits / 缓存率 / unpriced 请求），其中成本与 credits 带 7 天 sparkline；时间跨度选择 24h / 7d / 30d / 90d / 自定义（存 localStorage，24h 内走小时粒度）。
 - 堆叠趋势图（按模型分色，≤8 色 + Others）、用户排行表（搜索 + 可排序列 + 点击下钻该用户的 per-model 明细）、模型表（混合 $/M、unpriced 徽标、TOU 徽标、匹配目标按钮）。
-- 最近动态（`/recent`，最近 200 条响应，手动刷新）、TOU 编辑器（档位 / 时间窗 / 提供方 / 模型 / 节假日，节假日支持一键从 date.nager.at 拉取）、CSV 导出（前端生成）。
+- 最近动态（`/recent`，最近 200 条响应，手动刷新）、TOU 编辑器（档位 / 时间窗 / 提供方 / 模型 exact-or-glob / 节假日，节假日支持一键从 date.nager.at 拉取）、CSV 导出（前端生成）。
 - **无任何自动刷新/轮询**：数据在打开页面或点手动刷新/改筛选时加载，聚合在服务端 `/stats` 按需完成，页面不下载原始 ledger。
 
 ## 个人自助（普通用户视角 /quota）

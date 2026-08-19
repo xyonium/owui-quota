@@ -68,16 +68,28 @@ def test_overrides_save_preserves_non_visible_rows():
     # JS fetches real-looking URLs in the harness.
     page_js = _extract_page_js().replace("__QK_API_PREFIX__", "/api/v1/quota-keeper")
 
-    # Fixture mirrors /pricing?full=1: 3 entries -> 50/page pagination shows
-    # only zebra/model-aaa on page 1; bbb is a hidden-page row that already
-    # carries a manual override on disk; ccc is a never-touched baseline row.
+    # Fixture mirrors GET /models (v0.3.0 editor data source): 3 used models.
+    # The search filter hides bbb (existing override on disk, wrapped form)
+    # and ccc (baseline row) while aaa is edited -- the save must preserve
+    # hidden rows and not drop the hidden override.
     data = {
-        "full": {
-            "table": {
-                "zebra/model-aaa": {"input": 1.0, "output": 2.0},
-                "zebra/model-bbb": {"input": 1.0, "output": 2.0},
-                "zebra/model-ccc": {"input": 1.0, "output": 2.0},
-            }
+        "models": {
+            "pricing_fetched": True,
+            "items": [
+                {"model": "zebra/model-aaa", "used": True, "available": True,
+                 "requests": 3, "unpriced_requests": 0, "cost_usd": 0.1,
+                 "matched": True, "how": "exact:zebra/model-aaa",
+                 "price": {"input": 1.0, "output": 2.0}, "override": None},
+                {"model": "zebra/model-bbb", "used": True, "available": True,
+                 "requests": 5, "unpriced_requests": 0, "cost_usd": 0.2,
+                 "matched": True, "how": "override:zebra/model-bbb",
+                 "price": {"input": 9.0, "output": 9.0},
+                 "override": {"prices": {"input": 9.0, "output": 9.0}}},
+                {"model": "zebra/model-ccc", "used": True, "available": True,
+                 "requests": 1, "unpriced_requests": 0, "cost_usd": 0.0,
+                 "matched": True, "how": "exact:zebra/model-ccc",
+                 "price": {"input": 1.0, "output": 2.0}, "override": None},
+            ],
         },
         "cfg": {
             "credits_per_usd": 1000.0,
@@ -88,7 +100,7 @@ def test_overrides_save_preserves_non_visible_rows():
             "schedule": {"timezone": None, "night_start_hour": 22, "night_end_hour": 8,
                          "night_multiplier": 1.0, "weekend_multiplier": 1.0},
             "pricing": {"url": "http://x", "refresh_hours": 24, "default_pricing": None,
-                        "overrides": {"zebra/model-bbb": {"input": 9.0, "output": 9.0}}},
+                        "overrides": {"zebra/model-bbb": {"prices": {"input": 9.0, "output": 9.0}}}},
             "tou": {"enabled": False, "timezone": None, "tiers": {}, "holidays": [],
                     "default_policy": "off", "providers": {}, "models": {}},
         },
@@ -98,7 +110,7 @@ def test_overrides_save_preserves_non_visible_rows():
     }
 
     fake_src = (
-        "window.FAKE = {full:" + json.dumps(data["full"])
+        "window.FAKE = {models:" + json.dumps(data["models"])
         + ",cfg:" + json.dumps(data["cfg"])
         + ",stats:" + json.dumps(data["stats"]) + ",posted:null};\n"
         + "window.__qk_fake_fetch__ = (path, opts) => {\n"
@@ -108,7 +120,7 @@ def test_overrides_save_preserves_non_visible_rows():
         + "  const j = v => ({json: () => v, ok: true});\n"
         + "  if (m === 'POST' && url.endsWith('/config')) { window.FAKE.posted = JSON.parse(opts.body); return Promise.resolve(j({ok:true})); }\n"
         + "  if (url.endsWith('/me')) return Promise.resolve(j({user:{id:'u1',name:'Admin',email:'a@x',role:'admin'}}));\n"
-        + "  if (url.endsWith('/pricing?full=1')) return Promise.resolve(j(window.FAKE.full));\n"
+        + "  if (url.endsWith('/models')) return Promise.resolve(j(window.FAKE.models));\n"
         + "  if (url.endsWith('/config')) return Promise.resolve(j(window.FAKE.cfg));\n"
         + "  if (url.endsWith('/users')) return Promise.resolve(j([]));\n"
         + "  if (url.endsWith('/groups')) return Promise.resolve(j([]));\n"
@@ -136,7 +148,7 @@ def test_overrides_save_preserves_non_visible_rows():
     const inputs = document.querySelectorAll('input[data-pk]');
     if (!inputs.length) throw new Error('no editor rows rendered');
     const pk = [...inputs].map(i => i.dataset.pk);
-    if (!(pk.length === 4 && pk.every(p => p === 'zebra/model-aaa')))
+    if (!(pk.length === 6 && pk.every(p => p === 'zebra/model-aaa')))
       throw new Error('expected only the visible zebra/model-aaa row, got ' + pk.join(','));
     // edit the visible row through its input. jsdom in outside-only mode does
     // not execute inline attribute handlers (oninput="peEdit(this)"), so the
@@ -146,28 +158,25 @@ def test_overrides_save_preserves_non_visible_rows():
     aaa.value = '5.5';
     peEdit(aaa);
     // bbb: existing override on disk (9.0/9.0), hidden by the search filter,
-    // never re-edited this session. Old collectOverrides() read only DOM
-    // inputs: bbb's cur stayed {} -> hasAny=false -> the key was dropped from
-    // the POST and deep-merged away on disk. It must re-emit unchanged.
+    // never re-edited this session -> must be preserved unchanged.
     // ccc: baseline row (no override on disk), hidden, untouched; also give
     // it an explicit all-empty cur (simulating the user clearing the fields)
     // -> must NOT be emitted.
     const rc = STATE.pe.orig['zebra/model-ccc'];
-    rc.cur.input = null; rc.cur.cached = null; rc.cur.cache_write = null; rc.cur.output = null;
+    rc.cur = {prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''};
     saveConfig();
     await new Promise(r2 => setTimeout(r2, 60));
     const body = window.FAKE.posted;
     if (!body) throw new Error('no /config POST recorded');
     const ov = (body.pricing || {}).overrides || {};
-    // assertions:
-    //  aaa: edited while visible -> emitted with the edit, other fields at
-    //       their baseline values (output stays 2.0)
+    // assertions (v0.3.0 emission shapes):
+    //  aaa: edited while visible -> {prices:{input:5.5, output:2.0, ...}}
     //  bbb: hidden, untouched, existing override -> preserved unchanged
     //  ccc: all-empty, no existing override -> dropped
-    const aaaOk = ov['zebra/model-aaa'] && ov['zebra/model-aaa'].input === 5.5
-      && ov['zebra/model-aaa'].output === 2.0;
-    const bbbOk = ov['zebra/model-bbb'] && ov['zebra/model-bbb'].input === 9.0
-      && ov['zebra/model-bbb'].output === 9.0;
+    const pa = ov['zebra/model-aaa'] && ov['zebra/model-aaa'].prices || {};
+    const pb = ov['zebra/model-bbb'] && ov['zebra/model-bbb'].prices || {};
+    const aaaOk = pa.input === 5.5 && pa.output === 2.0;
+    const bbbOk = pb.input === 9.0 && pb.output === 9.0;
     const cccOk = !('zebra/model-ccc' in ov);
     if (!(aaaOk && bbbOk && cccOk))
       throw new Error('bad overrides: ' + JSON.stringify(ov));
@@ -200,8 +209,7 @@ add('userq', 'table', '<tbody></tbody>');
 add('groups', 'table', '<tbody></tbody>');
 add('toast', 'div');
 add('peSearch', 'input');
-add('pePrev', 'button');
-add('peNext', 'button');
+add('peOnlyUnpriced', 'input');
 add('peRows', 'table', '<tbody></tbody>');
 add('pePage', 'span');
 add('btnSave', 'button');

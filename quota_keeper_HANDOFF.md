@@ -131,8 +131,11 @@ Open WebUI 实例
 输入统一 lower。变体集 `_qk_variants(m)`：`[原串, . → - 版本, 去日期后缀版, 去日期+点转杠版]`。
 日期后缀正则：`r"[-:_.](20\d{2}[-_.]?\d{2}[-_.]?\d{2}|\d{6})$"`（剥 `-2024-08-06` / `-20241022`）。
 
-匹配顺序（每个策略内部都对全部变体尝试）：
-1. `override:<k>` — pricing.overrides 精确命中
+匹配顺序（每个策略内部都对全部变体尝试；实现为 `resolve(mid, depth)` 递归，别名跳转入同一链）：
+1. `override:<k>` — pricing.overrides 精确命中。覆盖值三种形态（v0.3.0）：
+   - `{"prices": {...}}` 或裸价格 dict（旧格式）→ 直接使用
+   - `{"alias": "<key>", "multiplier": m}` → 递归 resolve 目标 key（表内匹配与嵌套 override 都算），结果 per-1M 价 × `multiplier`（缺省 1）；**防环、最多 8 跳**，目标不可解析 → 无命中
+   - `null` → 清除标记（跳过，不匹配）
 2. `exact:<k>` — 表内精确
 3. `suffix:<k>` — 模型 id 以 `/<key>` 结尾（`openai/gpt-4o`→`gpt-4o`），取最长 key
 4. `segment:<k>` — 去掉前导路径段后命中
@@ -171,7 +174,7 @@ bedrock.us-east-1/anthropic.claude-3-5-haiku→contains / totally-unknown→None
 
 ### 5.7 分时计价 qk_tou_rate / qk_tou_resolve_policy（filter + admin 各一份，逻辑必须一致）
 
-- `qk_tou_resolve_policy(cfg, model_id)`：`models[精确 id]` → `providers[首段]`（裸模型名 → `_default`）→ `default_policy`（"off" 返回 None，不参与；"normal" 返回 `{}` 即 normal 档）。`enabled:false` 的策略返回 None。**先判 `tou.enabled`**，关闭时直接 None（rate 1.0）。
+- `qk_tou_resolve_policy(cfg, model_id)`：`models[精确 id]` → `models[* 通配]`（v0.3.0：键含 `*` 按 fnmatchcase 大小写不敏感匹配，**长 pattern 优先**，如 `*deepseek-v4-pro*` 优先于 `*deepseek*`）→ `providers[首段]`（裸模型名 → `_default`）→ `default_policy`（"off" 返回 None，不参与；"normal" 返回 `{}` 即 normal 档）。`enabled:false` 的策略返回 None。**先判 `tou.enabled`**，关闭时直接 None（rate 1.0）。
 - `qk_tou_rate(cfg, model_id, now)` 返回 `(rate, tier)`，tier `"off"` = 不适用（rate 1.0）：
   1. 策略档级配置在全局 `tiers` 之上浅合并（`base.update(over)`，窗口与 rate 可部分覆盖）。
   2. 时区：`tou.timezone` → `schedule.timezone` → `$TZ` → UTC（`qk_tou_local_now`）；day/hour 均按此时区判定。
@@ -274,7 +277,7 @@ v0.2.1 修复记录（真实实例首验发现）：
 ## 10. 快速上手（给 coding agent）
 
 1. 环境要求：Open WebUI ≥ 0.10.0（Event primitive + `__app__` 注入；Filter 部分兼容 0.6+）。
-2. 复现测试：仓库 `tests/` 的 60 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
+2. 复现测试：仓库 `tests/` 的 70 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾；页面 JS 以 **AST 求值**（而非原始切片）取 QK_PAGE 后过 `node --check` 与 jsdom（v0.2.7 教训：Python 会吃掉 JS 里的 `\n` 转义）。
 3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6/5.7 中标注"两文件各一份"的）必须同步双文件，diff 检查。
 4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 四个 JSON（config/ledger/pricing_cache/recent）。
 5. 日志：全部 `log.warning/log.info`，前缀 `quota-keeper`，`docker logs` 可过滤。
