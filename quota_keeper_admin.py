@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.5
+version: 0.2.6
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1161,12 +1161,17 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 //   ONLY when the Pricing editor is first expanded or its Refresh is pressed.
 // =====
 const $=id=>document.getElementById(id);
+// boot marker: if the header badge never shows even this, the inline script
+// did not execute at all (browser/extension blocked it) -- no banner can
+// appear either, since the banner itself is rendered by this script
+{const b=document.getElementById('meta');if(b)b.textContent='booting…';}
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function toast(msg,ms=2200){const t=$('toast');t.textContent=msg;t.classList.add('show');clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('show'),ms)}
 // persistent, unmissable load-failure banner (the 2.2s toast was too easy to
 // miss and a blank page with no visible cause is undebuggable)
 function showFatal(msg){const b=$('fatal');if(!b)return;b.textContent=msg;b.hidden=false}
 window.addEventListener('error',e=>{try{showFatal('JS error: '+(e.message||e.type)+' @line '+(e.lineno||'?'))}catch(_){}});
+window.addEventListener('unhandledrejection',e=>{try{showFatal('Async error: '+((e.reason&&e.reason.message)||e.reason||'unknown'))}catch(_){}});
 async function api(path,opts){const r=await fetch('__QK_API_PREFIX__'+path,opts);if(!r.ok){throw new Error(await r.text()||r.status)}return r.json()}
 function fmt(n,d=2){if(n===null||n===undefined||isNaN(n))return '–';return Number(n).toLocaleString(undefined,{maximumFractionDigits:d})}
 // num: zero-safe number parse — 0 survives, empty/NaN falls back to def
