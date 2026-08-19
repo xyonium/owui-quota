@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.2.2
+version: 0.2.3
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -493,21 +493,62 @@ def qk_user_group_ids(user: dict):
         return []
 
 
+_GROUP_IDS_CACHE = {}  # uid -> (expiry_epoch, [group_ids]); 5-min TTL
+
+
+async def qk_user_group_ids_async(user: dict):
+    """Async group-membership resolver for async handlers.
+
+    OWUI >= 0.10 dropped group_ids from the injected UserModel and made
+    Groups.* async; the sync fallback above then silently returns [] and
+    group quotas never apply there. This resolves through the (possibly
+    async) model and caches briefly, so membership changes take up to
+    5 min to apply.
+    """
+    gids = (user or {}).get("group_ids")
+    if isinstance(gids, list) and gids:
+        return [str(g) for g in gids]
+    uid = (user or {}).get("id")
+    if not uid:
+        return []
+    ent = _GROUP_IDS_CACHE.get(uid)
+    if ent and ent[0] > time.time():
+        return list(ent[1])
+    ids = []
+    try:
+        from open_webui.models.groups import Groups
+
+        res = Groups.get_groups_by_member_id(uid)
+        if asyncio.iscoroutine(res):  # OWUI >= 0.10 async models
+            res = await res
+        ids = [str(g.id) for g in res]
+    except Exception:
+        ids = []
+    if len(_GROUP_IDS_CACHE) > 4096:
+        _GROUP_IDS_CACHE.clear()
+    _GROUP_IDS_CACHE[uid] = (time.time() + 300, ids)
+    return ids
+
+
 def _num(v):
     """True for numbers, but not bools (bool is an int subclass and must not
     be accepted as a quota/multiplier value)."""
     return not isinstance(v, bool) and isinstance(v, (int, float))
 
 
-def qk_resolve_quota(cfg: dict, user: dict):
-    """user quota (if set) wins; otherwise the highest group quota; else default."""
+def qk_resolve_quota(cfg: dict, user: dict, group_ids=None):
+    """user quota (if set) wins; otherwise the highest group quota; else default.
+
+    group_ids: memberships pre-resolved via qk_user_group_ids_async; when
+    None, falls back to the legacy sync qk_user_group_ids path."""
     uq = (cfg.get("user_quotas") or {}).get((user or {}).get("id"))
     if _num(uq) and uq > 0:
         return float(uq), "user"
     gq = cfg.get("group_quotas") or {}
+    gids = group_ids if group_ids is not None else qk_user_group_ids(user or {})
     vals = [
         float(gq[str(g)])
-        for g in qk_user_group_ids(user or {})
+        for g in gids
         if _num(gq.get(str(g))) and gq.get(str(g)) > 0
     ]
     if vals:
@@ -521,7 +562,7 @@ def qk_resolve_quota(cfg: dict, user: dict):
 # ==== stats aggregation (reads the ledger for serving; filter never calls it) ====
 
 
-def qk_stats(from_=None, to=None, user=None, model=None, granularity="day"):
+def qk_stats(from_=None, to=None, user=None, model=None, granularity="day", group_ids_map=None):
     """Aggregate ledger usage into KPI/series/users/models views.
 
     Filters: `from_`/`to` are inclusive "YYYY-MM-DD" day bounds, `user` matches
@@ -557,7 +598,10 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day"):
             "models": set(),
             "unpriced_requests": 0,
         }
-        quota, source = qk_resolve_quota(cfg, {"id": uid})
+        quota, source = qk_resolve_quota(
+            cfg, {"id": uid},
+            None if group_ids_map is None else group_ids_map.get(uid, []),
+        )
         row["quota"], row["quota_source"] = quota, source
         row["multiplier"] = qk_time_multiplier(cfg)
         for day, drec in sorted((u.get("days") or {}).items()):
@@ -726,6 +770,11 @@ async def _users_table():
     try:
         from open_webui.models.users import Users
 
+        res = Users.get_users()
+        if asyncio.iscoroutine(res):  # OWUI >= 0.10: async models
+            res = await res
+        if isinstance(res, dict):  # and paginated: {"users": [...], "total": n}
+            res = res.get("users") or []
         return [
             {
                 "id": u.id,
@@ -733,7 +782,7 @@ async def _users_table():
                 "email": u.email,
                 "role": u.role,
             }
-            for u in Users.get_users()
+            for u in res
         ]
     except Exception as e:
         log.warning("quota-keeper users fetch failed: %s", e)
@@ -744,17 +793,59 @@ async def _groups_table():
     try:
         from open_webui.models.groups import Groups
 
-        return [
+        try:
+            res = Groups.get_groups({})  # current builds require `filter`
+        except TypeError:
+            res = Groups.get_groups()  # older builds take no args
+        if asyncio.iscoroutine(res):
+            res = await res
+        out = [
             {
                 "id": g.id,
                 "name": g.name,
                 "members": list(getattr(g, "user_ids", None) or []),
             }
-            for g in Groups.get_groups()
+            for g in res
         ]
+        # Current GroupResponse dropped user_ids (member_count only): fill
+        # member ids via the bulk query so the users table can tag each
+        # user's groups and the groups table shows real members.
+        if out and all(not g["members"] for g in out):
+            bulk = getattr(Groups, "get_group_user_ids_by_ids", None)
+            if bulk is not None:
+                try:
+                    m = bulk([g["id"] for g in out])
+                    if asyncio.iscoroutine(m):
+                        m = await m
+                    for g in out:
+                        g["members"] = [str(u) for u in (m.get(g["id"]) or [])]
+                except Exception as e:
+                    log.info("quota-keeper group member fill failed: %s", e)
+        return out
     except Exception as e:
         log.warning("quota-keeper groups fetch failed: %s", e)
         return []
+
+
+async def qk_group_ids_map(uids):
+    """uid -> [group_id] via OWUI's bulk membership query; None when the
+    method is absent/fails (callers then use the per-user legacy path)."""
+    try:
+        from open_webui.models.groups import Groups
+
+        bulk = getattr(Groups, "get_groups_by_member_ids", None)
+        if bulk is None:
+            return None
+        res = bulk([str(u) for u in uids])
+        if asyncio.iscoroutine(res):
+            res = await res
+        return {
+            str(uid): [str(g.id) for g in groups]
+            for uid, groups in (res or {}).items()
+        }
+    except Exception as e:
+        log.info("quota-keeper group map fetch failed: %s", e)
+        return None
 
 
 # ==== UI HTML (self-contained, no build step) ====
@@ -1105,7 +1196,13 @@ async function init(){
   }catch(e){toast('Load failed: '+e.message)}
 }
 async function loadAdmin(){
-  [STATE.cfg,STATE.users,STATE.groups,STATE.pricing]=await Promise.all([api('/config'),api('/users'),api('/groups'),api('/pricing')]);
+  // tolerant loader: one failing endpoint (e.g. a gateway rate-limit 403 on
+  // the parallel burst) toasts and degrades just that section instead of
+  // blanking the whole page
+  const get=async p=>{try{return await api(p)}catch(e){toast(p+' failed: '+e.message);return null}};
+  [STATE.cfg,STATE.users,STATE.groups,STATE.pricing]=await Promise.all([get('/config'),get('/users'),get('/groups'),get('/pricing')]);
+  if(!STATE.cfg)throw new Error('config unavailable');
+  STATE.users=STATE.users||[];STATE.groups=STATE.groups||[];STATE.pricing=STATE.pricing||{};
   STATE.tou=JSON.parse(JSON.stringify(STATE.cfg.tou||{}));
   ['secDash','secUsers','secModels','secRecent','secGeneral','secSchedule','secPricing','secGroups','secUserq','secPricingEditor','secTou'].forEach(id=>$(id).hidden=false);
   renderMeta();renderConfig();renderGroups();renderUsersQ();renderTou();initSpanUI();
@@ -1884,16 +1981,19 @@ async def api_recent(request: Request):
 @qk_router.get("/stats", dependencies=[Depends(_require_admin)])
 async def api_stats(request: Request):
     q = request.query_params
+    led_users = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {})
+    gmap = await qk_group_ids_map(led_users.keys())
     return JSONResponse(
         qk_stats(q.get("from"), q.get("to"), q.get("user"), q.get("model"),
-                 q.get("granularity", "day"))
+                 q.get("granularity", "day"), group_ids_map=gmap)
     )
 
 
 @qk_router.get("/me")
 async def api_me(request: Request, user=Depends(_require_user)):
     cfg = qk_get_config()
-    quota, source = qk_resolve_quota(cfg, {"id": user.id})
+    gids = await qk_user_group_ids_async({"id": user.id})
+    quota, source = qk_resolve_quota(cfg, {"id": user.id}, gids)
     mult = qk_time_multiplier(cfg)
     led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}).get(user.id) or {}
     days = led.get("days") or {}

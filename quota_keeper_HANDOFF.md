@@ -233,7 +233,7 @@ v0.2.0 追加验证（tests/ 全量 42 例，2026-08-18）：
 
 按优先级排序（v0.2.0 更新：原 §8.2 已修复，原 §8.4 已修复，编号顺移）：
 
-1. **真实 OWUI 集成未经测试**（最重要）：filter 的 `__user__` 注入形态（`group_ids` 是否存在）、`__metadata__.task` 后台任务标记、stream() 收到的 event 具体形状（字符串 SSE 还是 dict、终止 chunk 是否带 usage——官方文档明说"形状因 connector 而异"）、outlet 在 API 直连时是否被调用。**首先做一轮真机日志验证**（log.warning 已埋好）。
+1. **真实 OWUI 集成部分未经测试**：已验证并修复——挂载顺序（§8.20）、auth 依赖签名（§8.21）、models async 化与 `__user__` 无 `group_ids`（§8.22）。**仍未验证**：`__metadata__.task` 后台任务标记、stream() 收到的 event 具体形状（字符串 SSE 还是 dict、终止 chunk 是否带 usage——官方文档明说"形状因 connector 而异"）、outlet 在 API 直连时是否被调用。
 2. ~~**函数热重载重复注册**~~ — **v0.2.0 已修复**：挂载前 `_mount_guard` 查 `__app__.routes` 是否已含 prefix 再 include_router；页面路由保留 `path` 查重。**v0.2.1 进一步**：改为先按当前 `route_prefix`/`api_prefix` 路径清陈旧路由再 splice 重挂（热更新保存代码即换新手柄，无需重启），`_pricing_task` 改存 `__app__.state`、重挂载时 cancel 旧 task 再建（不再泄漏）。**残余**：改前缀 Valve 后**旧前缀**路由无法按路径找到、仍残留到重启（Valve 描述已注明）。
 3. **usage 可能漏计**：若上游流式响应从不返回 usage 且未开模型 Usage capability → 不记账。`estimate_unreported_tokens` 是粗略兜底（chars/4）。改进方向：主动给请求注入 `stream_options:{include_usage:true}`（参照 open-webui PR #23556 对 Bedrock 的做法）。
 4. ~~**orphan 认领路径窄**~~ — **v0.2.0 已修复**：outlet 有 user 时**无条件**认领同 id orphan（不再依赖 `estimate_unreported_tokens`）；无 user 的 stream 事件只占 orphan 槽不占 `_seen` 槽。**残余**：真实环境若 API 直连根本不进 filter 的 outlet，认领逻辑无效（预期内：直连计量主要靠 stream 的 usage + `__user__` 注入）。
@@ -260,6 +260,7 @@ v0.2.1 修复记录（真实实例首验发现）：
 
 20. ~~**SPA 兜底遮蔽插件路由（/quota 与全部 API 变 404）**~~ — **v0.2.1 已修复**。根因：OWUI 在 **import 时**就把 `SPAStaticFiles`（404 时回退 index.html）mount 到 `/`（`name="spa-static-files"`），v0.2.0 的 `_mount_guard` 在 `system.startup.completed` 事件里用 `include_router` **追加**路由，排在兜底之后永不命中——`GET /quota` 返回 SPA 外壳（HTTP 200，前端路由显示 404），API 返回 HTML，POST 返回 405。prune 插件之所以正常，是它的 `mount_routes` 在 `include_router` 后把新增路由 **splice 到 `spa-static-files` mount 之前**（其注释原话："routes appended during the startup event land after it and get shadowed"）。v0.2.1 采用同一方案，并把页面路由也并入同一个临时 router 一起 splice（顺带 `include_in_schema=False`，不再污染 /openapi.json）。同时补了 prune 的 **late-init 兜底**：任何事件到来时若本实例未挂载则挂载——热更新代码后下一个事件即完成清陈旧 + 重挂载，无需重启。诊断要点：HTTP 200 + HTML ≠ 路由活着，curl 看 body 或发 POST 看是否 405；`tests/test_endpoints.py` 末尾两个用例钉死该回归。
 21. ~~**OWUI auth 签名漂移导致全端点 401**~~ — **v0.2.2 已修复**。`_require_user` 原来 `await get_verified_user(request)`；但 `get_verified_user` 是**依赖式**函数 `get_verified_user(user=Depends(get_current_user))`，收的是 user——把 request 传进去在 `user.role` 处 AttributeError，被兜底成 401，页面与 API 全灭（真机症状：日志正常、路由命中、全部 401）。v0.2.2 改为手动驱动真实链路：`bearer_security(request)` 取 token（`HTTPBearer(auto_error=False)`）→ `get_current_user(request, response, background_tasks, auth_token)`（按 TypeError 逐级减参兼容旧签名）→ `get_verified_user(user)`（sync/async 都兼容）；`_require_user/_require_admin` 声明 `response`/`background_tasks` 参数由 FastAPI 注入真对象，cookie 刷新不丢。教训：**OWUI 的 auth 工具是 FastAPI 依赖不是普通函数，接入前先读签名**；测试桩已改成真实依赖式签名（并断言 `get_verified_user` 收到的是 user），另增未认证 401 用例。
+22. ~~**OWUI models 全 async 化：users/groups 表为空 + 组配额静默失效**~~ — **v0.2.3 已修复**。三处漂移：(a) `Users.get_users()` 变 async 且返回分页 dict（`{"users": [...], "total": n}`）；(b) `Groups.get_groups()` 变 async 且 `filter` 必填，`GroupResponse` 去掉 `user_ids` 只剩 `member_count`（成员 id 用 `get_group_user_ids_by_ids` 批量回填）；(c) 注入 filter 的 `__user__`（`UserModel.model_dump()`）**不含 group_ids**，而 `Groups.get_groups_by_member_id` 也变 async——`qk_user_group_ids` 的同步兜底在新版上 100% 走异常返回 []，**组配额静默不生效**（filter inlet、`/me`、`/stats` 三处全受影响）。v0.2.3：新增共享的 `qk_user_group_ids_async`（await 协程 + 5 分钟 TTL 缓存，双文件已同步），`qk_resolve_quota` 加可选 `group_ids` 参数；filter inlet 与 `/me` 先解析再传入；`/stats` 用 `get_groups_by_member_ids` 批量构建 uid→groups 映射传入 `qk_stats`。页面侧：init 的 4 路 `Promise.all` 全有或全无改为逐 endpoint 容错（一个失败只 toast 不空白整页）——该实例前置网关对突发请求限流返回 9 字节纯文本 `403 Forbidden`（实测突发约半数被拦），属用户侧网关配置，已在 README 排障表说明。教训：OWUI main 的 models 层正在全面 async + 分页化，**接内部 API 必须 await 并防签名/返回形状漂移**。
 
 ## 9. 后续开发路线（按用户早前需求延伸）
 
@@ -272,7 +273,7 @@ v0.2.1 修复记录（真实实例首验发现）：
 ## 10. 快速上手（给 coding agent）
 
 1. 环境要求：Open WebUI ≥ 0.10.0（Event primitive + `__app__` 注入；Filter 部分兼容 0.6+）。
-2. 复现测试：仓库 `tests/` 的 53 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
+2. 复现测试：仓库 `tests/` 的 58 个用例可无 OWUI 依赖跑（`python3 -m pytest tests/ -v`；conftest 先导 fastapi 再用 pydantic stub 加载双模块）。§5.2 的 7 个匹配用例与 §5.7 TOU 用例都在其中；SPA 遮蔽/热更新重挂载回归用例在 `test_endpoints.py` 末尾。
 3. 修改共享算法（§5.1/5.2/5.3/5.4/5.5/5.6/5.7 中标注"两文件各一份"的）必须同步双文件，diff 检查。
 4. 数据目录：`$DATA_DIR/quota_keeper/`；调试时直接 cat 四个 JSON（config/ledger/pricing_cache/recent）。
 5. 日志：全部 `log.warning/log.info`，前缀 `quota-keeper`，`docker logs` 可过滤。

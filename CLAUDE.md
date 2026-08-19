@@ -34,7 +34,8 @@ Shared helpers (data dir, file locking, JSON cache, config schema, pricing fetch
 
 ## Known sharp edges (see HANDOFF §8 for full list)
 
-- Route mounting is verified on a real instance (main-slim build); the Filter's runtime shapes (`__user__`/`__metadata__`, stream event formats) are still unverified live and vary by connector.
+- Route mounting and auth chain are verified on a real instance (main-slim build); the Filter's remaining runtime shapes (`__metadata__.task`, stream event formats) are still unverified live and vary by connector.
+- OWUI ≥ 0.10 dropped `group_ids` from the injected `__user__` and made `open_webui.models.*` async — group resolution goes through `qk_user_group_ids_async` (5-min TTL cache); keep the sync `qk_user_group_ids` only as the legacy fallback.
 - Routes under a *changed* `route_prefix`/`api_prefix` valve linger until restart (stale cleanup can only find current-prefix paths) — valve descriptions say so (HANDOFF §8.15).
 - TOU topups are additive — a cumulative-style usage reporter would double-count tokens/cost (HANDOFF §8.13).
 - Only cost/credits KPI cards carry sparklines (4 of 6 do not); `/me` `tou.current_tier` is a reserved null field (HANDOFF §8.16/17).

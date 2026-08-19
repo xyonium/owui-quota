@@ -443,3 +443,118 @@ def test_unauthenticated_requests_401(load_admin, monkeypatch):
     assert c.get("/api/v1/quota-keeper/me").status_code == 401
     assert c.get("/api/v1/quota-keeper/me").json()["detail"] == "Invalid token"
     assert c.get("/api/v1/quota-keeper/config").status_code == 401
+
+
+# ---- OWUI async-models drift (v0.2.3 root-cause fixes) -----------------------
+
+
+def _stub_webui_models(monkeypatch, *, users=None, groups=None, memberships=None):
+    """Stub open_webui.models.{users,groups} with the CURRENT async shapes:
+    Users.get_users() -> coroutine of {"users": [...], "total": n};
+    Groups.get_groups(filter) -> coroutine of responses WITHOUT user_ids;
+    Groups.get_group_user_ids_by_ids(ids) -> coroutine of {gid: [uid]}.
+    """
+    models = types.ModuleType("open_webui.models")
+    musers = types.ModuleType("open_webui.models.users")
+    mgroups = types.ModuleType("open_webui.models.groups")
+
+    if users is not None:
+        class Users:
+            @staticmethod
+            async def get_users(*a, **kw):
+                return {"users": users, "total": len(users)}
+        musers.Users = Users
+
+    if groups is not None:
+        class Groups:
+            @staticmethod
+            async def get_groups(filter, **kw):  # filter is REQUIRED
+                return groups
+
+            @staticmethod
+            async def get_group_user_ids_by_ids(ids, **kw):
+                return {g: list((memberships or {}).get(g, [])) for g in ids}
+
+            @staticmethod
+            async def get_groups_by_member_id(uid, **kw):
+                return [g for g in groups if uid in (memberships or {}).get(g.id, [])]
+        mgroups.Groups = Groups
+
+    ow = types.ModuleType("open_webui")
+    ow.models = models
+    models.users = musers
+    models.groups = mgroups
+    monkeypatch.setitem(sys.modules, "open_webui", ow)
+    monkeypatch.setitem(sys.modules, "open_webui.models", models)
+    monkeypatch.setitem(sys.modules, "open_webui.models.users", musers)
+    monkeypatch.setitem(sys.modules, "open_webui.models.groups", mgroups)
+
+
+def test_users_table_async_paginated_shape(load_admin, monkeypatch):
+    # Current OWUI: get_users is async and returns a paginated dict, not a
+    # list (v0.2.2 iterated the coroutine -> warning + empty table).
+    _stub_webui_models(monkeypatch, users=[
+        types.SimpleNamespace(id="u1", name="A", email="a@x", role="user")
+    ])
+    adm = load_admin()
+    rows = asyncio.run(adm._users_table())
+    assert rows == [{"id": "u1", "name": "A", "email": "a@x", "role": "user"}]
+
+
+def test_groups_table_async_bulk_member_fill(load_admin, monkeypatch):
+    # Current GroupResponse has member_count but no user_ids; member ids come
+    # from the bulk get_group_user_ids_by_ids query.
+    g1 = types.SimpleNamespace(id="g1", name="Team", member_count=2)
+    _stub_webui_models(monkeypatch, groups=[g1], memberships={"g1": ["u1", "u2"]})
+    adm = load_admin()
+    rows = asyncio.run(adm._groups_table())
+    assert rows == [{"id": "g1", "name": "Team", "members": ["u1", "u2"]}]
+
+
+def test_group_ids_async_resolves_and_caches(qk, monkeypatch):
+    calls = []
+    g1 = types.SimpleNamespace(id="g1", name="Team")
+
+    models = types.ModuleType("open_webui.models")
+    mgroups = types.ModuleType("open_webui.models.groups")
+
+    class Groups:
+        @staticmethod
+        async def get_groups_by_member_id(uid, **kw):
+            calls.append(uid)
+            return [g1] if uid == "u1" else []
+    mgroups.Groups = Groups
+    ow = types.ModuleType("open_webui")
+    ow.models = models
+    models.groups = mgroups
+    monkeypatch.setitem(sys.modules, "open_webui", ow)
+    monkeypatch.setitem(sys.modules, "open_webui.models", models)
+    monkeypatch.setitem(sys.modules, "open_webui.models.groups", mgroups)
+
+    qk._GROUP_IDS_CACHE.clear()
+    ids1 = asyncio.run(qk.qk_user_group_ids_async({"id": "u1"}))
+    ids2 = asyncio.run(qk.qk_user_group_ids_async({"id": "u1"}))
+    assert ids1 == ["g1"] and ids2 == ["g1"]
+    assert len(calls) == 1  # second resolution served from the 5-min cache
+
+
+def test_resolve_quota_with_preresolved_group_ids(qk):
+    cfg = {"group_quotas": {"g1": 500, "g2": 900},
+           "user_quotas": {}, "default_quota_credits": 100}
+    assert qk.qk_resolve_quota(cfg, {"id": "u1"}, ["g1", "g2"]) == (900.0, "group")
+    assert qk.qk_resolve_quota(cfg, {"id": "u1"}, []) == (100.0, "default")
+    # group_ids=None keeps the legacy sync path (no OWUI here -> no groups)
+    assert qk.qk_resolve_quota(cfg, {"id": "u1"}, None) == (100.0, "default")
+
+
+def test_stats_quota_uses_group_ids_map(load_admin):
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    adm = load_admin()
+    write_json(Path(adm.QK_CONFIG_PATH), {"group_quotas": {"g1": 777}})
+    write_json(Path(adm.QK_LEDGER_PATH),
+               {"users": {"u1": {"name": "A", "email": "a@x", "days": {}}}})
+    out = adm.qk_stats(group_ids_map={"u1": ["g1"]})
+    row = next(r for r in out["users"] if r["user_id"] == "u1")
+    assert row["quota"] == 777.0 and row["quota_source"] == "group"

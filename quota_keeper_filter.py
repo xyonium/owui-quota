@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.2.0
+version: 0.2.3
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -10,6 +10,7 @@ import os
 import re
 import json
 import time
+import asyncio
 import logging
 import threading
 from contextlib import contextmanager
@@ -619,21 +620,62 @@ def qk_user_group_ids(user: dict):
         return []
 
 
+_GROUP_IDS_CACHE = {}  # uid -> (expiry_epoch, [group_ids]); 5-min TTL
+
+
+async def qk_user_group_ids_async(user: dict):
+    """Async group-membership resolver for async handlers.
+
+    OWUI >= 0.10 dropped group_ids from the injected UserModel and made
+    Groups.* async; the sync fallback above then silently returns [] and
+    group quotas never apply there. This resolves through the (possibly
+    async) model and caches briefly, so membership changes take up to
+    5 min to apply.
+    """
+    gids = (user or {}).get("group_ids")
+    if isinstance(gids, list) and gids:
+        return [str(g) for g in gids]
+    uid = (user or {}).get("id")
+    if not uid:
+        return []
+    ent = _GROUP_IDS_CACHE.get(uid)
+    if ent and ent[0] > time.time():
+        return list(ent[1])
+    ids = []
+    try:
+        from open_webui.models.groups import Groups
+
+        res = Groups.get_groups_by_member_id(uid)
+        if asyncio.iscoroutine(res):  # OWUI >= 0.10 async models
+            res = await res
+        ids = [str(g.id) for g in res]
+    except Exception:
+        ids = []
+    if len(_GROUP_IDS_CACHE) > 4096:
+        _GROUP_IDS_CACHE.clear()
+    _GROUP_IDS_CACHE[uid] = (time.time() + 300, ids)
+    return ids
+
+
 def _num(v):
     """True for numbers, but not bools (bool is an int subclass and must not
     be accepted as a quota/multiplier value)."""
     return not isinstance(v, bool) and isinstance(v, (int, float))
 
 
-def qk_resolve_quota(cfg: dict, user: dict):
-    """user quota (if set) wins; otherwise the highest group quota; else default."""
+def qk_resolve_quota(cfg: dict, user: dict, group_ids=None):
+    """user quota (if set) wins; otherwise the highest group quota; else default.
+
+    group_ids: memberships pre-resolved via qk_user_group_ids_async; when
+    None, falls back to the legacy sync qk_user_group_ids path."""
     uq = (cfg.get("user_quotas") or {}).get((user or {}).get("id"))
     if _num(uq) and uq > 0:
         return float(uq), "user"
     gq = cfg.get("group_quotas") or {}
+    gids = group_ids if group_ids is not None else qk_user_group_ids(user or {})
     vals = [
         float(gq[str(g)])
-        for g in qk_user_group_ids(user or {})
+        for g in gids
         if _num(gq.get(str(g))) and gq.get(str(g)) > 0
     ]
     if vals:
@@ -749,7 +791,8 @@ class Filter:
             if (__metadata__ or {}).get("task") and self.valves.allow_background_tasks:
                 return body
             cfg = qk_get_config()
-            quota, source = qk_resolve_quota(cfg, user)
+            gids = await qk_user_group_ids_async(user)
+            quota, source = qk_resolve_quota(cfg, user, gids)
             if quota is None:
                 return body  # unlimited
             mult = qk_time_multiplier(cfg)
