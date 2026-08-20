@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.4.6
+version: 0.4.7
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -960,7 +960,13 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
     - the unpriced share is assumed to hold the same token mix as the bucket
       average.
 
-    Returns a report dict; dry_run=True computes without writing.
+    recent.json is repriced in the same pass, under the same lock and the
+    same price table, so the Recent feed always agrees with the Models/ledger
+    numbers; each recent entry is an independent per-request record (own
+    ts/tokens), so that side is exact (no share scaling needed).
+
+    Returns a report dict (ledger + recent counts); dry_run=True computes
+    without writing.
     """
     cfg = qk_get_config()
     cache = qk_load_json(QK_PRICING_PATH, {}) or {}
@@ -1057,8 +1063,58 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
                     drec["cost_usd"] = round(float(drec.get("cost_usd") or 0.0) + day_delta, 8)
                     drec["cost_saved_usd"] = round(
                         float(drec.get("cost_saved_usd") or 0.0) + day_saved, 8)
+        # recent.json: each entry is an independent per-request record (own
+        # ts/tokens/priced), so repricing is exact -- no aggregation, no mixed
+        # buckets. Done under the SAME lock and the SAME price table as the
+        # ledger so the Recent feed and the Models/Ledger numbers can never
+        # disagree. Only entries inside the window (ts >= cutoff day start)
+        # whose model now has a price are touched.
+        rec_items_repriced = 0
+        rec_cost_added = 0.0
+        try:
+            cutoff_ts = datetime.strptime(cutoff, "%Y-%m-%d").replace(
+                tzinfo=now.tzinfo).timestamp()
+        except Exception:
+            cutoff_ts = 0.0
+        rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+        ritems = rec.get("items") or []
+        for it in ritems:
+            it = it if isinstance(it, dict) else {}
+            if it.get("priced", True):
+                continue  # already priced (or pre-channel entries): skip
+            try:
+                ts = float(it.get("ts") or 0)
+            except Exception:
+                continue
+            if ts < cutoff_ts:
+                continue
+            m = str(it.get("model") or "")
+            if model and m != model:
+                continue
+            price, _how = qk_find_pricing(m, table, pconf.get("overrides"))
+            if price is None:
+                price = pconf.get("default_pricing")
+            if price is None:
+                continue  # still no price: leave the entry alone
+            tok = it.get("tokens") or {}
+            base = qk_cost_usd(tok, price)
+            if base <= 0:
+                it["priced"] = True
+                continue
+            rate, _tier = qk_tou_rate(cfg, m, now)
+            new_cost = base * rate
+            delta = new_cost - float(it.get("cost_usd") or 0.0)
+            if not dry_run:
+                it["cost_usd"] = round(new_cost, 8)
+                it["priced"] = True
+            rec_items_repriced += 1
+            rec_cost_added = round(rec_cost_added + delta, 8)
         if not dry_run:
             qk_atomic_write(QK_LEDGER_PATH, led)
+            if rec_items_repriced:
+                qk_atomic_write(QK_RECENT_PATH, rec)
+    report["recent_items_repriced"] = rec_items_repriced
+    report["recent_cost_added_usd"] = rec_cost_added
     return report
 
 
@@ -1899,16 +1955,18 @@ async function reprice(model){
   const days=Math.max(1,parseInt($('repriceDays').value)||30);
   const out=$('repriceOut');
   const scope=model?('model '+model):('ALL unpriced models');
-  if(!confirm(`Reprice ${scope} for the last ${days} days at the CURRENT price?\n\nThis rewrites ledger cost_usd for buckets recorded while the model had no price and clears the unpriced tag. TOU is applied at the current rate (exact when TOU is off).`))return;
+  if(!confirm(`Reprice ${scope} for the last ${days} days at the CURRENT price?\n\nThis rewrites ledger cost_usd AND recent-activity entries recorded while the model had no price, and clears the unpriced tag in both. TOU is applied at the current rate (exact when TOU is off).`))return;
   out.textContent=' repricing…';
   try{
     const qs='days='+days+(model?'&model='+encodeURIComponent(model):'');
     const r=await api('/pricing/reprice?'+qs,{method:'POST'});
     if(r.error){out.textContent=' error: '+r.error;return}
     const per=Object.entries(r.models||{}).map(([m,v])=>`${m}: +$${fmt(v.cost_added_usd,4)} (${v.buckets}d)`).join(', ');
-    out.textContent=` +$${fmt(r.cost_added_usd,4)} across ${r.buckets_repriced} buckets`+(per?' · '+per:'');
+    const rec=r.recent_items_repriced?` · recent: ${r.recent_items_repriced} entries +$${fmt(r.recent_cost_added_usd,4)}`:'';
+    out.textContent=` +$${fmt(r.cost_added_usd,4)} across ${r.buckets_repriced} buckets`+(per?' · '+per:'')+rec;
     toast('Reprice done: +$'+fmt(r.cost_added_usd,4));
     await loadStats();  // refresh tables so the unpriced tag disappears
+    if(STATE.recent)await loadRecent();  // re-fetch the feed: reprice rewrote recent.json server-side
   }catch(e){out.textContent=' failed: '+e.message;toast('Reprice failed: '+e.message)}
 }
 

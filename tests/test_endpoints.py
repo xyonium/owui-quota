@@ -782,3 +782,45 @@ def test_reprice_dry_run_writes_nothing(load_admin, monkeypatch):
     led = json.load(open(adm.QK_LEDGER_PATH))
     mm = led["users"]["u1"]["days"]["2026-08-19"]["models"]["glm-5.3"]
     assert mm["cost_usd"] == 0.0 and mm["unpriced_requests"] == 2  # unchanged
+
+
+def test_reprice_also_backfills_recent(load_admin, monkeypatch):
+    """reprice rewrites recent.json unpriced entries in the SAME pass, at the
+    SAME price, so the Recent feed agrees with the Models/ledger numbers."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    for fn in ("qk_tou_local_now", "qk_local_now"):
+        monkeypatch.setattr(adm, fn, lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    write_json(Path(adm.QK_LEDGER_PATH), _unpriced_ledger("2026-08-19"))
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {"glm-5.3": {"input": 1.0, "output": 2.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH), {"tou": {"enabled": False}})
+
+    inside = _dt(2026, 8, 19, 10, 0, tzinfo=CST).timestamp()   # within 30d window
+    outside = _dt(2026, 6, 1, 10, 0, tzinfo=CST).timestamp()   # before cutoff
+    write_json(Path(adm.QK_RECENT_PATH), {"items": [
+        {"ts": inside, "user_id": "u1", "name": "A", "email": "a@x", "model": "glm-5.3",
+         "tokens": {"cached": 0.0, "input": 100000.0, "output": 5000.0},
+         "cost_usd": 0.0, "tou_tier": "normal", "priced": False, "channel": "webui"},
+        {"ts": inside, "user_id": "u1", "name": "A", "email": "a@x", "model": "glm-5.3",
+         "tokens": {"cached": 0.0, "input": 50000.0, "output": 1000.0},
+         "cost_usd": 0.052, "tou_tier": "normal", "priced": True, "channel": "webui"},
+        {"ts": outside, "user_id": "u1", "name": "A", "email": "a@x", "model": "glm-5.3",
+         "tokens": {"cached": 0.0, "input": 9000.0, "output": 1000.0},
+         "cost_usd": 0.0, "tou_tier": "normal", "priced": False, "channel": "api"},
+    ]})
+
+    rep = adm.qk_reprice_ledger(days=30)
+    items = json.load(open(adm.QK_RECENT_PATH))["items"]
+    # entry 0: unpriced, in-window -> repriced to $0.11, priced flag set
+    assert abs(items[0]["cost_usd"] - 0.11) < 1e-6 and items[0]["priced"] is True
+    # entry 1: already priced -> untouched
+    assert abs(items[1]["cost_usd"] - 0.052) < 1e-9 and items[1]["priced"] is True
+    # entry 2: unpriced but OUTSIDE the window -> untouched
+    assert items[2]["cost_usd"] == 0.0 and items[2]["priced"] is False
+    assert rep["recent_items_repriced"] == 1
+    assert abs(rep["recent_cost_added_usd"] - 0.11) < 1e-6
