@@ -416,6 +416,28 @@ def test_auth_chain_uses_dependency_style_signatures(load_admin, monkeypatch):
     assert r.json()["user"]["id"] == "u1"
 
 
+def test_page_is_login_gated_not_admin_gated(load_admin, monkeypatch):
+    """Role split: a non-admin must REACH the /quota page (it renders the
+    personal card from /me), while every admin API stays 403 for them.
+
+    Regression: the page used to hang Depends(_require_admin), so non-admins
+    got 403 on the HTML itself and the personal-card code never ran."""
+    _stub_self_user(monkeypatch, uid="u1", role="user")
+    adm = load_admin()
+    client = TestClient(_spa_shell_app())
+    _mount_via_event(adm, client.app)
+
+    page = client.get("/quota")
+    assert page.status_code == 200, "non-admin must be able to load the page"
+    assert "renderPersonal" in page.text  # the role-split branch ships in the SPA
+    assert client.get("/api/v1/quota-keeper/me").status_code == 200
+    # ...but the admin surface stays closed to them
+    for path in ("/config", "/users", "/groups", "/ledger", "/pricing",
+                 "/recent", "/stats", "/models"):
+        r = client.get(f"/api/v1/quota-keeper{path}")
+        assert r.status_code == 403, f"{path} must stay admin-only (got {r.status_code})"
+
+
 def test_unauthenticated_requests_401(load_admin, monkeypatch):
     """get_current_user raising HTTPException(401) (no/invalid token) must
     surface as 401 -- not be masked into a different error."""

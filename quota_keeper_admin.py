@@ -2206,8 +2206,11 @@ def _mount_guard(app, page_path: str, api_prefix: str) -> int:
 
     router = APIRouter()
 
+    # Page is login-gated, not admin-gated: any signed-in user may load it.
+    # The SPA then calls /me and renders the admin console or the personal
+    # card by role; every admin API still enforces _require_admin per route.
     @router.get(
-        page_path, include_in_schema=False, dependencies=[Depends(_require_admin)]
+        page_path, include_in_schema=False, dependencies=[Depends(_require_user)]
     )
     async def _qk_page(request: Request):
         # no-store: a cached page keeps the OLD JS after a plugin update
