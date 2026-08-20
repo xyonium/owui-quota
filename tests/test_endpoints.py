@@ -668,3 +668,117 @@ def test_stats_window_partial_flag(load_admin, monkeypatch):
          "model": "m/x", "tokens": {}, "cost_usd": 0.0, "channel": "api"}
     ]})
     assert adm.qk_stats_window(500_000.0)["kpi"]["window_partial"] is False
+
+
+# ---- reprice (backfill unpriced ledger days, v0.4.6) -------------------------
+
+
+def _unpriced_ledger(day, model="glm-5.3", cost=0.0, unpriced=2, inp=100000.0, out=5000.0):
+    toks = {"cached": 0.0, "input": inp, "output": out}
+    tou = {"peak": 0, "offpeak": 0, "normal": 2}
+    mm = {"requests": 2, "cost_usd": cost, "tokens": dict(toks),
+          "priced": False, "unpriced_requests": unpriced,
+          "tou": dict(tou), "cost_saved_usd": 0.0}
+    d = {"requests": 2, "cost_usd": cost, "tokens": dict(toks),
+         "tou": dict(tou), "cost_saved_usd": 0.0, "models": {model: mm}}
+    return {"users": {"u1": {"name": "A", "email": "a@x", "days": {day: d}}}}
+
+
+def test_reprice_backfills_and_clears_tag(load_admin, monkeypatch):
+    """The user's glm-5.3 case: recorded while unpriced (cost 0, tag set), a
+    price is configured later -> reprice backfills cost and clears the tag."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    monkeypatch.setattr(adm, "qk_tou_local_now",
+                        lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    monkeypatch.setattr(adm, "qk_local_now",
+                        lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    write_json(Path(adm.QK_LEDGER_PATH), _unpriced_ledger("2026-08-19"))
+    # price configured AFTER the fact: $1/M input, $2/M output (per-1M table)
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {
+        "glm-5.3": {"input": 1.0, "output": 2.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH), {"tou": {"enabled": False}})
+
+    # bucket tokens are the AGGREGATE of both requests: 100k in + 5k out.
+    # full re-cost = 100000*$1/1M + 5000*$2/1M = $0.11; both requests unpriced
+    # (share 2/2 = 1) -> the whole $0.11 is backfilled.
+    rep = adm.qk_reprice_ledger(days=30)
+    assert rep["buckets_repriced"] == 1
+    assert abs(rep["cost_added_usd"] - 0.11) < 1e-6
+
+    import json
+    led = json.load(open(adm.QK_LEDGER_PATH))
+    mm = led["users"]["u1"]["days"]["2026-08-19"]["models"]["glm-5.3"]
+    assert abs(mm["cost_usd"] - 0.11) < 1e-6
+    assert mm["unpriced_requests"] == 0 and mm["priced"] is True
+    d = led["users"]["u1"]["days"]["2026-08-19"]
+    assert abs(d["cost_usd"] - 0.11) < 1e-6  # day total backfilled too
+
+    # idempotent: a second run finds no unpriced buckets
+    rep2 = adm.qk_reprice_ledger(days=30)
+    assert rep2["buckets_repriced"] == 0
+
+
+def test_reprice_mixed_and_still_unpriced(load_admin, monkeypatch):
+    """Mixed buckets are topped up by exactly their unpriced share (not the
+    full re-cost); a model with STILL no price keeps its tag."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    for fn in ("qk_tou_local_now", "qk_local_now"):
+        monkeypatch.setattr(adm, fn, lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    led = _unpriced_ledger("2026-08-19", model="glm-5.3")  # fully unpriced
+    models = led["users"]["u1"]["days"]["2026-08-19"]["models"]
+    # glm-5.3 case: 2 requests, 1 already priced ($0.11 stored), 1 unpriced.
+    # bucket tokens are the 2-request aggregate (100k in/5k out) -> full
+    # re-cost $0.11; unpriced share 1/2 -> backfill $0.055 -> total $0.165.
+    models["m/half"] = _unpriced_ledger("2026-08-19", model="m/half", cost=0.11, unpriced=1)["users"]["u1"]["days"]["2026-08-19"]["models"]["m/half"]
+    # still-unpriced model (no price anywhere) -> untouched
+    models["m/noprice"] = _unpriced_ledger("2026-08-19", model="m/noprice")["users"]["u1"]["days"]["2026-08-19"]["models"]["m/noprice"]
+    write_json(Path(adm.QK_LEDGER_PATH), led)
+    price = {"input": 1.0, "output": 2.0}
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {
+        "glm-5.3": price, "m/half": price}})
+    write_json(Path(adm.QK_CONFIG_PATH), {"tou": {"enabled": False}})
+
+    rep = adm.qk_reprice_ledger(days=30)
+    assert rep["buckets_repriced"] == 2  # glm-5.3 (full) + m/half (share)
+    out = json.load(open(adm.QK_LEDGER_PATH))
+    models = out["users"]["u1"]["days"]["2026-08-19"]["models"]
+    # glm-5.3 fully unpriced: 0 + full share (2/2) of $0.11 = $0.11
+    assert abs(models["glm-5.3"]["cost_usd"] - 0.11) < 1e-6
+    assert models["glm-5.3"]["unpriced_requests"] == 0
+    # m/half: $0.11 stored + half share (1/2) of $0.11 = $0.055 -> $0.165 total
+    assert abs(models["m/half"]["cost_usd"] - 0.165) < 1e-6
+    assert models["m/half"]["unpriced_requests"] == 0        # tag cleared
+    assert models["m/noprice"]["unpriced_requests"] == 2     # tag kept (no price)
+    assert models["m/noprice"]["cost_usd"] == 0.0
+
+
+def test_reprice_dry_run_writes_nothing(load_admin, monkeypatch):
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    for fn in ("qk_tou_local_now", "qk_local_now"):
+        monkeypatch.setattr(adm, fn, lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    write_json(Path(adm.QK_LEDGER_PATH), _unpriced_ledger("2026-08-19"))
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {"glm-5.3": {"input": 1.0, "output": 2.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH), {"tou": {"enabled": False}})
+
+    rep = adm.qk_reprice_ledger(days=30, dry_run=True)
+    assert rep["buckets_repriced"] == 1 and abs(rep["cost_added_usd"] - 0.11) < 1e-6
+    led = json.load(open(adm.QK_LEDGER_PATH))
+    mm = led["users"]["u1"]["days"]["2026-08-19"]["models"]["glm-5.3"]
+    assert mm["cost_usd"] == 0.0 and mm["unpriced_requests"] == 2  # unchanged

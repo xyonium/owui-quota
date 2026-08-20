@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.4.5
+version: 0.4.6
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -663,6 +663,19 @@ def qk_resolve_quota(cfg: dict, user: dict, group_ids=None):
     return None, "none"
 
 
+def qk_cost_usd(tok: dict, price) -> float:
+    # verbatim copy of the filter's cost model -- reprice must reproduce the
+    # exact same numbers the filter would have written with this price
+    if not price:
+        return 0.0
+    c = 0.0
+    for field in ("input", "cached", "cache_write", "output"):
+        p = price.get(field)
+        if isinstance(p, (int, float)):
+            c += (tok.get(field) or 0.0) * float(p) / 1e6
+    return c
+
+
 # ==== stats aggregation (reads the ledger for serving; filter never calls it) ====
 
 
@@ -923,6 +936,130 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
         "users": list(urows.values()),
         "models": sorted(mrows.values(), key=lambda x: -x["cost_usd"]),
     }
+
+
+def qk_reprice_ledger(days=30, model=None, dry_run=False):
+    """Reprice ledger buckets that were recorded while a model had no price.
+
+    For each (user, day, model) bucket with unpriced_requests > 0 whose model
+    NOW resolves to a price (same override/match chain as the filter, then
+    default_pricing), backfill ONLY the unpriced share of the cost: the full
+    re-cost (qk_cost_usd on the bucket's tokens) is scaled by
+    unpriced_requests/requests and added to the stored cost. unpriced_requests
+    is zeroed, which also clears the UI "unpriced" tag.
+
+    Why the share scaling: any priced request already contributes to the
+    stored cost, so a cost-proportion skip guard would suppress every mixed
+    bucket (e.g. glm-5.3 with one priced + one unpriced request) and the tag
+    would never clear. Scaling by the unpriced request share tops a mixed
+    bucket up by exactly its missing share instead of double-counting.
+
+    Approximations (the ledger is day×model aggregates, not per-request):
+    - TOU: charged at the CURRENT policy rate for "now" (exact when TOU is
+      disabled, rate 1.0); historical tier mix is not reconstructable.
+    - the unpriced share is assumed to hold the same token mix as the bucket
+      average.
+
+    Returns a report dict; dry_run=True computes without writing.
+    """
+    cfg = qk_get_config()
+    cache = qk_load_json(QK_PRICING_PATH, {}) or {}
+    table = cache.get("table") or {}
+    pconf = cfg.get("pricing") or {}
+    try:
+        days = int(days)
+    except Exception:
+        days = 30
+    days = max(1, min(days, 3650))
+    now = qk_tou_local_now(cfg)
+    cutoff = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    # current TOU rate per model is time-dependent; repricing historical days
+    # at "now" rate is the documented approximation (exact when TOU disabled)
+    report = {"days_scanned": days, "cutoff": cutoff, "models": {},
+              "cost_added_usd": 0.0, "buckets_repriced": 0, "dry_run": dry_run}
+    with qk_lock():
+        led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
+        users = led.get("users") or {}
+        for uid, u in users.items():
+            udays = (u or {}).get("days") or {}
+            for day, drec in udays.items():
+                if day < cutoff:
+                    continue
+                drec = drec or {}
+                models = drec.get("models") or {}
+                day_delta = 0.0
+                day_saved = 0.0
+                for m, mm in list(models.items()):
+                    if model and m != model:
+                        continue
+                    mm = mm or {}
+                    un = mm.get("unpriced_requests") or 0
+                    if un <= 0:
+                        continue
+                    tok = mm.get("tokens") or {}
+                    tot_tok = sum(float(tok.get(k) or 0.0) for k in ("cached", "input", "output"))
+                    if tot_tok <= 0:
+                        # nothing to reprice; just clear the stale flag
+                        if not dry_run:
+                            mm["unpriced_requests"] = 0
+                            mm["priced"] = True
+                        continue
+                    price, _how = qk_find_pricing(m, table, pconf.get("overrides"))
+                    if price is None:
+                        price = pconf.get("default_pricing")
+                    if price is None:
+                        continue  # still no price: leave the flag alone
+                    new_base = qk_cost_usd(tok, price)
+                    if new_base <= 0:
+                        if not dry_run:
+                            mm["unpriced_requests"] = 0
+                            mm["priced"] = True
+                        continue
+                    stored = float(mm.get("cost_usd") or 0.0)
+                    # Only the UNPRICED share is backfilled: scale the full
+                    # re-cost by unpriced_requests/requests so a mixed bucket
+                    # (some requests already priced, e.g. glm-5.3 with one of
+                    # each) is topped up by exactly its missing share, not
+                    # double-counted to the full amount. A cost-proportion
+                    # guard can't work here -- any priced request makes the
+                    # stored cost a large fraction of the full re-cost.
+                    reqs = mm.get("requests") or 0
+                    share = (un / reqs) if reqs > 0 else 1.0
+                    share = max(0.0, min(1.0, share))
+                    rate, _tier = qk_tou_rate(cfg, m, now)
+                    add_cost = new_base * share * rate
+                    if add_cost <= 0:
+                        if not dry_run:
+                            mm["unpriced_requests"] = 0
+                            mm["priced"] = True
+                        continue
+                    new_cost = stored + add_cost
+                    delta = add_cost
+                    mrep = report["models"].setdefault(
+                        m, {"buckets": 0, "cost_added_usd": 0.0})
+                    mrep["buckets"] += 1
+                    mrep["cost_added_usd"] = round(mrep["cost_added_usd"] + delta, 8)
+                    report["cost_added_usd"] = round(report["cost_added_usd"] + delta, 8)
+                    report["buckets_repriced"] += 1
+                    if dry_run:
+                        continue
+                    mm["cost_usd"] = round(new_cost, 8)
+                    # cost_saved_usd tracks (base - charged); the backfilled
+                    # share contributes (base_share - charged_share)
+                    add_saved = (new_base * share) - add_cost
+                    mm["cost_saved_usd"] = round(
+                        float(mm.get("cost_saved_usd") or 0.0) + add_saved, 8)
+                    mm["unpriced_requests"] = 0
+                    mm["priced"] = True
+                    day_delta += delta
+                    day_saved += add_saved
+                if day_delta and not dry_run:
+                    drec["cost_usd"] = round(float(drec.get("cost_usd") or 0.0) + day_delta, 8)
+                    drec["cost_saved_usd"] = round(
+                        float(drec.get("cost_saved_usd") or 0.0) + day_saved, 8)
+        if not dry_run:
+            qk_atomic_write(QK_LEDGER_PATH, led)
+    return report
 
 
 # ==== Open WebUI integration ====
@@ -1255,7 +1392,12 @@ tr.pe-cleared td{opacity:.45}
 
  <section id="secModels" hidden>
   <h2>Models</h2>
-  <p class="hint">Blended $/M = cost per 1M tokens across all usage. The match button resolves the fuzzy pricing target via /pricing/match (the /stats payload does not carry the matched key per model) and shows it inline.</p>
+  <p class="hint">Blended $/M = cost per 1M tokens across all usage. The match button resolves the fuzzy pricing target via /pricing/match (the /stats payload does not carry the matched key per model) and shows it inline. <b>unpriced</b> means some recorded requests had no price at write time — after configuring a price, run reprice to backfill the last N days at the current price and clear the tag.</p>
+  <div class="filters">
+   <div class="f"><span>Backfill days</span><input id="repriceDays" type="number" value="30" min="1" max="3650" style="width:70px"/></div>
+   <button onclick="reprice(null)">Reprice all unpriced</button>
+   <span class="hint" id="repriceOut"></span>
+  </div>
   <div class="scroll">
   <table id="modelsT">
    <thead><tr>
@@ -1721,7 +1863,7 @@ function renderModels(){
     const sv=m.cost_saved_usd||0;
     return `<tr>
      <td>${esc(m.model)}
-       ${m.unpriced_requests>0?'<span class="tag unpriced">unpriced</span>':''}
+       ${m.unpriced_requests>0?`<span class="tag unpriced">unpriced</span><button class="small" onclick="reprice('${esc(m.model)}')">reprice</button>`:''}
        <button class="small" data-mi="${i}" onclick="matchModel(this)">match</button>
        <span class="match-out"></span></td>
      <td class="num">${fmt(m.requests,0)}</td>
@@ -1750,6 +1892,24 @@ async function matchModel(btn){
       out.textContent='→ '+target+' via '+how;
     }else{out.textContent='→ no match'}
   }catch(e){out.textContent='match error'}
+}
+
+// ---------- reprice (backfill unpriced ledger days at current price) ----------
+async function reprice(model){
+  const days=Math.max(1,parseInt($('repriceDays').value)||30);
+  const out=$('repriceOut');
+  const scope=model?('model '+model):('ALL unpriced models');
+  if(!confirm(`Reprice ${scope} for the last ${days} days at the CURRENT price?\n\nThis rewrites ledger cost_usd for buckets recorded while the model had no price and clears the unpriced tag. TOU is applied at the current rate (exact when TOU is off).`))return;
+  out.textContent=' repricing…';
+  try{
+    const qs='days='+days+(model?'&model='+encodeURIComponent(model):'');
+    const r=await api('/pricing/reprice?'+qs,{method:'POST'});
+    if(r.error){out.textContent=' error: '+r.error;return}
+    const per=Object.entries(r.models||{}).map(([m,v])=>`${m}: +$${fmt(v.cost_added_usd,4)} (${v.buckets}d)`).join(', ');
+    out.textContent=` +$${fmt(r.cost_added_usd,4)} across ${r.buckets_repriced} buckets`+(per?' · '+per:'');
+    toast('Reprice done: +$'+fmt(r.cost_added_usd,4));
+    await loadStats();  // refresh tables so the unpriced tag disappears
+  }catch(e){out.textContent=' failed: '+e.message;toast('Reprice failed: '+e.message)}
 }
 
 // ---------- recent activity (manual refresh only) ----------
@@ -2369,6 +2529,22 @@ async def api_refresh(request: Request):
         result = await asyncio.to_thread(
             qk_refresh_pricing, bool(body.get("force"))
         )
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@qk_router.post("/pricing/reprice", dependencies=[Depends(_require_admin)])
+async def api_reprice(request: Request):
+    q = request.query_params
+    try:
+        days = int(q.get("days") or 30)
+    except Exception:
+        days = 30
+    model = q.get("model") or None
+    dry = q.get("dry") == "1"
+    try:
+        result = await asyncio.to_thread(qk_reprice_ledger, days, model, dry)
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
