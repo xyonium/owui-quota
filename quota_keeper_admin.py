@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.10
+version: 0.5.11
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3393,48 +3393,44 @@ class Event:
             if not self._installed:
                 log.info("quota-keeper API mounted at %s", self.valves.api_prefix)
                 log.info("quota-keeper admin page at %s", page_path)
-            # Passthrough ingestion middleware. Starlette builds the middleware
-            # stack lazily on the first request, so mounting during lifespan is
-            # legal on the pinned starlette; a repeat mount (hot reload) simply
-            # re-adds a wrapper whose per-request mark dedupes the record.
-            # NOTE (v0.5.3): newer starlette (1.x, OWUI 0.11's fastapi 0.136)
-            # REBUILDS middleware_stack after startup, so add_middleware raises
-            # "Cannot add middleware after an application has started" — that
-            # is exactly what hit production (mount warning in logs, ingest
-            # silently dead). Bypass: append to user_middleware and rebuild
-            # the stack, which works on both lazy and eager builds.
-            try:
-                from starlette.middleware import Middleware
-                from starlette.middleware.base import BaseHTTPMiddleware
-
-                # Hot reload: the module instance changes but app.state persists
-                # — always (re)mount so the LATEST middleware code takes effect
-                # (a state flag would skip remount and keep the stale function).
-                # Remove any previously-mounted instance of our middleware
-                # BEFORE appending: hot reload creates a NEW function object, so
-                # identity (is) can't match it — match by dispatch __name__.
-                # Duplicate mounts tee the same response stream twice (the
-                # second sees an exhausted iterator) and 499 the client.
-                umw = getattr(__app__, "user_middleware", None)
-                if umw is not None:
-                    umw[:] = [
-                        m for m in umw
-                        if not (m.cls is BaseHTTPMiddleware
-                                and getattr(m.kwargs.get("dispatch"), "__name__", "")
-                                == "qk_passthrough_middleware")
-                    ]
-                umw.append(
-                    Middleware(BaseHTTPMiddleware, dispatch=qk_passthrough_middleware)
-                )
+                # Passthrough ingestion middleware — mounted ONCE per module
+                # instance, inside the _installed guard (a repeat mount would
+                # tee the same response stream twice and 499 the client).
+                # Starlette builds the middleware stack lazily on the first
+                # request, so mounting during lifespan is legal on the pinned
+                # starlette. NOTE (v0.5.3): newer starlette (1.x, OWUI 0.11's
+                # fastapi 0.136) REBUILDS middleware_stack after startup, so
+                # add_middleware raises "Cannot add middleware after an
+                # application has started" — bypass: append to user_middleware
+                # and rebuild the stack.
+                # Hot reload: a NEW module instance (self._installed=False)
+                # remounts and must first remove the OLD instance's middleware
+                # — hot reload creates a NEW function object, so identity (is)
+                # can't match; match by dispatch __name__.
                 try:
-                    __app__.middleware_stack = __app__.build_middleware_stack()
-                except Exception as _e:
-                    # build may fail if the stack is mid-request; keep the
-                    # middleware registered, it will build on next access
-                    log.info("quota-keeper ingest stack rebuild skipped: %s", _e)
-                log.info("quota-keeper passthrough ingest middleware mounted (v2)")
-            except Exception as e:
-                log.warning("quota-keeper ingest middleware mount failed: %s", e)
+                    from starlette.middleware import Middleware
+                    from starlette.middleware.base import BaseHTTPMiddleware
+
+                    umw = getattr(__app__, "user_middleware", None)
+                    if umw is not None:
+                        umw[:] = [
+                            m for m in umw
+                            if not (m.cls is BaseHTTPMiddleware
+                                    and getattr(m.kwargs.get("dispatch"), "__name__", "")
+                                    == "qk_passthrough_middleware")
+                        ]
+                    umw.append(
+                        Middleware(BaseHTTPMiddleware, dispatch=qk_passthrough_middleware)
+                    )
+                    try:
+                        __app__.middleware_stack = __app__.build_middleware_stack()
+                    except Exception as _e:
+                        # build may fail if the stack is mid-request; keep the
+                        # middleware registered, it will build on next access
+                        log.info("quota-keeper ingest stack rebuild skipped: %s", _e)
+                    log.info("quota-keeper passthrough ingest middleware mounted (v2)")
+                except Exception as e:
+                    log.warning("quota-keeper ingest middleware mount failed: %s", e)
             self._installed = True
 
             # The pricing loop is tracked on app.state so a hot code update
