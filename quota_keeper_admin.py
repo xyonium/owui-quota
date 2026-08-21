@@ -1664,6 +1664,7 @@ const STATE={
   drill:{},            // user_id -> /stats drilldown payload cache
   pe:{loaded:false,search:'',data:null,orig:{}}, // pricing editor state
   tou:null,            // live editable copy of cfg.tou
+  personal:{span:localStorage.getItem('qk_myspan')||'7d',usage:null,recent:null,models:null},
 };
 
 // ---------- entry ----------
@@ -1724,9 +1725,76 @@ function renderPersonal(){
      <div class="small muted">used this period (month if monthly)</div></div>
    </div>
    <p class="hint">7-day cost trend · $${fmt(cost7,2)} total, ${fmt(req7,0)} requests</p>
-   ${sparkSvg(trend.map(d=>d.cost_usd||0),560,56,'#38bdf8')}`;
+   ${sparkSvg(trend.map(d=>d.cost_usd||0),560,56,'#38bdf8')}
+   <div class="spans" style="margin-top:16px">
+    <button data-myspan="7d" onclick="setMySpan('7d')">7d</button>
+    <button data-myspan="30d" onclick="setMySpan('30d')">30d</button>
+    <span class="small muted">by model · recent · prices</span>
+   </div>
+   <h3>By model</h3>
+   <div class="scroll"><table id="myModelsT"><thead><tr>
+    <th>Model</th><th class="num">Req</th><th class="num">Tokens</th><th class="num">Cost $</th><th>Share</th>
+   </tr></thead><tbody><tr><td colspan="5" class="empty">loading…</td></tr></tbody></table></div>
+   <h3>Recent activity <button style="margin-left:8px" onclick="loadMyRecent()">Refresh</button></h3>
+   <div class="scroll"><table id="myRecentT"><thead><tr>
+    <th>Time</th><th>Model</th><th>Via</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th><th>Tier</th>
+   </tr></thead><tbody><tr><td colspan="8" class="empty">loading…</td></tr></tbody></table></div>
+   <h3>Model prices</h3>
+   <p class="hint">价格为 0 的模型暂未匹配到价目；价格表由后台定期刷新，使用后会按最新价格自动计价（历史未计价记录由 admin reprice 回填）。</p>
+   <div class="scroll"><table id="myPricesT"><thead><tr>
+    <th>Model</th><th class="num">Input $/M</th><th class="num">Output $/M</th><th class="num">Cached $/M</th><th></th>
+   </tr></thead><tbody><tr><td colspan="5" class="empty">loading…</td></tr></tbody></table></div>`;
   $('secPersonal').hidden=false;
   $('meta').textContent='self-service view';
+  loadPersonal();
+}
+
+// ---------- personal page: by-model / recent / prices ----------
+function setMySpan(k){STATE.personal.span=k;localStorage.setItem('qk_myspan',k);
+  document.querySelectorAll('[data-myspan]').forEach(b=>b.classList.toggle('active',b.dataset.myspan===k));
+  loadMyUsage();}
+async function loadPersonal(){
+  document.querySelectorAll('[data-myspan]').forEach(b=>b.classList.toggle('active',b.dataset.myspan===STATE.personal.span));
+  loadMyUsage();loadMyRecent();loadMyPrices();  // independent lazy loads; each toasts on failure
+}
+async function loadMyUsage(){
+  try{STATE.personal.usage=await api('/me/usage?span='+STATE.personal.span);renderMyModels()}
+  catch(e){toast('Usage load failed: '+e.message)}
+}
+function renderMyModels(){
+  const u=STATE.personal.usage;if(!u)return;
+  const rows=u.models||[],tot=rows.reduce((s,m)=>s+(m.cost_usd||0),0)||1;
+  $('myModelsT').querySelector('tbody').innerHTML=rows.map(m=>{
+    const t=m.tokens||{},tt=(t.cached||0)+(t.input||0)+(t.output||0),pct=(m.cost_usd||0)/tot*100;
+    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(tt,0)}</td><td class="num">$${fmt(m.cost_usd,4)}</td><td><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div><span class="pct">${pct.toFixed(1)}%</span></td></tr>`;
+  }).join('')||'<tr><td colspan="5" class="empty">No usage in this span.</td></tr>';
+}
+async function loadMyRecent(){
+  try{STATE.personal.recent=await api('/recent?mine=1');renderMyRecent()}
+  catch(e){toast('Recent load failed: '+e.message)}
+}
+function renderMyRecent(){
+  const items=((STATE.personal.recent||{}).items||[]);
+  $('myRecentT').querySelector('tbody').innerHTML=items.map(it=>{
+    const t=it.tokens||{},dt=new Date((it.ts||0)*1000),p=n=>String(n).padStart(2,'0');
+    const time=(dt.getMonth()+1)+'-'+p(dt.getDate())+' '+p(dt.getHours())+':'+p(dt.getMinutes());
+    const tier=(it.tou_tier&&it.tou_tier!=='off')?`<span class="tag t-${esc(it.tou_tier)}">${esc(it.tou_tier)}</span>`:'';
+    const chan=it.channel==='webui'?'webui':'api';
+    return `<tr><td class="small muted">${time}</td><td>${esc(it.model)}${it.priced===false?' <span class="tag unpriced">unpriced</span>':''}</td><td><span class="tag ch-${chan}">${chan}</span></td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(t.input,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(it.cost_usd,4)}</td><td>${tier}</td></tr>`;
+  }).join('')||'<tr><td colspan="8" class="empty">No activity yet.</td></tr>';
+}
+async function loadMyPrices(){
+  try{STATE.personal.models=await api('/models?mine=1');renderMyPrices()}
+  catch(e){toast('Prices load failed: '+e.message)}
+}
+function renderMyPrices(){
+  const items=((STATE.personal.models||{}).items||[]).slice().sort((a,b)=>String(a.model).localeCompare(String(b.model)));
+  $('myPricesT').querySelector('tbody').innerHTML=items.map(it=>{
+    const p=it.price||{};
+    const tag=it.override?'<span class="tag manual">manual</span>':(it.matched?'':'<span class="tag unpriced">unmatched</span>');
+    const f=v=>(typeof v==='number')?fmt(v,2):'0';
+    return `<tr><td>${esc(it.model)}</td><td class="num">${f(p.input)}</td><td class="num">${f(p.output)}</td><td class="num">${f(p.cached)}</td><td>${tag}</td></tr>`;
+  }).join('')||'<tr><td colspan="5" class="empty">No models used yet.</td></tr>';
 }
 
 // ---------- SVG helpers ----------
@@ -1803,21 +1871,30 @@ function fillModelSelect(){
 // ---------- KPI cards ----------
 function renderKpis(){
   const k=STATE.stats.kpi||{},cpu=Number(STATE.cfg.credits_per_usd)||1000;
-  const tot=(k.tokens||{}).cached+(k.tokens||{}).input+(k.tokens||{}).output;
-  // NOTE: the /stats `series` carries ONLY cost per bucket (see qk_stats), so
-  // per-bucket trends exist for Cost/Credits; Requests/Tokens/Cache rate and
-  // Unpriced show the span total instead of a fabricated sparkline.
+  const tk=k.tokens||{};
+  const tot=(tk.cached||0)+(tk.input||0)+(tk.output||0);
+  // series buckets carry {cost:{m:v}|{_:v}, requests, tokens} (see qk_stats /
+  // qk_stats_window): Cost/Credits trend from cost, Requests/Tokens from the
+  // per-bucket request/token series. Cache rate and Unpriced are span ratios
+  // (a sparkline of a ratio is noise), so they get a totals subline instead.
   const ser=STATE.stats.series||[];
-  const costPer=ser.map(b=>Object.values(b.by_model||{}).reduce((a,c)=>a+c,0));
+  const costPer=ser.map(b=>Object.values(b.cost||{}).reduce((a,c)=>a+c,0));
+  const reqPer=ser.map(b=>b.requests||0);
+  const tokPer=ser.map(b=>b.tokens||0);
+  const ch=k.channels||{};
+  const ci=(tk.cached||0)+(tk.input||0);
   const cards=[
-    {lbl:'Requests',val:fmt(k.requests||0,0)},
-    {lbl:'Tokens',val:fmt(tot||0,0)},
+    {lbl:'Requests',val:fmt(k.requests||0,0),sp:sparkSvg(reqPer,140,34,'#c98500'),
+     sub:`webui ${fmt(ch.webui||0,0)} · api ${fmt(ch.api||0,0)}`},
+    {lbl:'Tokens',val:fmt(tot||0,0),sp:sparkSvg(tokPer,140,34,'#9085e9')},
     {lbl:'Cost $',val:'$'+fmt(k.cost_usd||0,2),sp:sparkSvg(costPer,140,34,'#38bdf8')},
     {lbl:'Credits',val:fmt((k.cost_usd||0)*cpu,0),sp:sparkSvg(costPer.map(v=>v*cpu),140,34,'#34d399')},
-    {lbl:'Cache rate',val:fmt((k.cache_rate||0)*100,1)+'%'},
-    {lbl:'Unpriced',val:fmt(k.unpriced_requests||0,0)},
+    {lbl:'Cache rate',val:fmt((k.cache_rate||0)*100,1)+'%',
+     sub:`cached ${fmt(tk.cached||0,0)} / in ${fmt(ci,0)}`},
+    {lbl:'Unpriced',val:fmt(k.unpriced_requests||0,0),
+     sub:`of ${fmt(k.requests||0,0)} req`},
   ];
-  $('kpis').innerHTML=cards.map(c=>`<div class="kpi"><div class="lbl">${c.lbl}</div><div class="val">${c.val}</div>${c.sp||''}</div>`).join('');
+  $('kpis').innerHTML=cards.map(c=>`<div class="kpi"><div class="lbl">${c.lbl}</div><div class="val">${c.val}</div>${c.sp||''}${c.sub?`<div class="small muted">${c.sub}</div>`:''}</div>`).join('');
 }
 
 // ---------- stacked trend chart ----------
@@ -1827,7 +1904,7 @@ function renderTrend(){
   const ser=STATE.stats.series||[];
   const hourMode=spanDates()&&spanDates().gran==='hour';
   const totals={};
-  ser.forEach(b=>{Object.entries(b.by_model||{}).forEach(([m,c])=>{totals[m]=(totals[m]||0)+c})});
+  ser.forEach(b=>{Object.entries(b.cost||{}).forEach(([m,c])=>{totals[m]=(totals[m]||0)+c})});
   const ranked=Object.entries(totals).sort((a,b)=>b[1]-a[1]);
   if(!ranked.length){box.innerHTML='<p class="hint">No data for the selected span.</p>';$('trendLegend').innerHTML='';return}
   const top=ranked.slice(0,8).map(e=>e[0]);
@@ -1837,9 +1914,9 @@ function renderTrend(){
   const W=1040,H=250,pl=48,pr=12,pt=10,pb=26;
   const iw=W-pl-pr,ih=H-pt-pb;
   let ymax=0;
-  ser.forEach(b=>{const s=Object.values(b.by_model||{}).reduce((a,c)=>a+c,0);if(s>ymax)ymax=s});
+  ser.forEach(b=>{const s=Object.values(b.cost||{}).reduce((a,c)=>a+c,0);if(s>ymax)ymax=s});
   const yt=v=>pt+ih-(v/ymax*ih);
-  const rows=ser.map(b=>{const bm=b.by_model||{};return {label:b.bucket,parts:names.map(m=>bm[m]||0)}});
+  const rows=ser.map(b=>{const bm=b.cost||{};return {label:b.bucket,parts:names.map(m=>bm[m]||0)}});
   let g=`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Cost per bucket by model">`;
   [0,.25,.5,.75,1].forEach(f=>{
     const y=yt(ymax*f);
