@@ -955,6 +955,17 @@ class Filter:
             choices = body.get("choices") or []
             if tok is None and isinstance(choices, list) and choices:
                 tok = qk_normalize_usage((choices[0] or {}).get("usage"))
+            if tok is None:
+                # OWUI 0.11 rebuilds the outlet body as a message list: usage
+                # lives only on the last assistant message (messages[-1].usage),
+                # with no top-level body["usage"] and no "choices". Non-streaming
+                # API requests reach outlet exclusively in this shape, so without
+                # this branch they were silently never recorded.
+                for msg in reversed(body.get("messages") or []):
+                    if isinstance(msg, dict) and msg.get("usage"):
+                        tok = qk_normalize_usage(msg.get("usage"))
+                        if tok is not None:
+                            break
             rid = str(body.get("id") or "")
             model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
             chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"

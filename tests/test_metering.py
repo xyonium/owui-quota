@@ -148,3 +148,73 @@ def test_stats_channels_aggregated(load_admin):
     }}}})
     out = adm.qk_stats()
     assert out["users"][0]["channels"] == {"webui": 0, "api": 0}
+
+
+# ---- OWUI 0.11 outlet body shape (rebuilt message list) -------------------------
+#
+# 0.11 rebuilds the outlet body: usage lives ONLY on the last assistant message
+# (messages[-1].usage); there is no top-level body["usage"] and no "choices".
+# The non-streaming API path (/api/v1/messages, /openai/responses) reaches outlet
+# exclusively through this shape, so a filter that only reads the top level /
+# choices[0] silently records nothing for every non-streaming API request.
+
+
+def _011_body(usage):
+    return {
+        "model": "glm-5.3",
+        "messages": [
+            {"id": "u1", "role": "user", "content": "hi", "info": None, "timestamp": 1},
+            {"id": "msg-1", "role": "assistant", "content": "ok", "usage": usage},
+        ],
+        "filter_ids": [],
+        "chat_id": "",
+        "session_id": "sess-1",
+        "id": "msg-1",
+    }
+
+
+def test_outlet_records_usage_from_last_message(qk):
+    """0.11.0 non-streaming API body: usage on messages[-1] must be recorded."""
+    f = qk.Filter()
+    import asyncio
+    body = _011_body({"prompt_tokens": 100, "completion_tokens": 40, "total_tokens": 140})
+    md = {"chat_id": "", "session_id": "sess-1", "message_id": "msg-1", "user_id": "u1"}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert d["tokens"]["input"] == 100
+    assert d["tokens"]["output"] == 40
+    # empty chat_id -> api channel
+    assert d["channels"] == {"webui": 0, "api": 1}
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {})
+    assert rec["items"][0]["channel"] == "api"
+
+
+def test_outlet_anthropic_usage_shape_in_message(qk):
+    """0.11.0 Anthropic-normalized usage (input/output_tokens) on the message."""
+    f = qk.Filter()
+    import asyncio
+    body = _011_body({"input_tokens": 11, "output_tokens": 7,
+                      "cache_read_input_tokens": 3, "cache_creation_input_tokens": 2})
+    md = {"chat_id": "", "session_id": "s", "message_id": "msg-1", "user_id": "u1"}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert d["tokens"]["input"] == 11
+    assert d["tokens"]["cached"] == 3
+
+
+def test_outlet_toplevel_usage_still_wins(qk):
+    """Regression guard: the pre-0.11 top-level usage shape must keep working."""
+    f = qk.Filter()
+    import asyncio
+    body = {"id": "r9", "model": "gpt-4o",
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__={"chat_id": "chat-9"}))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert d["tokens"]["input"] == 5
+    assert d["channels"] == {"webui": 1, "api": 0}
