@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.6
+version: 0.5.7
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2021,6 +2021,8 @@ tr.pe-cleared td{opacity:.45}
   </div>
   <label>Fallback pricing per 1M tokens when no match (JSON, optional)</label>
   <input id="default_pricing" placeholder='{"input":1,"cached":0.1,"output":2}'/>
+  <label>Model aliases (upstream alias → real model name, JSON; e.g. {"prx.gemini-flash":"gemini-3.7-flash"} — merges the alias into the real model's stats/pricing)</label>
+  <textarea id="model_aliases" rows="2" placeholder='{"prx.gemini-flash":"gemini-3.7-flash"}'></textarea>
   <div class="row" style="margin-top:10px">
    <input id="matchTest" placeholder="Type a model id to test matching, e.g. openai/gpt-4o-mini"/>
    <button onclick="testMatch()">Test match</button>
@@ -2604,6 +2606,9 @@ function renderConfig(){
   $('pricing_url').value=Array.isArray(p.url)?p.url.join('\n'):(p.url||'');
   $('refresh_hours').value=p.refresh_hours??24;
   $('default_pricing').value=p.default_pricing?JSON.stringify(p.default_pricing):'';
+  const ma=STATE.cfg.model_aliases||{};
+  const maEl=$('model_aliases');
+  if(maEl)maEl.value=Object.keys(ma).length?JSON.stringify(ma,null,1):'';
 }
 function userGroups(u){
   return STATE.groups.filter(g=>(g.members||[]).includes(u.id)).map(g=>g.id);
@@ -2670,6 +2675,7 @@ async function saveConfig(){
     // only after /pricing?full=1 has loaded once)
     pricing:{url:(()=>{const lines=$('pricing_url').value.split('\n').map(s=>s.trim()).filter(Boolean);return lines.length<=1?(lines[0]||''):lines})(),refresh_hours:num('refresh_hours',24),default_pricing:dp,overrides:STATE.pe.loaded?collectOverrides():((STATE.cfg.pricing||{}).overrides||{})},
     group_quotas:gq,user_quotas:uq,
+    model_aliases:(()=>{const el=$('model_aliases');if(!el)return (STATE.cfg.model_aliases||{});const v=el.value.trim();if(!v)return {};try{const o=JSON.parse(v);if(typeof o!=='object'||Array.isArray(o))throw 0;return o}catch(e){toast('Model aliases is not a JSON object');throw e}})(),
     tou:buildTou(),
   };
   try{
