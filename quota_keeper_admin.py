@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.9
+version: 0.5.10
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3411,12 +3411,17 @@ class Event:
                 # — always (re)mount so the LATEST middleware code takes effect
                 # (a state flag would skip remount and keep the stale function).
                 # Remove any previously-mounted instance of our middleware
-                # (identified by dispatch) before appending a fresh one.
+                # BEFORE appending: hot reload creates a NEW function object, so
+                # identity (is) can't match it — match by dispatch __name__.
+                # Duplicate mounts tee the same response stream twice (the
+                # second sees an exhausted iterator) and 499 the client.
                 umw = getattr(__app__, "user_middleware", None)
                 if umw is not None:
                     umw[:] = [
                         m for m in umw
-                        if not (m.cls is BaseHTTPMiddleware and m.kwargs.get("dispatch") is qk_passthrough_middleware)
+                        if not (m.cls is BaseHTTPMiddleware
+                                and getattr(m.kwargs.get("dispatch"), "__name__", "")
+                                == "qk_passthrough_middleware")
                     ]
                 umw.append(
                     Middleware(BaseHTTPMiddleware, dispatch=qk_passthrough_middleware)
