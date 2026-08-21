@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.8
+version: 0.5.9
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3404,23 +3404,30 @@ class Event:
             # silently dead). Bypass: append to user_middleware and rebuild
             # the stack, which works on both lazy and eager builds.
             try:
-                if getattr(__app__.state, "quota_keeper_ingest_mw", False):
-                    pass  # already mounted this process lifetime
-                else:
-                    from starlette.middleware import Middleware
-                    from starlette.middleware.base import BaseHTTPMiddleware
+                from starlette.middleware import Middleware
+                from starlette.middleware.base import BaseHTTPMiddleware
 
-                    __app__.user_middleware.append(
-                        Middleware(BaseHTTPMiddleware, dispatch=qk_passthrough_middleware)
-                    )
-                    try:
-                        __app__.middleware_stack = __app__.build_middleware_stack()
-                    except Exception as _e:
-                        # build may fail if the stack is mid-request; keep the
-                        # middleware registered, it will build on next access
-                        log.info("quota-keeper ingest stack rebuild skipped: %s", _e)
-                    __app__.state.quota_keeper_ingest_mw = True
-                    log.info("quota-keeper passthrough ingest middleware mounted")
+                # Hot reload: the module instance changes but app.state persists
+                # — always (re)mount so the LATEST middleware code takes effect
+                # (a state flag would skip remount and keep the stale function).
+                # Remove any previously-mounted instance of our middleware
+                # (identified by dispatch) before appending a fresh one.
+                umw = getattr(__app__, "user_middleware", None)
+                if umw is not None:
+                    umw[:] = [
+                        m for m in umw
+                        if not (m.cls is BaseHTTPMiddleware and m.kwargs.get("dispatch") is qk_passthrough_middleware)
+                    ]
+                umw.append(
+                    Middleware(BaseHTTPMiddleware, dispatch=qk_passthrough_middleware)
+                )
+                try:
+                    __app__.middleware_stack = __app__.build_middleware_stack()
+                except Exception as _e:
+                    # build may fail if the stack is mid-request; keep the
+                    # middleware registered, it will build on next access
+                    log.info("quota-keeper ingest stack rebuild skipped: %s", _e)
+                log.info("quota-keeper passthrough ingest middleware mounted (v2)")
             except Exception as e:
                 log.warning("quota-keeper ingest middleware mount failed: %s", e)
             self._installed = True

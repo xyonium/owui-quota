@@ -300,6 +300,11 @@ v0.5.8 新增：
 
 30. **流式 message_delta usage 提取修复**（admin v0.5.8）：真机 Claude Code 流式直连出现 `input=30362 output=0`——anthropic 流式 `message_delta` 的 usage 在**顶层**（`delta` 里只有 stop_reason），且是**累计值**（非增量）。原代码只查 `delta.usage`（拿不到）且按增量累加（double-count）。修：`message_delta` 先查顶层 `usage` 再查 `delta.usage`；scan 里 `message_start/message_delta/response.completed` 全部**覆盖** acc（累计语义）。真机抓包确认：非流式响应 model 已是真实名（`gemini-3.7-flash`），流式 message_start 也是真实名——**model_aliases 主要兜 filter 侧**，passthrough 响应自带真实名。
 
+
+v0.5.9 新增：
+
+31. **热重载后中间件仍是旧代码（output=0 持续）**（admin v0.5.9）：0.5.8 的 message_delta 顶层 usage 修复部署后 output 仍 0——原因：中间件挂载用 `app.state.quota_keeper_ingest_mw` 标志防重，热重载时标志为 True → **跳过重挂**，进程里跑的还是旧中间件（无顶层 usage 分支）。修：**每次 mount 都重挂**——从 `user_middleware` 移除旧实例（按 dispatch 是当前模块函数对象）再 append 新实例 + 重建栈；`QK_INGEST_MARK`（request.state）兜底防双记。**注意**：热重载后模块函数对象变了，旧实例靠 `is` 删不掉（不同对象），但新 append 的会先跑？不——中间件顺序是 append 顺序，旧的在内层先跑仍 output=0。**根治仍需重启 OWUI**（进程内旧模块无法替换）；v2 逻辑保证**重启后**热重载不再踩坑。**真机经验：改中间件代码后必须重启 OWUI，热重载不会替换已挂的中间件函数。**
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。
