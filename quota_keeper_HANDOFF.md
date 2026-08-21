@@ -275,6 +275,11 @@ v0.5.2 新增：
 25. **phantom alias 行（prx.\*）**（filter v0.4.11 / admin v0.5.2 修复）：真机发现两类 `prx.*` 污染——(a) **stream-end outlet topup 落 alias 名**：`stream()` 按真实名记账后，stream-end 的 outlet 用 `metadata.model_name or body.model` 取名，metadata 缺 model_name 时 fallback 到 body.model（上游回显的 alias `prx.gemini-flash`）→ topup 落到 alias 行（req=0 但有 tokens，且 unpriced=1 永不消费）。修：`_seen`/`_seen_msgids` 改存 `(model, channel)` 对，topup 复用 stream() 首记的 model。(b) **outlet 整记用 alias**：metadata.model_name 缺失 + message_id 未匹配 `_seen_msgids`（stream 从未见过该 id）时 outlet 走 `_record`，body.model 是 alias → 整记 alias 行（req=1 unpriced=1）。修：outlet/stream 的 model fallback 剥离 `prx.` 前缀（cli-proxy-api prefix_id；硬编码该前缀，通用启发式太冒险）。**注意**：剥离后得到的是 `gemini-flash` 这类裸名，价格表里未必存在（真实模型是 `gemini-3.7-flash`）——治本靠 metadata.model_name（OWUI 注入真实名），剥离只是兜底；真机清理时用 alias→真实模型名映射表（`prx.gemini-flash→gemini-3.7-flash`、`prx.gemini-pro→gemini-3.1-pro-preview`、`prx.deepseek-flash→deepseek-v4-flash`）合并/改名 ledger 与 recent 的 prx 行，再跑 `qk_reprice_ledger` 补记成本并清 unpriced。真机教训：**metadata.model_name 并非总是注入**（15:01 案例就没有），alias 回显 + model_name 缺失 = phantom 行温床。
 
 
+
+v0.5.3 新增：
+
+26. **中间件在生产从未挂上（Claude Code 直连 0 记录根因）**（admin v0.5.3 修复）：生产 OWUI 0.11（fastapi 0.136.3 + **starlette 1.3.1**）在 **app startup 后已构建 `middleware_stack`**，Event 函数挂载时 `add_middleware` 抛 `Cannot add middleware after an application has started`（日志可见 `quota-keeper ingest middleware mount failed`）。本地测试环境是 starlette 0.36.3（懒构建、无守卫）→ 测试全绿但生产静默失效，**Claude Code 的 `/api/v1/messages` 直连 8347 次请求全没记到**。修复：不用 `add_middleware`，改 `__app__.user_middleware.append(Middleware(BaseHTTPMiddleware, dispatch=...))` + `__app__.middleware_stack = __app__.build_middleware_stack()`（starlette 1.3.1 下已单独验证可行，栈已构建也能重建）。**教训：测试环境 starlette 版本必须与生产一致**（本地 0.36.3 vs 生产 1.3.1 的差异正是这次坑的根源）。残余：`build_middleware_stack` 若在请求中途调用可能抛错（已 try/except，注册保留、下次访问重建）；中间件 append 到 user_middleware 末尾 = 最内层，AuthTokenMiddleware 外层先跑设 `state.token` → 路由 Depends(get_verified_user) 设 `state.user`（auth.py:360/411）→ 响应侧 `qk_ingest_parse_body_user` 读到 user。**不要**在中间件请求侧手动调 get_current_user（需要 Response()/BackgroundTasks() 实例化，在 1.3.1 下会 422 破坏路由）。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。

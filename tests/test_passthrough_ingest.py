@@ -163,13 +163,28 @@ def _mk_app(adm, path, resp_body=b"", stream=False, user=None):
 def _stub_owui_auth(monkeypatch):
     """Provide the open_webui.auth stub for admin import (qk_passthrough
     middleware references request.state.user only, but the admin module's
-    auth dependency import needs the module to exist)."""
+    auth dependency import needs the module to exist). get_current_user
+    mimics OWUI's signature: resolves the user from request.state.token."""
     import sys, types
+    from types import SimpleNamespace
+
     ow = types.ModuleType("open_webui")
     utils = types.ModuleType("open_webui.utils")
     auth = types.ModuleType("open_webui.utils.auth")
-    auth.get_current_user = None
-    auth.get_verified_user = None
+
+    async def get_current_user(request, response=None, background_tasks=None, auth_token=None):
+        token = getattr(request.state, "token", None)
+        if auth_token is not None:
+            token = auth_token
+        if token is None:
+            raise RuntimeError("no token")
+        return SimpleNamespace(id="u1", name="U", email="u@x.com", role="user")
+
+    def get_verified_user(user):
+        return user
+
+    auth.get_current_user = get_current_user
+    auth.get_verified_user = get_verified_user
     utils.auth = auth
     ow.utils = utils
     monkeypatch.setitem(sys.modules, "open_webui", ow)
@@ -237,3 +252,103 @@ def test_middleware_stream_body_preserved(load_admin, monkeypatch):
     resp = c.post("/api/v1/messages", json={})
     assert resp.status_code == 200
     assert resp.content == payload
+
+
+def test_middleware_reads_user_set_by_route_depends(load_admin, monkeypatch):
+    """OWUI's routes resolve the user via Depends(get_verified_user), which
+    sets request.state.user (auth.py:360/411). Our middleware runs after the
+    route, so the response-side ingest record must see that user without
+    re-resolving the token itself."""
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    body = json.dumps({"type": "message", "model": "claude-x",
+                       "usage": {"input_tokens": 11, "output_tokens": 7}}).encode()
+
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    from fastapi.testclient import TestClient
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from types import SimpleNamespace
+
+    app = FastAPI()
+
+    async def route(request: Request):
+        # OWUI's Depends(get_verified_user) would have set this already
+        request.state.user = SimpleNamespace(id="u1", name="U", email="u@x.com", role="user")
+        return JSONResponse(json.loads(body))
+
+    app.add_api_route("/api/v1/messages", route, methods=["POST"])
+    app.add_middleware(BaseHTTPMiddleware, dispatch=adm.qk_passthrough_middleware)
+
+    with TestClient(app) as c:
+        resp = c.post("/api/v1/messages", json={"model": "claude-x"})
+        assert resp.status_code == 200
+
+    led = _led(adm)
+    d = list((led["users"].get("u1") or {}).get("days", {}).values())
+    assert d and d[0]["requests"] == 1
+    assert d[0]["channels"] == {"webui": 0, "api": 1}
+
+
+def test_middleware_records_nonstream_messages(load_admin, monkeypatch, tmp_path):
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    body = json.dumps({"type": "message", "model": "claude-x",
+                       "usage": {"input_tokens": 11, "output_tokens": 7,
+                                 "cache_read_input_tokens": 3}}).encode()
+    c = _mk_app(adm, "/api/v1/messages", resp_body=body)
+    # simulate OWUI AuthTokenMiddleware populating request.state.user
+    from fastapi.testclient import TestClient
+    resp = c.post("/api/v1/messages", json={"model": "claude-x"},
+                  headers={"authorization": "Bearer x"})
+    assert resp.status_code == 200
+    led = _led(adm)
+    d = list((led["users"].get("u1") or {}).get("days", {}).values())
+    assert d and d[0]["requests"] == 1
+    assert d[0]["channels"] == {"webui": 0, "api": 1}
+
+
+def test_middleware_records_streaming_messages(load_admin, monkeypatch):
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    c = _mk_app(adm, "/api/v1/messages", resp_body=ANTHROPIC_SSE, stream=True)
+    resp = c.post("/api/v1/messages", json={})
+    assert resp.status_code == 200
+    led = _led(adm)
+    d = list((led["users"].get("u1") or {}).get("days", {}).values())
+    assert d and d[0]["requests"] == 1
+    assert d[0]["tokens"]["input"] == 10 and d[0]["tokens"]["output"] == 7
+
+
+def test_middleware_ignores_non_ingest_path(load_admin, monkeypatch):
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    body = json.dumps({"usage": {"prompt_tokens": 5, "completion_tokens": 2}}).encode()
+    c = _mk_app(adm, "/api/chat/completions", resp_body=body)
+    resp = c.post("/api/chat/completions", json={})
+    assert resp.status_code == 200
+    # path not in QK_INGEST_PATHS -> nothing recorded
+    assert not Path(adm.QK_LEDGER_PATH).exists()
+
+
+def test_middleware_skips_when_no_user(load_admin, monkeypatch):
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    body = json.dumps({"usage": {"prompt_tokens": 5, "completion_tokens": 2}}).encode()
+    c = _mk_app(adm, "/openai/responses", resp_body=body, user=False)
+    resp = c.post("/openai/responses", json={})
+    assert resp.status_code == 200
+    # no authenticated user -> nothing recorded (can't attribute)
+    assert not Path(adm.QK_LEDGER_PATH).exists()
+
+
+def test_middleware_stream_body_preserved(load_admin, monkeypatch):
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    payload = b'data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}\n\n'
+    c = _mk_app(adm, "/api/v1/messages", resp_body=payload, stream=True)
+    resp = c.post("/api/v1/messages", json={})
+    assert resp.status_code == 200
+    assert resp.content == payload
+
+
