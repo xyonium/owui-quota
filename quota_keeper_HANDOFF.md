@@ -295,6 +295,11 @@ v0.5.6 新增：
 
 29. **model_aliases（alias → 真实模型名映射）**（filter v0.4.13 / admin v0.5.6）：passthrough 响应里的 `model` 是上游回显的 alias（`prx.gemini-flash`），价格表里没有 → unpriced；且和 webui 侧的真实名（`gemini-3.7-flash`）统计分裂。新增顶层配置 `model_aliases: {"prx.gemini-flash": "gemini-3.7-flash", ...}`，`qk_resolve_model_alias` 在**价格匹配前**（`qk_record_usage` 内）替换模型名，记账/计价/统计全用真实名。**与 `pricing.overrides` 的 `alias` 语义不同**：那是"价格引用"（glm-5.3 按 glm-5.2 价计，仍统计为 glm-5.3），这是"命名映射"（合并统计）；不配的模型原样通过。校验器对 `model_aliases` 做 dict[str,str] 检查。
 
+
+v0.5.8 新增：
+
+30. **流式 message_delta usage 提取修复**（admin v0.5.8）：真机 Claude Code 流式直连出现 `input=30362 output=0`——anthropic 流式 `message_delta` 的 usage 在**顶层**（`delta` 里只有 stop_reason），且是**累计值**（非增量）。原代码只查 `delta.usage`（拿不到）且按增量累加（double-count）。修：`message_delta` 先查顶层 `usage` 再查 `delta.usage`；scan 里 `message_start/message_delta/response.completed` 全部**覆盖** acc（累计语义）。真机抓包确认：非流式响应 model 已是真实名（`gemini-3.7-flash`），流式 message_start 也是真实名——**model_aliases 主要兜 filter 侧**，passthrough 响应自带真实名。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。

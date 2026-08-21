@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.7
+version: 0.5.8
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -994,9 +994,15 @@ def qk_ingest_extract_usage(data: dict) -> Optional[dict]:
             return qk_normalize_usage(msg.get("usage"))
         return None
     if data.get("type") == "message_delta":
+        # Anthropic streams put output_tokens in the TOP-LEVEL usage of the
+        # message_delta event (delta only carries stop_reason); some proxies
+        # nest it under delta.usage instead — accept both.
         d = data.get("delta")
-        if isinstance(d, dict):
-            return qk_normalize_usage(d.get("usage"))
+        u = data.get("usage")
+        if u is None and isinstance(d, dict):
+            u = d.get("usage")
+        if isinstance(u, dict):
+            return qk_normalize_usage(u)
         return None
     if data.get("type") == "response.completed":
         resp = data.get("response")
@@ -1063,10 +1069,12 @@ def qk_ingest_scan_sse(chunks):
                 part = qk_ingest_extract_usage(ev)
                 if part is None:
                     continue
-                if ev.get("type") == "message_start" or ev.get("type") == "response.completed":
+                # Anthropic message_start / message_delta carry CUMULATIVE
+                # usage (delta's top-level usage is the running total, not an
+                # increment) — each replaces the accumulator. response.completed
+                # likewise holds the final totals.
+                if ev.get("type") in ("message_start", "message_delta", "response.completed"):
                     acc = part
-                elif acc is not None and ev.get("type") == "message_delta":
-                    acc = qk_ingest_merge_usage(acc, part)
                 elif acc is None:
                     acc = part
     return model, acc

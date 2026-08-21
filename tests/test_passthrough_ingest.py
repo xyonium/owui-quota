@@ -91,12 +91,16 @@ ANTHROPIC_SSE = (
     'event: content_block_delta\n'
     'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}\n\n'
     'event: message_delta\n'
-    'data: {"type":"message_delta","delta":{"usage":{"output_tokens":7}}}\n\n'
+    # real Anthropic streams carry the CUMULATIVE usage on the TOP LEVEL of
+    # message_delta (delta only has stop_reason) — it REPLACES the acc, not
+    # increments it
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+    '"usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":2}}\n\n'
     'data: [DONE]\n\n'
 ).encode()
 
 
-def test_scan_anthropic_sse_merges_start_and_delta(load_admin):
+def test_scan_anthropic_sse_replaces_with_message_delta(load_admin):
     adm = load_admin()
     _m, out = adm.qk_ingest_scan_sse(iter([ANTHROPIC_SSE]))
     assert out == {"cached": 2.0, "input": 10.0, "output": 7.0, "cache_write": 0.0}
