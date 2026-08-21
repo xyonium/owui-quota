@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.13
+version: 0.5.14
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2262,6 +2262,7 @@ async function loadAdmin(){
   ['secDash','secUsers','secModels','secRecent','secGeneral','secSchedule','secPricing','secGroups','secUserq','secPricingEditor','secTou'].forEach(id=>$(id).hidden=false);
   renderMeta();renderConfig();renderGroups();renderUsersQ();renderTou();initSpanUI();
   await loadStats();
+  loadRecent();  // feed auto-refreshes on page load; Refresh button is a manual re-pull
 }
 function renderMeta(){
   const p=STATE.pricing||{};
