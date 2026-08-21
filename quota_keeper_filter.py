@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.10
+version: 0.4.11
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -835,10 +835,13 @@ class Filter:
 
     # -- helpers ------------------------------------------------------------
 
-    def _mark_seen(self, key: str) -> bool:
+    def _mark_seen(self, key: str, model: str = "", channel: str = "api") -> bool:
         if key in self._seen:
             return False
-        self._seen[key] = True
+        # store the model/channel recorded first so later topups for the same
+        # response (stream-end outlet) reuse the same name instead of falling
+        # back to an upstream-echoed alias (prx.*) from the outlet body
+        self._seen[key] = (model, channel)
         while len(self._seen) > 4096:
             self._seen.popitem(last=False)
         return True
@@ -854,9 +857,16 @@ class Filter:
                 self._orphan.popitem(last=False)
             return
         rid = rid or f"{time.time_ns()}"
-        if not self._mark_seen(rid):
+        if not self._mark_seen(rid, model, channel):
             return
         qk_record_usage(user, model, tok, channel=channel)
+
+    def _seen_info(self, key: str):
+        """(model, channel) recorded first for a response id, for topup reuse."""
+        v = self._seen.get(key)
+        if isinstance(v, tuple) and len(v) == 2:
+            return v
+        return None, None
 
     # -- enforcement ----------------------------------------------------------
 
@@ -939,14 +949,20 @@ class Filter:
             if tok is None:
                 return event
             rid = str(ev.get("id") or f"stream-{time.time_ns()}")
-            # prefer the real model name over the upstream-echoed alias (see outlet)
+            # prefer the real model name over the upstream-echoed alias (see
+            # outlet); strip the provider prefix (cli-proxy-api "prx.") when
+            # model_name is missing so the fallback still prices the real model
             model = str((__metadata__ or {}).get("model_name") or ev.get("model") or "unknown")
+            if model.startswith("prx."):
+                model = model[4:]
             chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"
             # mark the message id so the stream-end outlet call (0.11) tops up
-            # instead of double-recording (its rid is the message id, not rid)
+            # instead of double-recording (its rid is the message id, not rid).
+            # Store the same (model, channel) pair used for rid so the topup
+            # can reuse the real model name (outlet body echoes the alias).
             _mid = (__metadata__ or {}).get("message_id")
             if _mid:
-                self._seen_msgids[str(_mid)] = True
+                self._seen_msgids[str(_mid)] = (model, chan)
                 while len(self._seen_msgids) > 4096:
                     self._seen_msgids.popitem(last=False)
             if rid in self._seen:
@@ -992,6 +1008,12 @@ class Filter:
             # resolved name. Recording the alias would price it separately (and
             # often unpriced) and double-list one request under two names.
             model = str((__metadata__ or {}).get("model_name") or body.get("model") or "unknown")
+            # metadata.model_name can be missing on some connectors (the 15:01
+            # phantom alias row was exactly this): the upstream-echoed alias
+            # carries a provider prefix (cli-proxy-api prefix_id "prx.") --
+            # strip it so the underlying model name is priced/aggregated.
+            if model.startswith("prx."):
+                model = model[4:]
             chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"
             if tok is not None:
                 # 0.11 also runs outlet at the END of a streaming chat, with a
@@ -1002,6 +1024,13 @@ class Filter:
                 # A non-streaming request never runs stream(), so its message id
                 # is absent and it records exactly once here.
                 if rid and rid in self._seen_msgids:
+                    # topup for an already-recorded response: reuse the model
+                    # name it was recorded under (the outlet body echoes the
+                    # upstream alias prx.* while stream() recorded the real
+                    # name), otherwise the topup lands under a phantom alias
+                    smodel, _schan = self._seen_msgids[rid]
+                    if smodel:
+                        model = smodel
                     qk_record_usage(__user__ or {}, model, tok, count_request=False, channel=chan)
                 else:
                     self._record(__user__ or {}, model, tok, rid, channel=chan)

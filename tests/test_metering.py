@@ -249,6 +249,68 @@ def test_stream_then_outlet_does_not_double_record(qk):
     assert rec["items"][0]["model"] == "gemini-3.7-flash"
 
 
+def test_stream_then_outlet_topup_reuses_real_name_without_model_name(qk, tmp_path):
+    """Regression (v0.5.2): stream() records the real name; the stream-end
+    outlet topup gets metadata WITHOUT model_name and an outlet body whose
+    model echoes the alias (prx.gemini-flash). The topup must merge into the
+    already-recorded real-name row, not create a phantom alias row with
+    req=0 + unpriced."""
+    from tests.conftest import write_json
+    from pathlib import Path
+    write_json(Path(qk.QK_PRICING_PATH), {"table": {
+        "gemini-flash": {"input": 0.5, "output": 1.5, "cached": 0.1, "cache_write": 0.1}}})
+    f = qk.Filter()
+    import asyncio
+    md = {"chat_id": "chat-9", "session_id": "s", "message_id": "msg-1",
+          "user_id": "u1"}  # NO model_name (production metadata)
+    asyncio.run(f.stream({"id": "chatcmpl-ABC", "model": "prx.gemini-flash",
+                          "usage": {"prompt_tokens": 4226, "completion_tokens": 756}},
+                         __user__=_user(), __metadata__=md))
+    outlet_body = {"model": "prx.gemini-flash", "id": "msg-1",
+                   "messages": [{"role": "user", "content": "hi"},
+                                {"id": "msg-1", "role": "assistant", "content": "ok",
+                                 "usage": {"prompt_tokens": 4226, "completion_tokens": 756}}],
+                   "chat_id": "chat-9", "session_id": "s"}
+    asyncio.run(f.outlet(outlet_body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1                      # not 2
+    # stream() had no model_name so it recorded the prx-stripped fallback
+    # (gemini-flash); the topup must reuse that same name, not prx.gemini-flash
+    assert set(d["models"]) == {"gemini-flash"}     # no phantom alias row
+    mm = d["models"]["gemini-flash"]
+    assert mm["unpriced_requests"] == 0            # no phantom unpriced
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {})
+    assert len(rec["items"]) == 1
+    assert rec["items"][0]["model"] == "gemini-flash"
+
+
+def test_outlet_orphan_alias_model_stripped(qk, tmp_path):
+    """Regression (v0.5.2): outlet with an unmatched message id (metadata
+    model_name missing, stream() mark never saw this id) records the request
+    directly. The body.model echoes the alias prx.*; it must be stripped to
+    the underlying name so the row is priced, not a phantom unpriced alias."""
+    # price the stripped name so unpriced_requests must be 0 after the fix
+    from tests.conftest import write_json
+    from pathlib import Path
+    write_json(Path(qk.QK_PRICING_PATH), {"table": {
+        "gemini-flash": {"input": 0.5, "output": 1.5, "cached": 0.1, "cache_write": 0.1}}})
+    f = qk.Filter()
+    import asyncio
+    md = {"chat_id": "", "session_id": "s", "message_id": "msg-9", "user_id": "u1"}
+    body = {"model": "prx.gemini-flash", "id": "msg-9",
+            "messages": [{"role": "user", "content": "hi"},
+                         {"id": "msg-9", "role": "assistant", "content": "ok",
+                          "usage": {"prompt_tokens": 11, "completion_tokens": 7}}],
+            "chat_id": "", "session_id": "s"}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert set(d["models"]) == {"gemini-flash"}
+    assert d["models"]["gemini-flash"]["unpriced_requests"] == 0
+    assert d["channels"] == {"webui": 0, "api": 1}
+
+
 def test_outlet_message_usage_falls_back_to_body_model(qk):
     """Non-streaming 0.11 body still records via messages[-1].usage. OWUI's
     metadata has no model_name field, so the model name comes from body.model
@@ -267,7 +329,9 @@ def test_outlet_message_usage_falls_back_to_body_model(qk):
     led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
     d = list(led["users"]["u1"]["days"].values())[0]
     assert d["requests"] == 1
-    assert set(d["models"]) == {"prx.gemini-flash"}   # body.model fallback
+    # v0.5.2: the body.model fallback strips the provider prefix (prx.*) so
+    # the alias never pollutes the ledger as a phantom unpriced model
+    assert set(d["models"]) == {"gemini-flash"}   # body.model fallback, prx stripped
     assert d["channels"] == {"webui": 0, "api": 1}
     # model_name (when present) takes precedence
     f2 = qk.Filter()
@@ -275,4 +339,4 @@ def test_outlet_message_usage_falls_back_to_body_model(qk):
     asyncio.run(f2.outlet(dict(body, id="msg-2"), __user__=_user(), __metadata__=md2))
     led2 = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
     d2 = list(led2["users"]["u1"]["days"].values())[0]
-    assert set(d2["models"]) == {"prx.gemini-flash", "gemini-3.7-flash"}
+    assert set(d2["models"]) == {"gemini-flash", "gemini-3.7-flash"}
