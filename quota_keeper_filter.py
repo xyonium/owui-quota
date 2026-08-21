@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.13
+version: 0.4.14
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -649,10 +649,13 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
                 "requests": 0,
                 "cost_usd": 0.0,
                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "channels": {"webui": 0, "api": 0},
             },
         )
         if count_request:
             h["requests"] = h.get("requests", 0) + 1
+            hch = h.setdefault("channels", {"webui": 0, "api": 0})
+            hch[channel if channel in hch else "api"] = hch.get(channel if channel in hch else "api", 0) + 1
         h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)

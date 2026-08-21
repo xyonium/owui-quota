@@ -743,8 +743,29 @@ def test_stats_window_24h(load_admin, monkeypatch):
          "cost_usd": 99.0, "tou_tier": "normal", "priced": True, "channel": "webui"},
     ]
     write_json(Path(adm.QK_RECENT_PATH), {"items": items})
+    # v0.5.12: KPI totals come from the ledger's hourly buckets (exact, no
+    # 200-ring cap). recent.json still drives the per-user/per-model tables.
+    # item1 (1h ago) = 2026-08-19 23:16 CST -> day 2026-08-19 hour 23;
+    # item2 (23h ago) = 2026-08-19 01:16 CST -> day 2026-08-19 hour 1;
+    # item3 (25h ago) = 2026-08-18 23:16 CST -> outside the window.
     write_json(Path(adm.QK_LEDGER_PATH),
-               {"users": {"u1": {"name": "A", "email": "a@x", "days": {}}}})
+               {"users": {"u1": {"name": "A", "email": "a@x", "days": {
+                   "2026-08-19": {
+                       "models": {"m/y": {"unpriced_requests": 1}},
+                       "hours": {
+                           "23": {"requests": 1, "cost_usd": 0.01,
+                                  "tokens": {"cached": 0.0, "input": 100.0, "output": 50.0},
+                                  "channels": {"webui": 1, "api": 0}},
+                           "1": {"requests": 1, "cost_usd": 0.02,
+                                 "tokens": {"cached": 10.0, "input": 90.0, "output": 40.0},
+                                 "channels": {"webui": 0, "api": 1}},
+                       }},
+                   "2026-08-18": {"hours": {
+                       "23": {"requests": 1, "cost_usd": 99.0,
+                              "tokens": {"cached": 0.0, "input": 5.0, "output": 5.0},
+                              "channels": {"webui": 1, "api": 0}},
+                   }},
+               }}}})
 
     out = adm.qk_stats_window(now_ts - 86400)
     assert out["kpi"]["requests"] == 2

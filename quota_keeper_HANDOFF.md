@@ -305,6 +305,11 @@ v0.5.9 新增：
 
 31. **热重载后中间件仍是旧代码（output=0 持续）**（admin v0.5.9）：0.5.8 的 message_delta 顶层 usage 修复部署后 output 仍 0——原因：中间件挂载用 `app.state.quota_keeper_ingest_mw` 标志防重，热重载时标志为 True → **跳过重挂**，进程里跑的还是旧中间件（无顶层 usage 分支）。修：**每次 mount 都重挂**——从 `user_middleware` 移除旧实例（按 dispatch 是当前模块函数对象）再 append 新实例 + 重建栈；`QK_INGEST_MARK`（request.state）兜底防双记。**注意**：热重载后模块函数对象变了，旧实例靠 `is` 删不掉（不同对象），但新 append 的会先跑？不——中间件顺序是 append 顺序，旧的在内层先跑仍 output=0。**根治仍需重启 OWUI**（进程内旧模块无法替换）；v2 逻辑保证**重启后**热重载不再踩坑。**真机经验：改中间件代码后必须重启 OWUI，热重载不会替换已挂的中间件函数。**
 
+
+v0.5.12 新增：
+
+32. **24h KPI 卡 200（recent 环形缓冲上限）**（filter v0.4.14 / admin v0.5.12 修复）：24h 视图的 KPI 从 recent.json 统计，而 recent 是 200 条环形缓冲 → 24h 内请求超 200 时 KPI 卡在 200（`window_partial` 标记但数字假）。修：`qk_stats_window` 的 **KPI 改从 ledger 的 hours 桶聚合**（精确、无截断；hours 桶新增 `channels` 字段，filter + admin 记账时同步写入）。recent 仍驱动 per-user/per-model 明细表和序列（截断仍以 `window_partial` 标记）。**模型过滤时** hours 桶不可用（跨模型）→ 回退 recent 累加。unpriced 从 day 级 models 按"窗口内有 hours 桶的 day"聚合。**注意**：hours 桶是整小时聚合，滚动窗口的当前部分小时会被整算（近似，可接受）。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。

@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.11
+version: 0.5.12
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -856,10 +856,13 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
                 "requests": 0,
                 "cost_usd": 0.0,
                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "channels": {"webui": 0, "api": 0},
             },
         )
         if count_request:
             h["requests"] = h.get("requests", 0) + 1
+            hch = h.setdefault("channels", {"webui": 0, "api": 0})
+            hch[channel if channel in hch else "api"] = hch.get(channel if channel in hch else "api", 0) + 1
         h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
@@ -1359,6 +1362,65 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
            "cost_usd": 0.0, "unpriced_requests": 0, "channels": {"webui": 0, "api": 0}}
     series, urows, mrows = {}, {}, {}
     series_rt = {}  # bucket -> {"requests": n, "tokens": t}
+    # v0.5.12: KPI totals come from the LEDGER's hourly buckets (exact, no
+    # 200-entry ring-buffer cap). recent.json still drives the per-user /
+    # per-model tables and the series (partial beyond 200 is surfaced via
+    # kpi.window_partial). Hour buckets are keyed by local (schedule-tz)
+    # day+hour; the rolling window includes every bucket whose hour boundary
+    # falls inside [wstart, now], so the current partial hour is included.
+    led_all = qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}
+    now_dt = qk_local_now(cfg)
+    # hour buckets are cross-model, so a model filter can't use them for KPI —
+    # fall back to the recent-based loop below (kpi stays 0 here and recent
+    # re-accumulates it when a model filter is active).
+    if not model:
+        for uid, u in led_all.items():
+            if user and user not in (uid, (u or {}).get("name", ""), (u or {}).get("email", "")):
+                continue
+            for day, drec in ((u or {}).get("days") or {}).items():
+                drec = drec or {}
+                for hour_str, hrec in ((drec.get("hours") or {}).items()):
+                    try:
+                        bts = datetime.strptime(f"{day}T{int(hour_str):02d}", "%Y-%m-%dT%H").replace(
+                            tzinfo=now_dt.tzinfo).timestamp()
+                    except Exception:
+                        continue
+                    if bts < wstart or bts > now_dt.timestamp():
+                        continue
+                    if not isinstance(hrec, dict):
+                        continue
+                    kpi["requests"] += hrec.get("requests", 0) or 0
+                    kpi["cost_usd"] += hrec.get("cost_usd", 0) or 0
+                    for k in ("cached", "input", "output"):
+                        kpi["tokens"][k] += (hrec.get("tokens") or {}).get(k, 0) or 0
+                    hch = hrec.get("channels") or {}
+                    for cname, cnt in hch.items():
+                        if cname in kpi["channels"]:
+                            kpi["channels"][cname] += cnt or 0
+    # unpriced_requests is not in the hour buckets (day/model level only).
+    # Include a day's unpriced count when ANY of its hour buckets falls inside
+    # the rolling window (a day whose first hour is before wstart still has
+    # hours inside it — excluding by the day boundary under-counts).
+    if not model:
+        for uid, u in led_all.items():
+            if user and user not in (uid, (u or {}).get("name", ""), (u or {}).get("email", "")):
+                continue
+            for day, drec in ((u or {}).get("days") or {}).items():
+                drec = drec or {}
+                in_window = False
+                for hour_str in (drec.get("hours") or {}):
+                    try:
+                        bts = datetime.strptime(f"{day}T{int(hour_str):02d}", "%Y-%m-%dT%H").replace(
+                            tzinfo=now_dt.tzinfo).timestamp()
+                    except Exception:
+                        continue
+                    if wstart <= bts <= now_dt.timestamp():
+                        in_window = True
+                        break
+                if not in_window:
+                    continue
+                for mm in (drec.get("models") or {}).values():
+                    kpi["unpriced_requests"] += (mm or {}).get("unpriced_requests", 0) or 0
     for it in items:
         try:
             ts = float(it.get("ts") or 0)
@@ -1376,12 +1438,16 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
         cost = float(it.get("cost_usd") or 0.0)
         priced = it.get("priced", True)
         chan = it.get("channel") if it.get("channel") in ("webui", "api") else "api"
-        kpi["requests"] += 1
-        kpi["cost_usd"] += cost
-        kpi["unpriced_requests"] += 0 if priced else 1
-        kpi["channels"][chan] += 1
-        for k in ("cached", "input", "output"):
-            kpi["tokens"][k] += float(tok.get(k) or 0.0)
+        # KPI totals come from the ledger hours buckets above (exact). With a
+        # model filter the hour buckets can't be used (they're cross-model), so
+        # fall back to accumulating from recent here.
+        if model:
+            kpi["requests"] += 1
+            kpi["cost_usd"] += cost
+            kpi["unpriced_requests"] += 0 if priced else 1
+            kpi["channels"][chan] += 1
+            for k in ("cached", "input", "output"):
+                kpi["tokens"][k] += float(tok.get(k) or 0.0)
         row = urows.get(uid)
         if row is None:
             info = users_by_id.get(uid) or {}
@@ -1439,6 +1505,8 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
             break
         except Exception:
             continue
+    # KPI totals are exact (ledger); the per-user/per-model TABLES below are
+    # still recent-limited, so keep the partial flag for those.
     kpi["window_partial"] = bool(oldest is not None and oldest > wstart and len(items) >= 200)
     for row in urows.values():
         row["models"] = len(row["models"])
