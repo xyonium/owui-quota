@@ -138,6 +138,104 @@ def test_me_requires_auth(load_admin):
     assert c.get("/api/v1/quota-keeper/me").status_code == 401
 
 
+def test_recent_mine_filters_and_strips(qk, load_admin, monkeypatch):
+    _stub_self_user(monkeypatch, uid="u1", role="user")
+    for i in range(3):
+        qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, f"m/{i}",
+                           {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    qk.qk_record_usage({"id": "u2", "name": "V", "email": "v@x"}, "m/other",
+                       {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    c, _ = _app(load_admin)
+    r = c.get("/api/v1/quota-keeper/recent?mine=1")
+    assert r.status_code == 200
+    items = r.json()["items"]
+    assert len(items) == 3
+    assert all(it["user_id"] == "u1" for it in items)
+    assert all("email" not in it for it in items)
+
+
+def test_recent_mine_caps_at_50(qk, load_admin, monkeypatch):
+    _stub_self_user(monkeypatch, uid="u1", role="user")
+    for i in range(60):
+        qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, f"m/{i}",
+                           {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    c, _ = _app(load_admin)
+    items = c.get("/api/v1/quota-keeper/recent?mine=1").json()["items"]
+    assert len(items) == 50
+    assert items[0]["model"] == "m/59"   # newest first preserved
+
+
+def test_models_mine_own_models_with_prices(qk, load_admin, monkeypatch):
+    _stub_self_user(monkeypatch, uid="u1", role="user")
+    qk.qk_atomic_write(qk.QK_PRICING_PATH, {"table": {"m/x": {"input": 1.0, "output": 2.0}}})
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, "m/x",
+                       {"cached": 0, "input": 10, "output": 5, "cache_write": 0})
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, "m/unpriced",
+                       {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    qk.qk_record_usage({"id": "u2", "name": "V", "email": "v@x"}, "m/theirs",
+                       {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    c, _ = _app(load_admin)
+    r = c.get("/api/v1/quota-keeper/models?mine=1")
+    assert r.status_code == 200
+    items = {it["model"]: it for it in r.json()["items"]}
+    assert set(items) == {"m/x", "m/unpriced"}       # u2's m/theirs absent
+    assert items["m/x"]["matched"] is True
+    assert items["m/x"]["price"]["input"] == 1.0
+    assert items["m/unpriced"]["matched"] is False
+    assert items["m/unpriced"]["price"] is None
+    assert items["m/x"]["requests"] == 1             # own aggregate only
+
+
+def test_models_admin_unchanged(qk, load_admin, monkeypatch):
+    # admin without ?mine sees all users' models (existing behavior)
+    _stub_webui_auth(monkeypatch)
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, "m/x",
+                       {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    qk.qk_record_usage({"id": "u2", "name": "V", "email": "v@x"}, "m/y",
+                       {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    c, _ = _app(load_admin)
+    items = c.get("/api/v1/quota-keeper/models").json()["items"]
+    assert {it["model"] for it in items} == {"m/x", "m/y"}
+
+
+def test_me_usage_own_data_only(qk, load_admin, monkeypatch):
+    _stub_self_user(monkeypatch, uid="u1")
+    qk.qk_atomic_write(qk.QK_PRICING_PATH, {"table": {"m/x": {"input": 1.0, "output": 2.0}}})
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, "m/x",
+                       {"cached": 10, "input": 90, "output": 50, "cache_write": 0},
+                       now=datetime(2026, 8, 20, 12, 0), channel="webui")
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, "m/y",
+                       {"cached": 0, "input": 10, "output": 10, "cache_write": 0},
+                       now=datetime(2026, 8, 21, 9, 0), channel="api")
+    qk.qk_record_usage({"id": "u2", "name": "V", "email": "v@x"}, "m/z",
+                       {"cached": 0, "input": 999, "output": 999, "cache_write": 0},
+                       now=datetime(2026, 8, 21, 9, 0), channel="api")
+    c, adm = _app(load_admin)
+    monkeypatch.setattr(adm, "qk_local_now", lambda cfg: datetime(2026, 8, 21, 12, 0))
+
+    r = c.get("/api/v1/quota-keeper/me/usage?span=7d")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["span"] == "7d"
+    assert len(body["trend"]) == 7
+    assert body["trend"][-1]["day"] == "2026-08-21"
+    assert body["trend"][-1]["requests"] == 1          # only u1, not u2
+    assert body["channels"] == {"webui": 1, "api": 1}  # u2's api not counted
+    models = {m["model"]: m for m in body["models"]}
+    assert set(models) == {"m/x", "m/y"}               # u2's m/z absent
+    assert models["m/x"]["tokens"]["cached"] == 10.0
+    # cost desc: m/x (0.00028) before m/y (0.00004)
+    assert [m["model"] for m in body["models"]] == ["m/x", "m/y"]
+
+    r = c.get("/api/v1/quota-keeper/me/usage?span=30d")
+    assert len(r.json()["trend"]) == 30
+
+
+def test_me_usage_requires_auth(load_admin):
+    c, _ = _app(load_admin)
+    assert c.get("/api/v1/quota-keeper/me/usage").status_code == 401
+
+
 # ---- /stats -------------------------------------------------------------------
 
 
@@ -162,7 +260,9 @@ def test_stats_aggregates(qk, load_admin, monkeypatch):
     assert out["users"][0]["quota_source"] in ("user", "group", "default", "none")
     assert out["users"][0]["multiplier"] == 1.0
     # recorded under the pinned clock, so the day bucket is deterministic
-    assert out["series"] == [{"bucket": "2026-08-17", "by_model": {"m/x": 1.9e-4}}]
+    assert out["series"] == [{"bucket": "2026-08-17", "cost": {"m/x": 1.9e-4},
+                              "requests": 1, "tokens": 150.0}]
+    assert out["kpi"]["channels"] == {"webui": 0, "api": 1}  # record_usage default channel=api
 
 
 def test_stats_per_user_models_count_only_own_models(qk, load_admin):
@@ -194,13 +294,13 @@ def test_stats_hour_granularity_buckets(qk, load_admin):
     adm = load_admin()
     out = adm.qk_stats(from_=None, to=None, user=None, model=None, granularity="hour")
     assert out["series"] == [
-        {"bucket": "2026-08-17T09", "by_model": {"_": 1.9e-4}},
-        {"bucket": "2026-08-17T14", "by_model": {"_": 1.9e-4}},
+        {"bucket": "2026-08-17T09", "cost": {"_": 1.9e-4}, "requests": 1, "tokens": 150.0},
+        {"bucket": "2026-08-17T14", "cost": {"_": 1.9e-4}, "requests": 1, "tokens": 150.0},
     ]
     # day granularity: per-model cost under the day bucket
     out = adm.qk_stats(from_=None, to=None, user=None, model=None, granularity="day")
     assert out["series"] == [
-        {"bucket": "2026-08-17", "by_model": {"m/x": 3.8e-4}},
+        {"bucket": "2026-08-17", "cost": {"m/x": 3.8e-4}, "requests": 2, "tokens": 300.0},
     ]
 
 
@@ -217,7 +317,7 @@ def test_stats_filters(qk, load_admin):
     assert [m["model"] for m in out["models"]] == ["m/x"]
     assert out["kpi"]["requests"] == 1
     # regression: model-filtered day series must match kpi cost (was 2x before)
-    s = out["series"][0]["by_model"]["m/x"]
+    s = out["series"][0]["cost"]["m/x"]
     assert abs(s - out["kpi"]["cost_usd"]) < 1e-12
     out = adm.qk_stats(from_="2026-08-15", to="2026-08-15")
     assert out["kpi"]["requests"] == 1
@@ -225,6 +325,20 @@ def test_stats_filters(qk, load_admin):
     assert out["kpi"]["requests"] == 2
     out = adm.qk_stats(user="nobody")
     assert out["users"] == [] and out["kpi"]["requests"] == 0
+
+
+def test_stats_kpi_channels_follow_model_filter(qk, load_admin):
+    # model filter scopes kpi.channels to that model's contribution; unfiltered
+    # aggregates the whole span (both record_usage calls default channel=api)
+    qk.qk_record_usage({"id": "u1", "name": "A", "email": "a@x"}, "m/x",
+                       {"cached": 0, "input": 10, "output": 10, "cache_write": 0})
+    qk.qk_record_usage({"id": "u1", "name": "A", "email": "a@x"}, "m/other",
+                       {"cached": 0, "input": 10, "output": 10, "cache_write": 0})
+    adm = load_admin()
+    out = adm.qk_stats(model="m/x")
+    assert out["kpi"]["channels"] == {"webui": 0, "api": 1}
+    out = adm.qk_stats()
+    assert out["kpi"]["channels"] == {"webui": 0, "api": 2}
 
 
 def test_stats_endpoint_via_http(qk, load_admin, monkeypatch):
@@ -254,7 +368,8 @@ def test_stats_forbidden_for_plain_user(load_admin, monkeypatch):
     _stub_self_user(monkeypatch, role="user")
     c, _ = _app(load_admin)
     assert c.get("/api/v1/quota-keeper/stats").status_code == 403
-    assert c.get("/api/v1/quota-keeper/recent").status_code == 403
+    # /recent is no longer admin-only: a plain user gets their own feed
+    assert c.get("/api/v1/quota-keeper/recent").status_code == 200
 
 
 # ---- /pricing summary ----------------------------------------------------------
@@ -431,11 +546,16 @@ def test_page_is_login_gated_not_admin_gated(load_admin, monkeypatch):
     assert page.status_code == 200, "non-admin must be able to load the page"
     assert "renderPersonal" in page.text  # the role-split branch ships in the SPA
     assert client.get("/api/v1/quota-keeper/me").status_code == 200
-    # ...but the admin surface stays closed to them
-    for path in ("/config", "/users", "/groups", "/ledger", "/pricing",
-                 "/recent", "/stats", "/models"):
+    # ...but the admin surface stays closed to them. /recent and /models are
+    # now self-service (own-data-only via the server-enforced filter), so they
+    # return 200 here; the rest must stay admin-only.
+    for path in ("/config", "/users", "/groups", "/ledger", "/pricing", "/stats"):
         r = client.get(f"/api/v1/quota-keeper{path}")
         assert r.status_code == 403, f"{path} must stay admin-only (got {r.status_code})"
+    # self-service endpoints reachable but scoped to the caller
+    assert client.get("/api/v1/quota-keeper/recent?mine=1").status_code == 200
+    assert client.get("/api/v1/quota-keeper/models?mine=1").status_code == 200
+    assert client.get("/api/v1/quota-keeper/me/usage").status_code == 200
 
 
 def test_unauthenticated_requests_401(load_admin, monkeypatch):
@@ -641,6 +761,14 @@ def test_stats_window_24h(load_admin, monkeypatch):
     assert models["m/y"]["unpriced_requests"] == 1
     # series bucketed by local hour: item2 at 01:16 local yesterday
     assert any(b["bucket"].endswith("T01") for b in out["series"])
+    # window series also carries per-bucket requests/tokens; kpi aggregates channels
+    assert out["kpi"]["channels"] == {"webui": 1, "api": 1}
+    b0 = out["series"][0]
+    assert set(("bucket", "cost", "requests", "tokens")) <= set(b0)
+    assert all(set(b["cost"]) == {"_"} for b in out["series"])
+    assert sum(b["requests"] for b in out["series"]) == 2  # 25h-old item trimmed out
+    # item1 tokens 0+100+50=150, item2 10+90+40=140
+    assert abs(sum(b["tokens"] for b in out["series"]) - (150.0 + 140.0)) < 1e-9
     # filters still apply
     assert adm.qk_stats_window(now_ts - 86400, model="m/y")["kpi"]["requests"] == 1
     assert adm.qk_stats_window(now_ts - 86400, user="nobody")["kpi"]["requests"] == 0

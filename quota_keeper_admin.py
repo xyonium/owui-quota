@@ -705,8 +705,10 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
         "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
         "cost_usd": 0.0,
         "unpriced_requests": 0,
+        "channels": {"webui": 0, "api": 0},
     }
     series, users_rows, models_rows = {}, [], {}
+    series_rt = {}  # bucket -> {"requests": n, "tokens": t} (per-bucket KPI trends)
     cfg = qk_get_config()
     from_s = from_ or "0000-00-00"
     to_s = to or "9999-99-99"
@@ -749,10 +751,14 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
                 for cname, cnt in ((mm.get("channels") or {}).items()):
                     if cname in row["channels"]:
                         row["channels"][cname] += cnt or 0
+                        kpi["channels"][cname] += cnt or 0
                 for k in ("cached", "input", "output"):
                     tk = (mm.get("tokens") or {}).get(k, 0) or 0
                     row["tokens"][k] += tk
                     kpi["tokens"][k] += tk
+                rt = series_rt.setdefault(day, {"requests": 0, "tokens": 0.0})
+                rt["requests"] += mm.get("requests", 0)
+                rt["tokens"] += sum((mm.get("tokens") or {}).get(k, 0) or 0 for k in ("cached", "input", "output"))
                 day_ms = {model: mm}
             else:
                 row["requests"] += drec.get("requests", 0)
@@ -763,10 +769,14 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
                 for cname, cnt in ((drec.get("channels") or {}).items()):
                     if cname in row["channels"]:
                         row["channels"][cname] += cnt or 0
+                        kpi["channels"][cname] += cnt or 0
                 for k in ("cached", "input", "output"):
                     tk = (drec.get("tokens") or {}).get(k, 0) or 0
                     row["tokens"][k] += tk
                     kpi["tokens"][k] += tk
+                rt = series_rt.setdefault(day, {"requests": 0, "tokens": 0.0})
+                rt["requests"] += drec.get("requests", 0)
+                rt["tokens"] += sum((drec.get("tokens") or {}).get(k, 0) or 0 for k in ("cached", "input", "output"))
             for m, mm in day_ms.items():
                 row["models"].add(m)
                 mk = models_rows.setdefault(
@@ -804,6 +814,13 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
                     series[bkey]["_"] = series[bkey].get("_", 0) + (
                         (hrec.get("cost_usd") or 0) if isinstance(hrec, dict) else 0
                     )
+                    rt = series_rt.setdefault(bkey, {"requests": 0, "tokens": 0.0})
+                    if isinstance(hrec, dict):
+                        rt["requests"] += hrec.get("requests", 0) or 0
+                        rt["tokens"] += sum(
+                            (hrec.get("tokens") or {}).get(k, 0) or 0
+                            for k in ("cached", "input", "output")
+                        )
         kpi["requests"] += row["requests"]
         kpi["cost_usd"] += row["cost_usd"]
         kpi["unpriced_requests"] += row["unpriced_requests"]
@@ -817,7 +834,12 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
         mk["blended_per_m"] = (mk["cost_usd"] * 1e6 / tot) if tot else 0.0
     return {
         "kpi": kpi,
-        "series": [{"bucket": b, "by_model": v} for b, v in sorted(series.items())],
+        "series": [
+            {"bucket": b, "cost": v,
+             "requests": (series_rt.get(b) or {}).get("requests", 0),
+             "tokens": (series_rt.get(b) or {}).get("tokens", 0.0)}
+            for b, v in sorted(series.items())
+        ],
         "users": users_rows,
         "models": sorted(models_rows.values(), key=lambda x: -x["cost_usd"]),
     }
@@ -845,8 +867,9 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
     users_by_id = {uid: (u or {}) for uid, u in
                    (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}).items()}
     kpi = {"requests": 0, "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
-           "cost_usd": 0.0, "unpriced_requests": 0}
+           "cost_usd": 0.0, "unpriced_requests": 0, "channels": {"webui": 0, "api": 0}}
     series, urows, mrows = {}, {}, {}
+    series_rt = {}  # bucket -> {"requests": n, "tokens": t}
     for it in items:
         try:
             ts = float(it.get("ts") or 0)
@@ -867,6 +890,7 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
         kpi["requests"] += 1
         kpi["cost_usd"] += cost
         kpi["unpriced_requests"] += 0 if priced else 1
+        kpi["channels"][chan] += 1
         for k in ("cached", "input", "output"):
             kpi["tokens"][k] += float(tok.get(k) or 0.0)
         row = urows.get(uid)
@@ -914,6 +938,9 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
         bkey = datetime.fromtimestamp(ts, qk_local_now(cfg).tzinfo).strftime("%Y-%m-%dT%H")
         sb = series.setdefault(bkey, {})
         sb["_"] = sb.get("_", 0) + cost
+        rt = series_rt.setdefault(bkey, {"requests": 0, "tokens": 0.0})
+        rt["requests"] += 1
+        rt["tokens"] += sum(float(tok.get(k) or 0.0) for k in ("cached", "input", "output"))
     ci = kpi["tokens"]["cached"] + kpi["tokens"]["input"]
     kpi["cache_rate"] = (kpi["tokens"]["cached"] / ci) if ci else 0.0
     oldest = None
@@ -932,7 +959,12 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
         mk["blended_per_m"] = (mk["cost_usd"] * 1e6 / tot) if tot else 0.0
     return {
         "kpi": kpi,
-        "series": [{"bucket": b, "by_model": v} for b, v in sorted(series.items())],
+        "series": [
+            {"bucket": b, "cost": v,
+             "requests": (series_rt.get(b) or {}).get("requests", 0),
+             "tokens": (series_rt.get(b) or {}).get("tokens", 0.0)}
+            for b, v in sorted(series.items())
+        ],
         "users": list(urows.values()),
         "models": sorted(mrows.values(), key=lambda x: -x["cost_usd"]),
     }
@@ -1284,6 +1316,7 @@ QK_PAGE = r"""<!doctype html>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Quota Keeper</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f172a'/%3E%3Cpath d='M8 20a8 8 0 0 1 16 0' fill='none' stroke='%2338bdf8' stroke-width='2.4' stroke-linecap='round'/%3E%3Cline x1='16' y1='20' x2='21' y2='13.5' stroke='%2338bdf8' stroke-width='2.4' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='20' r='2' fill='%2338bdf8'/%3E%3C/svg%3E"/>
 <style>
 :root{--bg:#0f172a;--card:#1e293b;--line:#334155;--txt:#e2e8f0;--mut:#94a3b8;--acc:#38bdf8;--ok:#34d399;--warn:#fbbf24;--bad:#f87171}
 *{box-sizing:border-box}
@@ -2513,10 +2546,17 @@ async def api_pricing(request: Request):
     return JSONResponse({k: cache.get(k) for k in ("url", "fetched_at_iso", "models")})
 
 
-@qk_router.get("/recent", dependencies=[Depends(_require_admin)])
-async def api_recent(request: Request):
+@qk_router.get("/recent")
+async def api_recent(request: Request, user=Depends(_require_user)):
     rec = qk_load_json(QK_RECENT_PATH, {"items": []})
-    return JSONResponse({"items": list(reversed(rec.get("items") or []))})
+    items = list(reversed(rec.get("items") or []))
+    # self-service: non-admins (or an explicit ?mine=1) only ever see their own
+    # rows, capped at 50, with the email field stripped. Server-enforced: the
+    # caller's role/id decide, never a client-supplied filter.
+    if request.query_params.get("mine") == "1" or getattr(user, "role", "") != "admin":
+        items = [it for it in items if it.get("user_id") == user.id][:50]
+        items = [{k: v for k, v in it.items() if k != "email"} for it in items]
+    return JSONResponse({"items": items})
 
 
 @qk_router.get("/stats", dependencies=[Depends(_require_admin)])
@@ -2576,6 +2616,42 @@ async def api_me(request: Request, user=Depends(_require_user)):
     )
 
 
+@qk_router.get("/me/usage")
+async def api_me_usage(request: Request, user=Depends(_require_user)):
+    """Self-service per-model/usage view: the caller's own ledger days only,
+    never another user's. span=7d (default) or 30d."""
+    cfg = qk_get_config()
+    span = "30d" if request.query_params.get("span") == "30d" else "7d"
+    days_n = 30 if span == "30d" else 7
+    led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}).get(user.id) or {}
+    days = led.get("days") or {}
+    now = qk_local_now(cfg)
+    trend, channels, models = [], {"webui": 0, "api": 0}, {}
+    for i in range(days_n - 1, -1, -1):
+        kd = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        dd = days.get(kd) or {}
+        trend.append({"day": kd, "requests": dd.get("requests", 0),
+                      "cost_usd": dd.get("cost_usd", 0) or 0})
+        for cname, cnt in ((dd.get("channels") or {}).items()):
+            if cname in channels:
+                channels[cname] += cnt or 0
+        for m, mm in ((dd.get("models") or {}).items()):
+            mm = mm or {}
+            row = models.setdefault(m, {"model": m, "requests": 0,
+                                        "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                                        "cost_usd": 0.0})
+            row["requests"] += mm.get("requests", 0) or 0
+            row["cost_usd"] += mm.get("cost_usd", 0) or 0
+            for k in ("cached", "input", "output"):
+                row["tokens"][k] += (mm.get("tokens") or {}).get(k, 0) or 0
+    return JSONResponse({
+        "span": span,
+        "channels": channels,
+        "trend": trend,
+        "models": sorted(models.values(), key=lambda x: -x["cost_usd"]),
+    })
+
+
 @qk_router.post("/pricing/refresh", dependencies=[Depends(_require_admin)])
 async def api_refresh(request: Request):
     body = {}
@@ -2608,20 +2684,28 @@ async def api_reprice(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
-@qk_router.get("/models", dependencies=[Depends(_require_admin)])
-async def api_models(request: Request):
+@qk_router.get("/models")
+async def api_models(request: Request, user=Depends(_require_user)):
     """Models actually used (from the ledger's usage records -- these are
     the real upstream model ids), each with the resolved price, the
     matching strategy, and the configured override (if any). Backs the
     pricing editor; OWUI's /api/models is intentionally NOT included (it
-    mixes aliases, duplicates and stale entries nobody calls)."""
+    mixes aliases, duplicates and stale entries nobody calls).
+
+    Self-service: non-admins (or ?mine=1) only see models THEY used, with
+    requests/cost aggregated from their own days. The raw upstream pricing
+    table stays admin-only (/pricing); this only exposes the resolved
+    per-1M price for models the caller already used."""
     cfg = qk_get_config()
     ov = ((cfg.get("pricing") or {}).get("overrides")) or {}
     table = (qk_load_json(QK_PRICING_PATH, {}) or {}).get("table") or {}
 
+    mine = request.query_params.get("mine") == "1" or getattr(user, "role", "") != "admin"
     used = {}  # model -> {"requests": n, "unpriced_requests": n, "cost_usd": x}
     led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {})
-    for u in led.values():
+    for uid, u in led.items():
+        if mine and uid != user.id:
+            continue
         for d in (u.get("days") or {}).values():
             for m, mm in ((d or {}).get("models") or {}).items():
                 row = used.setdefault(m, {"requests": 0, "unpriced_requests": 0, "cost_usd": 0.0})
