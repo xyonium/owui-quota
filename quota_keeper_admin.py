@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.0
+version: 0.5.1
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -20,7 +20,7 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +101,31 @@ def qk_atomic_write(path: str, obj) -> None:
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp, path)
+
+
+class _JsonCache:
+    """mtime-keyed in-memory cache; refreshes automatically after any write."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._store = {}
+
+    def get(self, path: str, default):
+        try:
+            mtime = os.stat(path).st_mtime
+        except Exception:
+            return default
+        with self._lock:
+            ent = self._store.get(path)
+            if ent and ent[0] == mtime:
+                return ent[1]
+        data = qk_load_json(path, default)
+        with self._lock:
+            self._store[path] = (mtime, data)
+        return data
+
+
+JC = _JsonCache()
 
 
 try:
@@ -674,6 +699,417 @@ def qk_cost_usd(tok: dict, price) -> float:
         if isinstance(p, (int, float)):
             c += (tok.get(field) or 0.0) * float(p) / 1e6
     return c
+
+
+def qk_normalize_usage(u) -> Optional[dict]:
+    """Normalize OpenAI / Anthropic / Responses API / generic usage into
+    cached/input/output(+write). The OpenAI Responses API reports cache inside
+    `input_tokens_details.cached_tokens` and its `input_tokens` is the TOTAL
+    input (cache included); Anthropic's `input_tokens` excludes cache."""
+    if not isinstance(u, dict):
+        return None
+
+    def g(*keys):
+        for k in keys:
+            v = u.get(k)
+            if isinstance(v, (int, float)):
+                return float(v)
+        return None
+
+    pt = g("prompt_tokens")
+    ct = g("completion_tokens")
+    ai = g("input_tokens")
+    ao = g("output_tokens")
+    cr = g("cache_read_input_tokens")
+    cw = g("cache_creation_input_tokens")
+    cached_oai = None
+    ptd = u.get("prompt_tokens_details")
+    if isinstance(ptd, dict) and isinstance(ptd.get("cached_tokens"), (int, float)):
+        cached_oai = float(ptd["cached_tokens"])
+    itd = u.get("input_tokens_details")
+    if cached_oai is None and isinstance(itd, dict) and isinstance(itd.get("cached_tokens"), (int, float)):
+        cached_oai = float(itd["cached_tokens"])
+
+    if pt is not None:
+        cached = (cached_oai or 0.0) + (cr or 0.0)
+        inp = max(0.0, pt - cached)
+        out = ct if ct is not None else (ao or 0.0)
+    elif ai is not None or ao is not None:
+        # input_tokens and/or output_tokens; a lone output_tokens appears in
+        # Anthropic message_delta partial-usage events. For the Responses API
+        # input_tokens includes the cached part (only when cache came via
+        # input_tokens_details and Anthropic-style cache fields are absent).
+        cached = (cached_oai or 0.0) + (cr or 0.0)
+        inp = ai or 0.0
+        if cached_oai is not None and cr is None:
+            inp = max(0.0, inp - cached)
+        out = ao or 0.0
+    else:
+        return None
+    if inp == 0 and out == 0 and cached == 0 and not cw:
+        return None
+    return {"cached": cached, "input": inp, "output": out, "cache_write": cw or 0.0}
+
+
+def qk_prune_ledger(led: dict, cfg: dict) -> None:
+    try:
+        days = int(cfg.get("ledger_retention_days") or 0)
+    except Exception:
+        days = 0
+    if days <= 0:
+        return
+    # cutoff in the configured timezone so "today" is the same day the
+    # ledger buckets were written under (previously naive UTC)
+    cutoff = (qk_local_now(cfg) - timedelta(days=days)).strftime("%Y-%m-%d")
+    for uid in list((led.get("users") or {}).keys()):
+        udays = (led["users"].get(uid) or {}).get("days") or {}
+        for k in [k for k in udays if k < cutoff]:
+            udays.pop(k, None)
+
+
+def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True,
+                    now: datetime = None, channel: str = "api") -> None:
+    """Record one usage event (verbatim copy of the filter's writer — the
+    passthrough middleware meters direct API requests here). count_request=False
+    marks a partial-usage topup for an id that already recorded: tokens/cost
+    still accumulate but the request counters are not incremented again.
+    `channel` is "webui" when the request came through the web UI, else "api"."""
+    uid = (user or {}).get("id")
+    if not uid:
+        return
+    cfg = qk_get_config()
+    cache = JC.get(QK_PRICING_PATH, {}) or {}
+    table = cache.get("table") or {}
+    pconf = cfg.get("pricing") or {}
+    price, _how = qk_find_pricing(model, table, pconf.get("overrides"))
+    priced = price is not None
+    if price is None:
+        price = pconf.get("default_pricing")
+        priced = price is not None
+    base_cost = qk_cost_usd(tok, price)
+    now_local = now or qk_tou_local_now(cfg)
+    day = now_local.strftime("%Y-%m-%d")
+    model = str(model or "unknown")[:200]
+    rate, tier = qk_tou_rate(cfg, model, now_local)
+    cost = base_cost * rate
+
+    with qk_lock():
+        led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
+        users = led.setdefault("users", {})
+        u = users.setdefault(uid, {"name": "", "email": "", "days": {}})
+        u["name"] = (user.get("name") or u.get("name") or "")[:200]
+        u["email"] = (user.get("email") or u.get("email") or "")[:200]
+        d = u["days"].setdefault(
+            day,
+            {
+                "requests": 0,
+                "cost_usd": 0.0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "tou": {"peak": 0, "offpeak": 0, "normal": 0},
+                "cost_saved_usd": 0.0,
+                "models": {},
+            },
+        )
+        if count_request:
+            d["requests"] = d.get("requests", 0) + 1
+            dch = d.setdefault("channels", {"webui": 0, "api": 0})
+            dch[channel if channel in dch else "api"] = dch.get(channel if channel in dch else "api", 0) + 1
+        d["cost_usd"] = round(d.get("cost_usd", 0.0) + cost, 8)
+        dtou = d.setdefault("tou", {"peak": 0, "offpeak": 0, "normal": 0})
+        if count_request and tier in dtou:
+            dtou[tier] = dtou.get(tier, 0) + 1
+        d["cost_saved_usd"] = round(d.get("cost_saved_usd", 0.0) + (base_cost - cost), 8)
+        for k in ("cached", "input", "output"):
+            d["tokens"][k] = d["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        # hourly bucket (consumed by the dashboard at granularity=hour)
+        h = d.setdefault("hours", {}).setdefault(
+            str(now_local.hour),
+            {
+                "requests": 0,
+                "cost_usd": 0.0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+            },
+        )
+        if count_request:
+            h["requests"] = h.get("requests", 0) + 1
+        h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
+        for k in ("cached", "input", "output"):
+            h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        mm = d["models"].setdefault(
+            model,
+            {
+                "requests": 0,
+                "cost_usd": 0.0,
+                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                "priced": True,
+                "unpriced_requests": 0,
+                "tou": {"peak": 0, "offpeak": 0, "normal": 0},
+                "cost_saved_usd": 0.0,
+            },
+        )
+        # unpriced_requests is a per-request counter; topups are not requests
+        if count_request:
+            mm["requests"] = mm.get("requests", 0) + 1
+            mm["unpriced_requests"] = mm.get("unpriced_requests", 0) + (0 if priced else 1)
+            mch = mm.setdefault("channels", {"webui": 0, "api": 0})
+            mch[channel if channel in mch else "api"] = mch.get(channel if channel in mch else "api", 0) + 1
+        mm["cost_usd"] = round(mm.get("cost_usd", 0.0) + cost, 8)
+        mtou = mm.setdefault("tou", {"peak": 0, "offpeak": 0, "normal": 0})
+        if count_request and tier in mtou:
+            mtou[tier] = mtou.get(tier, 0) + 1
+        mm["cost_saved_usd"] = round(mm.get("cost_saved_usd", 0.0) + (base_cost - cost), 8)
+        for k in ("cached", "input", "output"):
+            mm["tokens"][k] = mm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        # derived flag kept for UI back-compat (same semantics as the old
+        # sticky AND: once an unpriced request occurred, stays false)
+        mm["priced"] = mm.get("unpriced_requests", 0) == 0
+        qk_prune_ledger(led, cfg)
+        qk_atomic_write(QK_LEDGER_PATH, led)
+        # recent.json ring buffer (dashboard "recent activity" feed), capped
+        # at 200 newest-last; same lock so it stays consistent with the ledger.
+        # Topups (count_request=False) are partial-usage merges for an already
+        # recorded response, not new responses: they do not enter the feed.
+        if count_request:
+            rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+            items = rec.setdefault("items", [])
+            items.append(
+                {
+                    "ts": time.time(),
+                    "user_id": uid,
+                    "name": u.get("name", ""),
+                    "email": u.get("email", ""),
+                    "model": model,
+                    "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
+                    "cost_usd": cost,
+                    "tou_tier": tier,
+                    "priced": priced,
+                    "channel": channel,
+                }
+            )
+            del items[:-200]
+            qk_atomic_write(QK_RECENT_PATH, rec)
+
+
+# ==== passthrough API ingestion middleware (direct /messages & /responses) ====
+#
+# Open WebUI routes these as a pure upstream proxy (no filter inlet/stream/
+# outlet), so the Filter never sees them. We hook a middleware at Event mount
+# time that (a) captures the authenticated user from the request, (b) watches
+# the response — non-streaming body or SSE chunks — for the usage object, and
+# (c) records it into the same ledger/recent.json the Filter writes, with
+# channel="api". Starlette builds the middleware stack lazily on the first
+# request; Event functions mount during lifespan, before any request, so
+# add_middleware here is legal on the pinned starlette (OWUI 0.11).
+
+QK_INGEST_PATHS = frozenset(
+    {
+        "/api/v1/messages",   # Anthropic Messages passthrough (litellm mode)
+        "/openai/responses",  # OpenAI Responses API passthrough
+    }
+)
+QK_INGEST_MARK = "_quota_keeper_ingested"
+QK_SSE_EVENT_MAX = 1 << 22  # 4 MiB guard against pathological chunks
+
+
+def qk_ingest_parse_body_user(req) -> dict:
+    """Extract the authenticated user from a Starlette Request. OWUI routes
+    resolve the user via Depends(get_verified_user), which runs before the
+    passthrough forward, so request.state.user (a UserModel) is populated by
+    the time our response-side hook runs. Falls back to the forwarded
+    X-OpenWebUI-User-* headers for resilience."""
+    u = None
+    try:
+        u = getattr(req.state, "user", None)
+    except Exception:
+        pass
+    if u is not None:
+        uid = getattr(u, "id", None) or getattr(u, "id_str", None)
+        if uid:
+            return {
+                "id": str(uid),
+                "name": str(getattr(u, "name", "") or ""),
+                "email": str(getattr(u, "email", "") or ""),
+                "role": str(getattr(u, "role", "") or ""),
+            }
+    h = req.headers
+    uid = h.get("x-openwebui-user-id") or h.get("x-open-webui-user-id")
+    if not uid:
+        return {}
+    return {
+        "id": uid,
+        "name": h.get("x-openwebui-user-name") or h.get("x-open-webui-user-name", ""),
+        "email": h.get("x-openwebui-user-email") or h.get("x-open-webui-user-email", ""),
+        "role": h.get("x-openwebui-user-role") or h.get("x-open-webui-user-role", ""),
+    }
+
+
+def qk_ingest_body_model(body: bytes) -> str:
+    try:
+        obj = json.loads(body)
+    except Exception:
+        return ""
+    m = obj.get("model") if isinstance(obj, dict) else None
+    return str(m) if m else ""
+
+
+def qk_ingest_extract_usage(data: dict) -> Optional[dict]:
+    """Pull the usage object from a parsed JSON event/body. Handles the
+    Anthropic streaming shapes (message_start carries cumulative usage,
+    message_delta carries deltas), the OpenAI Responses API
+    (response.completed carries response.usage), and the plain OpenAI
+    completion shape (top-level or choices[0].usage)."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("type") == "message_start":
+        msg = data.get("message")
+        if isinstance(msg, dict):
+            return qk_normalize_usage(msg.get("usage"))
+        return None
+    if data.get("type") == "message_delta":
+        d = data.get("delta")
+        if isinstance(d, dict):
+            return qk_normalize_usage(d.get("usage"))
+        return None
+    if data.get("type") == "response.completed":
+        resp = data.get("response")
+        if isinstance(resp, dict):
+            return qk_normalize_usage(resp.get("usage"))
+        return None
+    u = data.get("usage")
+    if isinstance(u, dict):
+        return qk_normalize_usage(u)
+    ch = data.get("choices")
+    if isinstance(ch, list) and ch and isinstance(ch[0], dict):
+        return qk_normalize_usage(ch[0].get("usage"))
+    return None
+
+
+def qk_ingest_merge_usage(acc: dict, part: dict) -> dict:
+    """Merge a partial (delta) usage into an accumulator. Both are normalized
+    {cached,input,output,cache_write}; cumulative messages (message_start /
+    response.completed) overwrite, deltas add."""
+    out = dict(acc)
+    for k in ("cached", "input", "output", "cache_write"):
+        v = part.get(k) or 0.0
+        out[k] = (out.get(k) or 0.0) + v
+    return out
+
+
+def qk_ingest_scan_sse(chunks) -> Optional[dict]:
+    """Scan SSE bytes for a usage object, merging message_start + message_delta
+    (Anthropic) or accepting response.completed / top-level usage. Keeps a
+    small rolling tail buffer so data: lines split across chunks still parse."""
+    acc = None
+    buf = b""
+    for chunk in chunks:
+        buf += chunk
+        if len(buf) > QK_SSE_EVENT_MAX:
+            # pathological stream: drop from the head to bound memory
+            buf = buf[-QK_SSE_EVENT_MAX:]
+        while b"\n\n" in buf:
+            raw, _, buf = buf.partition(b"\n\n")
+            # an SSE event block may carry event:/id: lines before the
+            # data: line; scan the block line by line
+            for line in raw.split(b"\n"):
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+            if not payload or payload == b"[DONE]":
+                continue
+            try:
+                ev = json.loads(payload)
+            except Exception:
+                continue
+            part = qk_ingest_extract_usage(ev)
+            if part is None:
+                continue
+            if ev.get("type") == "message_start" or ev.get("type") == "response.completed":
+                acc = part
+            elif acc is not None and ev.get("type") == "message_delta":
+                acc = qk_ingest_merge_usage(acc, part)
+            elif acc is None:
+                acc = part
+    return acc
+
+
+def qk_ingest_record(req, body: bytes, chunks=None) -> None:
+    """Best-effort: resolve user+model, extract usage, write to the ledger.
+    Never raises (fail-open — the API response must not be impacted)."""
+    try:
+        if getattr(req.state, QK_INGEST_MARK, False):
+            return  # already ingested (hot-reload re-mount double registration)
+        setattr(req.state, QK_INGEST_MARK, True)
+        user = qk_ingest_parse_body_user(req)
+        if not user.get("id"):
+            return
+        tok = None
+        if chunks is not None:
+            tok = qk_ingest_scan_sse(chunks)
+        elif body:
+            try:
+                data = json.loads(body)
+                tok = qk_ingest_extract_usage(data)
+            except Exception:
+                tok = None
+        if not tok:
+            return
+        try:
+            body_model = qk_ingest_body_model(getattr(req.state, "qk_ingest_body", b""))
+        except Exception:
+            body_model = ""
+        model = body_model or str(getattr(req.state, "qk_ingest_model", "") or "unknown")
+        # Request ID dedup: the Filter's _seen is per-instance and may not see
+        # this request at all; the passthrough has no stable response id, so
+        # dedup is keyed on (user, model, ts, tokens) with a short TTL window.
+        cfg = qk_get_config()
+        now_local = qk_tou_local_now(cfg)
+        qk_record_usage(user, model, tok, count_request=True, now=now_local, channel="api")
+    except Exception as e:
+        log.warning("quota-keeper passthrough ingest failed: %s", e)
+
+
+async def qk_passthrough_middleware(request: Request, call_next):
+    """Async middleware wrapping passthrough endpoints: forwards the request
+    untouched, and records usage from the response (streaming or buffered)."""
+    if request.method != "POST" or request.url.path not in QK_INGEST_PATHS:
+        return await call_next(request)
+    try:
+        body = await request.body()
+        request.state.qk_ingest_body = body
+        request.state.qk_ingest_model = qk_ingest_body_model(body)
+    except Exception:
+        pass
+    response = await call_next(request)
+    try:
+        is_sse = "text/event-stream" in (response.headers.get("content-type") or "")
+        if getattr(response, "body_iterator", None) is not None and is_sse:
+            chunks = []
+
+            async def _tee():
+                async for c in response.body_iterator:
+                    chunks.append(c)
+                    yield c
+                # stream fully consumed: now safe to scan the collected bytes
+                try:
+                    qk_ingest_record(request, b"", chunks=chunks)
+                except Exception:
+                    pass
+
+            teed = _tee()
+            return StreamingResponse(teed, status_code=response.status_code,
+                                     headers=dict(response.headers),
+                                     media_type=response.media_type)
+        # non-streaming (JSON etc.): buffer the body and scan it as JSON
+        resp_body = b""
+        async for c in response.body_iterator:
+            resp_body += c
+        qk_ingest_record(request, resp_body)
+        return Response(content=resp_body, status_code=response.status_code,
+                        headers=dict(response.headers), media_type=response.media_type)
+    except Exception as e:
+        log.warning("quota-keeper passthrough tee failed: %s", e)
+        return response
 
 
 # ==== stats aggregation (reads the ledger for serving; filter never calls it) ====
@@ -2898,6 +3334,23 @@ class Event:
             if not self._installed:
                 log.info("quota-keeper API mounted at %s", self.valves.api_prefix)
                 log.info("quota-keeper admin page at %s", page_path)
+            # Passthrough ingestion middleware. Starlette builds the middleware
+            # stack lazily on the first request, so mounting during lifespan is
+            # legal on the pinned starlette; a repeat mount (hot reload) simply
+            # re-adds a wrapper whose per-request mark dedupes the record.
+            try:
+                if getattr(__app__.state, "quota_keeper_ingest_mw", False):
+                    pass  # already mounted this process lifetime
+                else:
+                    from starlette.middleware.base import BaseHTTPMiddleware
+
+                    __app__.add_middleware(
+                        BaseHTTPMiddleware, dispatch=qk_passthrough_middleware
+                    )
+                    __app__.state.quota_keeper_ingest_mw = True
+                    log.info("quota-keeper passthrough ingest middleware mounted")
+            except Exception as e:
+                log.warning("quota-keeper ingest middleware mount failed: %s", e)
             self._installed = True
 
             # The pricing loop is tracked on app.state so a hot code update

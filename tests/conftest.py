@@ -12,6 +12,26 @@ try:
 except ImportError:
     pass
 
+# fastapi (any) forwards on_startup/on_shutdown to starlette.routing.Router.
+# Newer starlette dropped those kwargs; OWUI's pinned stack accepts them. Patch
+# the local Router to tolerate them so the admin module imports in the sandbox.
+import inspect
+
+try:
+    from starlette.routing import Router as _Router
+
+    if "on_startup" not in inspect.signature(_Router.__init__).parameters:
+
+        def _patched_init(self, *args, on_startup=None, on_shutdown=None, **kwargs):
+            _Router.__init__.__wrapped__ if False else None
+            orig = _patched_init._orig
+            return orig(self, *args, **kwargs)
+
+        _patched_init._orig = _Router.__init__
+        _Router.__init__ = _patched_init
+except Exception:
+    pass
+
 REPO = Path(__file__).resolve().parent.parent
 FILTER = REPO / "quota_keeper_filter.py"
 ADMIN = REPO / "quota_keeper_admin.py"

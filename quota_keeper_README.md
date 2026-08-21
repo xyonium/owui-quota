@@ -5,7 +5,7 @@
 | 文件 | 类型 | 职责 |
 |------|------|------|
 | `quota_keeper_filter.py` | Filter | 对每次 chat completion（网页 + 直接 API 调用）计量 cached/input/output token，按模型价格折算成本记账，并在配额超限时拦截请求 |
-| `quota_keeper_admin.py` | Event | 在启动/启用时向 `__app__` 注册 API 与 `/quota` 网页（admin 控制台 / 普通用户自助卡片，按角色分流），后台定时从上游拉取价格表 |
+| `quota_keeper_admin.py` | Event | 在启动/启用时向 `__app__` 注册 API 与 `/quota` 网页（admin 控制台 / 普通用户自助卡片，按角色分流），后台定时从上游拉取价格表；**v0.5.1 起**额外挂载 passthrough 摄入中间件，把 Open WebUI 纯代理转发的 `/api/v1/messages` 与 `/openai/responses` 请求（不走 Filter，原本完全记不到账）也计量进同一账本 |
 
 ## 安装
 
@@ -32,6 +32,7 @@
 - 价格来源默认 LiteLLM 的 `model_prices_and_context_window.json`（每 token 价格自动换算为每 1M），也支持 models.dev 嵌套格式；可改 URL。**v0.3.4 起支持多数据源**：`pricing.url` 可填多个（每行一个 URL 或 JSON list），按顺序合并、同一模型 id 冲突时**第一个源生效**。例：默认 LiteLLM 表没有 moonshotai/zai 官方裸键（kimi-k3、glm-5.2 等只在 azure_ai/ 等第三方前缀下），可追加 `https://models.dev/api.json` 补官方价。
 - 模糊匹配顺序：override → exact → 去日期后缀 → 路径后缀（`openai/gpt-4o` → `gpt-4o`）→ 尾段 → 包含子串；`.` 与 `-` 归一化，自动剥离 `-2024-08-06` / `-20241022` 等日期尾巴。管理页有 "Test match" 输入框实时验证。
 - 无匹配且未配置 fallback pricing 时该模型计 0 成本，并在用量表打 unpriced 标记。
+- **v0.5.1 passthrough 直通记账**：Open WebUI 对 `/api/v1/messages`（anthropic 直通）与 `/openai/responses`（OpenAI Responses API）走纯上游代理，Filter 的 inlet/stream/outlet 完全不触发。v0.5.1 起 Event 函数在启动时挂一个轻量中间件，扫描这两个路径的响应（非流式 JSON 或流式 SSE 的 usage 字段）并计入同一 ledger/recent，渠道记为 `api`。无需额外配置；若要走 header 兜底（`request.state.user` 未注入时），可在 docker 环境打开 `ENABLE_FORWARD_USER_INFO_HEADERS=true`。
 
 ## 时区
 

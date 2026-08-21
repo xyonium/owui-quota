@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.9
+version: 0.4.10
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -484,7 +484,10 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
 
 
 def qk_normalize_usage(u) -> Optional[dict]:
-    """Normalize OpenAI / Anthropic / generic usage into cached/input/output(+write)."""
+    """Normalize OpenAI / Anthropic / Responses API / generic usage into
+    cached/input/output(+write). The OpenAI Responses API reports cache inside
+    `input_tokens_details.cached_tokens` and its `input_tokens` is the TOTAL
+    input (cache included); Anthropic's `input_tokens` excludes cache."""
     if not isinstance(u, dict):
         return None
 
@@ -505,6 +508,9 @@ def qk_normalize_usage(u) -> Optional[dict]:
     ptd = u.get("prompt_tokens_details")
     if isinstance(ptd, dict) and isinstance(ptd.get("cached_tokens"), (int, float)):
         cached_oai = float(ptd["cached_tokens"])
+    itd = u.get("input_tokens_details")
+    if cached_oai is None and isinstance(itd, dict) and isinstance(itd.get("cached_tokens"), (int, float)):
+        cached_oai = float(itd["cached_tokens"])
 
     if pt is not None:
         cached = (cached_oai or 0.0) + (cr or 0.0)
@@ -512,9 +518,13 @@ def qk_normalize_usage(u) -> Optional[dict]:
         out = ct if ct is not None else (ao or 0.0)
     elif ai is not None or ao is not None:
         # input_tokens and/or output_tokens; a lone output_tokens appears in
-        # Anthropic message_delta partial-usage events
-        cached = cr or 0.0
+        # Anthropic message_delta partial-usage events. For the Responses API
+        # input_tokens includes the cached part (only when cache came via
+        # input_tokens_details and Anthropic-style cache fields are absent).
+        cached = (cached_oai or 0.0) + (cr or 0.0)
         inp = ai or 0.0
+        if cached_oai is not None and cr is None:
+            inp = max(0.0, inp - cached)
         out = ao or 0.0
     else:
         return None
