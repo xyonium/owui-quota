@@ -285,6 +285,11 @@ v0.5.4 新增：
 
 27. **中间件破坏转发（body 被消费 + 流式 content-length）**（admin v0.5.4 修复）：v0.5.3 挂载成功后暴露两个转发 bug——(a) **请求体被 `await request.body()` 消费后没重新注入**：passthrough 路由读 body 拿到空体 → 转发模型 fallback 成默认值（实测 call `prx.gemini-flash` 变 `deepseek-pro`）+ 请求中断。修：读后 `request._body = body` 重新注入（已单独验证路由能读到原 model）。(b) **流式响应重建带 content-length**：`StreamingResponse(teed, headers=dict(response.headers))` 会把原始 content-length 带上，流式长度未知 → 客户端截断/中断。修：流式 tee 剥掉 `content-length`。**教训：中间件动 request/response 必须验证"转发完整性"**——读 body 必须回注，重建流必须剥长度头。
 
+
+v0.5.5 新增：
+
+28. **读 body 重新注入在生产仍破坏转发（499）**（admin v0.5.5 修复）：v0.5.4 的 `request._body = body` 重注入在**生产 fastapi 0.136.3** 无效——路由/转发侧用的是**新 Request 实例**（各自 body 缓存），中间件实例的回注到不了下游 → 转发仍是空体 → Claude Code 499。**根治：中间件完全不读请求体**（转发零干扰），model 改从**响应**提取（anthropic `message_start.message.model`、openai `data.model`、responses `response.model`）。`qk_ingest_scan_sse` 改返回 `(model, tok)`。教训：**读请求体的中间件在 passthrough 场景是自寻死路**——只读响应，模型名从响应回显拿。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。

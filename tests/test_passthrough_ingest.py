@@ -86,7 +86,7 @@ def test_extract_none_when_no_usage(load_admin):
 
 ANTHROPIC_SSE = (
     'event: message_start\n'
-    'data: {"type":"message_start","message":{"usage":{"input_tokens":10,'
+    'data: {"type":"message_start","message":{"model":"claude-x","usage":{"input_tokens":10,'
     '"cache_read_input_tokens":2}}}\n\n'
     'event: content_block_delta\n'
     'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"hi"}}\n\n'
@@ -98,14 +98,15 @@ ANTHROPIC_SSE = (
 
 def test_scan_anthropic_sse_merges_start_and_delta(load_admin):
     adm = load_admin()
-    out = adm.qk_ingest_scan_sse(iter([ANTHROPIC_SSE]))
+    _m, out = adm.qk_ingest_scan_sse(iter([ANTHROPIC_SSE]))
     assert out == {"cached": 2.0, "input": 10.0, "output": 7.0, "cache_write": 0.0}
+    assert _m == "claude-x"
 
 
 def test_scan_sse_split_chunks(load_admin):
     adm = load_admin()
     chunks = [ANTHROPIC_SSE[i:i + 7] for i in range(0, len(ANTHROPIC_SSE), 7)]
-    out = adm.qk_ingest_scan_sse(iter(chunks))
+    _m, out = adm.qk_ingest_scan_sse(iter(chunks))
     assert out["output"] == 7.0 and out["input"] == 10.0
 
 
@@ -117,7 +118,7 @@ def test_scan_responses_sse_completed(load_admin):
         '"output_tokens":4,"input_tokens_details":{"cached_tokens":5}}}}\n\n'
         'data: [DONE]\n\n'
     ).encode()
-    out = adm.qk_ingest_scan_sse(iter([sse]))
+    _m, out = adm.qk_ingest_scan_sse(iter([sse]))
     assert out["input"] == 7 and out["cached"] == 5
 
 

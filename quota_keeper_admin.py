@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.4
+version: 0.5.5
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -995,11 +995,15 @@ def qk_ingest_merge_usage(acc: dict, part: dict) -> dict:
     return out
 
 
-def qk_ingest_scan_sse(chunks) -> Optional[dict]:
+def qk_ingest_scan_sse(chunks):
     """Scan SSE bytes for a usage object, merging message_start + message_delta
     (Anthropic) or accepting response.completed / top-level usage. Keeps a
-    small rolling tail buffer so data: lines split across chunks still parse."""
+    small rolling tail buffer so data: lines split across chunks still parse.
+
+    Returns (model, tok) — the model echoed by the first event that carries
+    one (anthropic message_start.message.model / responses response.model)."""
     acc = None
+    model = ""
     buf = b""
     for chunk in chunks:
         buf += chunk
@@ -1015,27 +1019,40 @@ def qk_ingest_scan_sse(chunks) -> Optional[dict]:
                 if not line.startswith(b"data:"):
                     continue
                 payload = line[5:].strip()
-            if not payload or payload == b"[DONE]":
-                continue
-            try:
-                ev = json.loads(payload)
-            except Exception:
-                continue
-            part = qk_ingest_extract_usage(ev)
-            if part is None:
-                continue
-            if ev.get("type") == "message_start" or ev.get("type") == "response.completed":
-                acc = part
-            elif acc is not None and ev.get("type") == "message_delta":
-                acc = qk_ingest_merge_usage(acc, part)
-            elif acc is None:
-                acc = part
-    return acc
+                if not payload or payload == b"[DONE]":
+                    continue
+                try:
+                    ev = json.loads(payload)
+                except Exception:
+                    continue
+                if not model:
+                    if isinstance(ev.get("message"), dict) and ev["message"].get("model"):
+                        model = str(ev["message"]["model"])
+                    elif isinstance(ev.get("response"), dict) and ev["response"].get("model"):
+                        model = str(ev["response"]["model"])
+                    elif ev.get("model"):
+                        model = str(ev["model"])
+                part = qk_ingest_extract_usage(ev)
+                if part is None:
+                    continue
+                if ev.get("type") == "message_start" or ev.get("type") == "response.completed":
+                    acc = part
+                elif acc is not None and ev.get("type") == "message_delta":
+                    acc = qk_ingest_merge_usage(acc, part)
+                elif acc is None:
+                    acc = part
+    return model, acc
 
 
-def qk_ingest_record(req, body: bytes, chunks=None) -> None:
+def qk_ingest_record(req, body: bytes = b"", chunks=None) -> None:
     """Best-effort: resolve user+model, extract usage, write to the ledger.
-    Never raises (fail-open — the API response must not be impacted)."""
+    Never raises (fail-open — the API response must not be impacted).
+
+    IMPORTANT: the middleware MUST NOT read the request body (reading it in
+    the middleware broke passthrough — the route saw an empty payload and the
+    upstream request fell back to a default model / 499'd). The model name is
+    taken from the RESPONSE instead: anthropic messages and openai
+    chat/responses bodies all echo the requested model."""
     try:
         if getattr(req.state, QK_INGEST_MARK, False):
             return  # already ingested (hot-reload re-mount double registration)
@@ -1044,21 +1061,19 @@ def qk_ingest_record(req, body: bytes, chunks=None) -> None:
         if not user.get("id"):
             return
         tok = None
+        model = ""
         if chunks is not None:
-            tok = qk_ingest_scan_sse(chunks)
+            model, tok = qk_ingest_scan_sse(chunks)
         elif body:
             try:
                 data = json.loads(body)
                 tok = qk_ingest_extract_usage(data)
+                model = str(data.get("model") or "") if isinstance(data, dict) else ""
             except Exception:
                 tok = None
         if not tok:
             return
-        try:
-            body_model = qk_ingest_body_model(getattr(req.state, "qk_ingest_body", b""))
-        except Exception:
-            body_model = ""
-        model = body_model or str(getattr(req.state, "qk_ingest_model", "") or "unknown")
+        model = str(model or getattr(req.state, "qk_ingest_model", "") or "unknown")
         # Request ID dedup: the Filter's _seen is per-instance and may not see
         # this request at all; the passthrough has no stable response id, so
         # dedup is keyed on (user, model, ts, tokens) with a short TTL window.
@@ -1074,17 +1089,10 @@ async def qk_passthrough_middleware(request: Request, call_next):
     untouched, and records usage from the response (streaming or buffered)."""
     if request.method != "POST" or request.url.path not in QK_INGEST_PATHS:
         return await call_next(request)
-    try:
-        body = await request.body()
-        # CRITICAL: consuming the body empties it for downstream — re-inject
-        # it so the passthrough route still sees the original request payload
-        # (otherwise the forwarded model falls back to a default and the
-        # request may break entirely).
-        request._body = body
-        request.state.qk_ingest_body = body
-        request.state.qk_ingest_model = qk_ingest_body_model(body)
-    except Exception:
-        pass
+    # NOTE: do NOT read request.body() here. Reading it in the middleware
+    # consumed the payload for the passthrough route (the forwarded model
+    # fell back to a default and requests 499'd). The model is extracted from
+    # the response instead (qk_ingest_record / scan_sse).
     response = await call_next(request)
     try:
         is_sse = "text/event-stream" in (response.headers.get("content-type") or "")
