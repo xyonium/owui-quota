@@ -340,3 +340,52 @@ def test_outlet_message_usage_falls_back_to_body_model(qk):
     led2 = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
     d2 = list(led2["users"]["u1"]["days"].values())[0]
     assert set(d2["models"]) == {"gemini-flash", "gemini-3.7-flash"}
+
+
+# ---- model_aliases (v0.5.6) ---------------------------------------------------
+
+
+def test_model_alias_maps_name_before_pricing(qk, tmp_path):
+    """prx.gemini-flash -> gemini-3.7-flash: the alias maps to the real name
+    BEFORE price matching, so the record prices under the real name and the
+    ledger has no alias row."""
+    from pathlib import Path
+    from tests.conftest import write_json
+    from pathlib import Path
+    write_json(Path(qk.QK_PRICING_PATH), {"table": {
+        "gemini-3.7-flash": {"input": 0.5, "output": 1.5, "cached": 0.1, "cache_write": 0.1}}})
+    cfg = qk.qk_get_config()
+    cfg["model_aliases"] = {"prx.gemini-flash": "gemini-3.7-flash"}
+    qk.qk_atomic_write(qk.QK_CONFIG_PATH, cfg)
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u@x.com"},
+                       "prx.gemini-flash",
+                       {"cached": 0, "input": 10, "output": 5, "cache_write": 0})
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert set(d["models"]) == {"gemini-3.7-flash"}   # no prx.* row
+    mm = d["models"]["gemini-3.7-flash"]
+    assert mm["unpriced_requests"] == 0               # priced under real name
+    assert mm["cost_usd"] > 0
+
+
+def test_model_alias_unmapped_passes_through(qk, tmp_path):
+    """glm-5.3 (priced via override to glm-5.2) is NOT in model_aliases: it
+    must stay its own ledger row, not merge into the alias target."""
+    from pathlib import Path
+    from tests.conftest import write_json
+    cfg = qk.qk_get_config()
+    cfg["model_aliases"] = {"prx.gemini-flash": "gemini-3.7-flash"}
+    qk.qk_atomic_write(qk.QK_CONFIG_PATH, cfg)
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u@x.com"},
+                       "glm-5.3",
+                       {"cached": 0, "input": 10, "output": 5, "cache_write": 0})
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert set(d["models"]) == {"glm-5.3"}            # untouched
+
+
+def test_model_aliases_validated(load_admin):
+    adm = load_admin()
+    assert not adm.qk_validate_config({"model_aliases": {"prx.x": "gemini-3.7-flash"}})
+    assert adm.qk_validate_config({"model_aliases": {"prx.x": 42}})         # non-str value
+    assert adm.qk_validate_config({"model_aliases": "oops"})                # non-dict

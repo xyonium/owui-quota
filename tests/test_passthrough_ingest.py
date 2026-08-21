@@ -385,3 +385,16 @@ def test_middleware_does_not_consume_request_body(load_admin, monkeypatch):
         resp = c.post("/api/v1/messages", json={"model": "prx.gemini-flash"})
         assert resp.status_code == 200
     assert seen["model"] == "prx.gemini-flash"
+
+
+def test_extract_anthropic_full_usage_with_cache_write(load_admin):
+    """/api/v1/messages (Anthropic protocol) response carries cache details:
+    cache_read_input_tokens -> cached, cache_creation_input_tokens ->
+    cache_write. Both must be extracted for cost accounting."""
+    adm = load_admin()
+    resp = {"id": "msg_x", "type": "message", "model": "prx.gemini-flash",
+            "usage": {"input_tokens": 100, "output_tokens": 50,
+                      "cache_read_input_tokens": 30,
+                      "cache_creation_input_tokens": 20}}
+    tok = adm.qk_ingest_extract_usage(resp)
+    assert tok == {"cached": 30.0, "input": 100.0, "output": 50.0, "cache_write": 20.0}

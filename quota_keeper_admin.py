@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.5
+version: 0.5.6
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -55,6 +55,8 @@ DEFAULT_CONFIG = {
     "user_quotas": {},
     "group_quotas": {},
     "ledger_retention_days": 400,
+    "model_aliases": {},                # upstream alias -> real model name (naming map,
+                                        # applied before pricing/bucketing; NOT a price ref)
     "pricing": {
         # one URL string, or a list merged in order (first source wins on
         # conflicts); LiteLLM flat and models.dev nested formats both work
@@ -186,6 +188,14 @@ def qk_validate_config(cfg) -> list:
     for key in ("user_quotas", "group_quotas"):
         if key in cfg and not isinstance(cfg[key], dict):
             errs.append(f"{key} must be an object")
+    ma = cfg.get("model_aliases")
+    if ma is not None:
+        if not isinstance(ma, dict):
+            errs.append("model_aliases must be an object")
+        else:
+            for k, v in ma.items():
+                if not isinstance(v, str) or not v.strip():
+                    errs.append(f"model_aliases.{k} must map to a non-empty model name")
     sch = cfg.get("schedule")
     if sch is not None and not isinstance(sch, dict):
         errs.append("schedule must be an object")
@@ -767,6 +777,23 @@ def qk_prune_ledger(led: dict, cfg: dict) -> None:
             udays.pop(k, None)
 
 
+def qk_resolve_model_alias(cfg: dict, model: str) -> str:
+    """Map an upstream-echoed alias (e.g. cli-proxy-api's prx.gemini-flash)
+    to the real model name via config `model_aliases`. Applied BEFORE price
+    matching and ledger bucketing, so an aliased request prices and
+    aggregates under the real name. Unmapped models pass through unchanged
+    (a price override that aliases glm-5.3 to glm-5.2 must NOT merge them —
+    that's a pricing-only reference, this is a naming map)."""
+    if not model:
+        return str(model or "unknown")
+    aliases = (cfg.get("model_aliases") or {})
+    if isinstance(aliases, dict):
+        real = aliases.get(model) or aliases.get(str(model).lower())
+        if real:
+            return str(real)
+    return str(model)
+
+
 def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True,
                     now: datetime = None, channel: str = "api") -> None:
     """Record one usage event (verbatim copy of the filter's writer — the
@@ -781,6 +808,7 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
     cache = JC.get(QK_PRICING_PATH, {}) or {}
     table = cache.get("table") or {}
     pconf = cfg.get("pricing") or {}
+    model = qk_resolve_model_alias(cfg, model)
     price, _how = qk_find_pricing(model, table, pconf.get("overrides"))
     priced = price is not None
     if price is None:

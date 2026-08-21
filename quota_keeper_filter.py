@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.12
+version: 0.4.13
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -55,6 +55,8 @@ DEFAULT_CONFIG = {
     "user_quotas": {},                  # user_id -> credits (highest priority)
     "group_quotas": {},                 # group_id -> credits (max wins among groups)
     "ledger_retention_days": 400,
+    "model_aliases": {},                # upstream alias -> real model name (naming map,
+                                        # applied before pricing/bucketing; NOT a price ref)
     "pricing": {
         # one URL string, or a list merged in order (first source wins on
         # conflicts); LiteLLM flat and models.dev nested formats both work
@@ -565,6 +567,23 @@ def qk_prune_ledger(led: dict, cfg: dict) -> None:
             udays.pop(k, None)
 
 
+def qk_resolve_model_alias(cfg: dict, model: str) -> str:
+    """Map an upstream-echoed alias (e.g. cli-proxy-api's prx.gemini-flash)
+    to the real model name via config `model_aliases`. Applied BEFORE price
+    matching and ledger bucketing, so an aliased request prices and
+    aggregates under the real name. Unmapped models pass through unchanged
+    (a price override that aliases glm-5.3 to glm-5.2 must NOT merge them —
+    that's a pricing-only reference, this is a naming map)."""
+    if not model:
+        return str(model or "unknown")
+    aliases = (cfg.get("model_aliases") or {})
+    if isinstance(aliases, dict):
+        real = aliases.get(model) or aliases.get(str(model).lower())
+        if real:
+            return str(real)
+    return str(model)
+
+
 def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True,
                     now: datetime = None, channel: str = "api") -> None:
     """Record one usage event. count_request=False marks a partial-usage
@@ -582,6 +601,7 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
     cache = JC.get(QK_PRICING_PATH, {}) or {}
     table = cache.get("table") or {}
     pconf = cfg.get("pricing") or {}
+    model = qk_resolve_model_alias(cfg, model)
     price, _how = qk_find_pricing(model, table, pconf.get("overrides"))
     priced = price is not None
     if price is None:

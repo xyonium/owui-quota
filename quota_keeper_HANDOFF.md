@@ -290,6 +290,11 @@ v0.5.5 新增：
 
 28. **读 body 重新注入在生产仍破坏转发（499）**（admin v0.5.5 修复）：v0.5.4 的 `request._body = body` 重注入在**生产 fastapi 0.136.3** 无效——路由/转发侧用的是**新 Request 实例**（各自 body 缓存），中间件实例的回注到不了下游 → 转发仍是空体 → Claude Code 499。**根治：中间件完全不读请求体**（转发零干扰），model 改从**响应**提取（anthropic `message_start.message.model`、openai `data.model`、responses `response.model`）。`qk_ingest_scan_sse` 改返回 `(model, tok)`。教训：**读请求体的中间件在 passthrough 场景是自寻死路**——只读响应，模型名从响应回显拿。
 
+
+v0.5.6 新增：
+
+29. **model_aliases（alias → 真实模型名映射）**（filter v0.4.13 / admin v0.5.6）：passthrough 响应里的 `model` 是上游回显的 alias（`prx.gemini-flash`），价格表里没有 → unpriced；且和 webui 侧的真实名（`gemini-3.7-flash`）统计分裂。新增顶层配置 `model_aliases: {"prx.gemini-flash": "gemini-3.7-flash", ...}`，`qk_resolve_model_alias` 在**价格匹配前**（`qk_record_usage` 内）替换模型名，记账/计价/统计全用真实名。**与 `pricing.overrides` 的 `alias` 语义不同**：那是"价格引用"（glm-5.3 按 glm-5.2 价计，仍统计为 glm-5.3），这是"命名映射"（合并统计）；不配的模型原样通过。校验器对 `model_aliases` 做 dict[str,str] 检查。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。
