@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.12
+version: 0.5.13
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1394,9 +1394,21 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
                     for k in ("cached", "input", "output"):
                         kpi["tokens"][k] += (hrec.get("tokens") or {}).get(k, 0) or 0
                     hch = hrec.get("channels") or {}
-                    for cname, cnt in hch.items():
-                        if cname in kpi["channels"]:
-                            kpi["channels"][cname] += cnt or 0
+                    if not hch:
+                        # historical hour buckets (pre-v0.5.12) have no
+                        # channels field: approximate from the DAY-level
+                        # channels by this hour's request share
+                        dch = drec.get("channels") or {}
+                        hreq = hrec.get("requests", 0) or 0
+                        dreq = drec.get("requests", 0) or 0
+                        if dch and dreq > 0:
+                            for cname, dcnt in dch.items():
+                                if cname in kpi["channels"]:
+                                    kpi["channels"][cname] += (dcnt or 0) * hreq / dreq
+                    else:
+                        for cname, cnt in hch.items():
+                            if cname in kpi["channels"]:
+                                kpi["channels"][cname] += cnt or 0
     # unpriced_requests is not in the hour buckets (day/model level only).
     # Include a day's unpriced count when ANY of its hour buckets falls inside
     # the rolling window (a day whose first hour is before wstart still has
@@ -1448,6 +1460,9 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
             kpi["channels"][chan] += 1
             for k in ("cached", "input", "output"):
                 kpi["tokens"][k] += float(tok.get(k) or 0.0)
+        # else: channels come from the ledger hours buckets above (exact,
+        # incl. the day-level fallback for pre-v0.5.12 hours) — do not add
+        # recent here or it double-counts.
         row = urows.get(uid)
         if row is None:
             info = users_by_id.get(uid) or {}
