@@ -218,3 +218,61 @@ def test_outlet_toplevel_usage_still_wins(qk):
     assert d["requests"] == 1
     assert d["tokens"]["input"] == 5
     assert d["channels"] == {"webui": 1, "api": 0}
+
+
+def test_stream_then_outlet_does_not_double_record(qk):
+    """0.11.0 calls outlet_filter_handler at the END of a streaming chat too.
+    The upstream stream chunk echoes the ALIAS (prx.gemini-flash); the rebuilt
+    outlet body carries the message id (not the response id) and usage on the
+    last message. Without the message-id mark + model_name preference, the
+    request is recorded twice (real name by stream, alias by outlet). OWUI
+    injects the same __metadata__ (with model_name) into both calls."""
+    f = qk.Filter()
+    import asyncio
+    md = {"chat_id": "chat-9", "session_id": "s", "message_id": "msg-1",
+          "user_id": "u1", "model_name": "gemini-3.7-flash"}
+    asyncio.run(f.stream({"id": "chatcmpl-ABC", "model": "prx.gemini-flash",
+                          "usage": {"prompt_tokens": 4226, "completion_tokens": 756}},
+                         __user__=_user(), __metadata__=md))
+    outlet_body = {"model": "prx.gemini-flash", "id": "msg-1",
+                   "messages": [{"role": "user", "content": "hi"},
+                                {"id": "msg-1", "role": "assistant", "content": "ok",
+                                 "usage": {"prompt_tokens": 4226, "completion_tokens": 756}}],
+                   "chat_id": "chat-9", "session_id": "s"}
+    asyncio.run(f.outlet(outlet_body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1                      # not 2
+    assert set(d["models"]) == {"gemini-3.7-flash"}  # real name only, no alias row
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {})
+    assert len(rec["items"]) == 1
+    assert rec["items"][0]["model"] == "gemini-3.7-flash"
+
+
+def test_outlet_message_usage_falls_back_to_body_model(qk):
+    """Non-streaming 0.11 body still records via messages[-1].usage. OWUI's
+    metadata has no model_name field, so the model name comes from body.model
+    (whatever name the response carries). If a deployment injects model_name,
+    it wins (kept as the preferred source for naming consistency)."""
+    f = qk.Filter()
+    import asyncio
+    # production metadata: no model_name key at all
+    md = {"chat_id": "", "session_id": "s", "message_id": "msg-1", "user_id": "u1"}
+    body = {"model": "prx.gemini-flash", "id": "msg-1",
+            "messages": [{"role": "user", "content": "hi"},
+                         {"id": "msg-1", "role": "assistant", "content": "ok",
+                          "usage": {"prompt_tokens": 11, "completion_tokens": 7}}],
+            "chat_id": "", "session_id": "s"}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert set(d["models"]) == {"prx.gemini-flash"}   # body.model fallback
+    assert d["channels"] == {"webui": 0, "api": 1}
+    # model_name (when present) takes precedence
+    f2 = qk.Filter()
+    md2 = dict(md, model_name="gemini-3.7-flash")
+    asyncio.run(f2.outlet(dict(body, id="msg-2"), __user__=_user(), __metadata__=md2))
+    led2 = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d2 = list(led2["users"]["u1"]["days"].values())[0]
+    assert set(d2["models"]) == {"prx.gemini-flash", "gemini-3.7-flash"}

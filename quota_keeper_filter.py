@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.8
+version: 0.4.9
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -820,6 +820,7 @@ class Filter:
     def __init__(self):
         self.valves = self.Valves()
         self._seen = OrderedDict()  # dedup usage by response id
+        self._seen_msgids = OrderedDict()  # message ids already recorded via stream()
         self._orphan = OrderedDict()  # usage seen in stream without user info
 
     # -- helpers ------------------------------------------------------------
@@ -928,8 +929,16 @@ class Filter:
             if tok is None:
                 return event
             rid = str(ev.get("id") or f"stream-{time.time_ns()}")
-            model = str(ev.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+            # prefer the real model name over the upstream-echoed alias (see outlet)
+            model = str((__metadata__ or {}).get("model_name") or ev.get("model") or "unknown")
             chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"
+            # mark the message id so the stream-end outlet call (0.11) tops up
+            # instead of double-recording (its rid is the message id, not rid)
+            _mid = (__metadata__ or {}).get("message_id")
+            if _mid:
+                self._seen_msgids[str(_mid)] = True
+                while len(self._seen_msgids) > 4096:
+                    self._seen_msgids.popitem(last=False)
             if rid in self._seen:
                 # Later partial usage for an already-recorded id: contribute
                 # its own fields additively (no new request). Anthropic sends
@@ -967,10 +976,25 @@ class Filter:
                         if tok is not None:
                             break
             rid = str(body.get("id") or "")
-            model = str(body.get("model") or (__metadata__ or {}).get("model_name") or "unknown")
+            # Prefer the request's real model name over the response body's
+            # "model": with provider prefixing, the upstream echoes the alias
+            # (e.g. prx.gemini-flash) while __metadata__.model_name carries the
+            # resolved name. Recording the alias would price it separately (and
+            # often unpriced) and double-list one request under two names.
+            model = str((__metadata__ or {}).get("model_name") or body.get("model") or "unknown")
             chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"
             if tok is not None:
-                self._record(__user__ or {}, model, tok, rid, channel=chan)
+                # 0.11 also runs outlet at the END of a streaming chat, with a
+                # rebuilt body whose id is the MESSAGE id (not the response id
+                # stream() already recorded under). Dedup by rid then fails, so
+                # stream() marks the message id in _seen_msgids; a matching
+                # outlet call tops up (tokens already counted, no new request).
+                # A non-streaming request never runs stream(), so its message id
+                # is absent and it records exactly once here.
+                if rid and rid in self._seen_msgids:
+                    qk_record_usage(__user__ or {}, model, tok, count_request=False, channel=chan)
+                else:
+                    self._record(__user__ or {}, model, tok, rid, channel=chan)
             elif rid and (__user__ or {}).get("id") and rid in self._orphan:
                 # adopt usage stashed by stream() when user info was missing
                 # there (independent of estimate_unreported_tokens)
