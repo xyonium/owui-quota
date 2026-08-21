@@ -352,3 +352,35 @@ def test_middleware_stream_body_preserved(load_admin, monkeypatch):
     assert resp.content == payload
 
 
+
+
+def test_middleware_does_not_consume_request_body(load_admin, monkeypatch):
+    """Regression (v0.5.3): reading request.body() in the middleware emptied
+    it for the passthrough route, breaking the forwarded model. The body must
+    be re-injected (request._body) so the route still sees the payload."""
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    body = json.dumps({"type": "message", "model": "prx.gemini-flash",
+                       "usage": {"input_tokens": 11, "output_tokens": 7}}).encode()
+
+    from fastapi import FastAPI, Request
+    from fastapi.responses import JSONResponse
+    from fastapi.testclient import TestClient
+    from starlette.middleware.base import BaseHTTPMiddleware
+    import json as j
+
+    app = FastAPI()
+    seen = {}
+
+    async def route(request: Request):
+        req_body = await request.body()
+        seen["model"] = j.loads(req_body).get("model")
+        return JSONResponse(j.loads(body))
+
+    app.add_api_route("/api/v1/messages", route, methods=["POST"])
+    app.add_middleware(BaseHTTPMiddleware, dispatch=adm.qk_passthrough_middleware)
+
+    with TestClient(app) as c:
+        resp = c.post("/api/v1/messages", json={"model": "prx.gemini-flash"})
+        assert resp.status_code == 200
+    assert seen["model"] == "prx.gemini-flash"

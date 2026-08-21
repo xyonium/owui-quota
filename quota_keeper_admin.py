@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.3
+version: 0.5.4
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1076,6 +1076,11 @@ async def qk_passthrough_middleware(request: Request, call_next):
         return await call_next(request)
     try:
         body = await request.body()
+        # CRITICAL: consuming the body empties it for downstream — re-inject
+        # it so the passthrough route still sees the original request payload
+        # (otherwise the forwarded model falls back to a default and the
+        # request may break entirely).
+        request._body = body
         request.state.qk_ingest_body = body
         request.state.qk_ingest_model = qk_ingest_body_model(body)
     except Exception:
@@ -1097,8 +1102,12 @@ async def qk_passthrough_middleware(request: Request, call_next):
                     pass
 
             teed = _tee()
+            hdrs = dict(response.headers)
+            # a streamed body has no meaningful content-length; keeping the
+            # original one would truncate/mangle the forwarded stream
+            hdrs.pop("content-length", None)
             return StreamingResponse(teed, status_code=response.status_code,
-                                     headers=dict(response.headers),
+                                     headers=hdrs,
                                      media_type=response.media_type)
         # non-streaming (JSON etc.): buffer the body and scan it as JSON
         resp_body = b""

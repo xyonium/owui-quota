@@ -280,6 +280,11 @@ v0.5.3 新增：
 
 26. **中间件在生产从未挂上（Claude Code 直连 0 记录根因）**（admin v0.5.3 修复）：生产 OWUI 0.11（fastapi 0.136.3 + **starlette 1.3.1**）在 **app startup 后已构建 `middleware_stack`**，Event 函数挂载时 `add_middleware` 抛 `Cannot add middleware after an application has started`（日志可见 `quota-keeper ingest middleware mount failed`）。本地测试环境是 starlette 0.36.3（懒构建、无守卫）→ 测试全绿但生产静默失效，**Claude Code 的 `/api/v1/messages` 直连 8347 次请求全没记到**。修复：不用 `add_middleware`，改 `__app__.user_middleware.append(Middleware(BaseHTTPMiddleware, dispatch=...))` + `__app__.middleware_stack = __app__.build_middleware_stack()`（starlette 1.3.1 下已单独验证可行，栈已构建也能重建）。**教训：测试环境 starlette 版本必须与生产一致**（本地 0.36.3 vs 生产 1.3.1 的差异正是这次坑的根源）。残余：`build_middleware_stack` 若在请求中途调用可能抛错（已 try/except，注册保留、下次访问重建）；中间件 append 到 user_middleware 末尾 = 最内层，AuthTokenMiddleware 外层先跑设 `state.token` → 路由 Depends(get_verified_user) 设 `state.user`（auth.py:360/411）→ 响应侧 `qk_ingest_parse_body_user` 读到 user。**不要**在中间件请求侧手动调 get_current_user（需要 Response()/BackgroundTasks() 实例化，在 1.3.1 下会 422 破坏路由）。
 
+
+v0.5.4 新增：
+
+27. **中间件破坏转发（body 被消费 + 流式 content-length）**（admin v0.5.4 修复）：v0.5.3 挂载成功后暴露两个转发 bug——(a) **请求体被 `await request.body()` 消费后没重新注入**：passthrough 路由读 body 拿到空体 → 转发模型 fallback 成默认值（实测 call `prx.gemini-flash` 变 `deepseek-pro`）+ 请求中断。修：读后 `request._body = body` 重新注入（已单独验证路由能读到原 model）。(b) **流式响应重建带 content-length**：`StreamingResponse(teed, headers=dict(response.headers))` 会把原始 content-length 带上，流式长度未知 → 客户端截断/中断。修：流式 tee 剥掉 `content-length`。**教训：中间件动 request/response 必须验证"转发完整性"**——读 body 必须回注，重建流必须剥长度头。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。
