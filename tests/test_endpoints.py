@@ -178,12 +178,14 @@ def test_models_mine_own_models_with_prices(qk, load_admin, monkeypatch):
     r = c.get("/api/v1/quota-keeper/models?mine=1")
     assert r.status_code == 200
     items = {it["model"]: it for it in r.json()["items"]}
-    assert set(items) == {"m/x", "m/unpriced"}       # u2's m/theirs absent
+    # v0.5.22: mine=1 shows the LOCAL model pool (every model anyone used),
+    # so the user sees what's available — not just their own usage
+    assert set(items) == {"m/x", "m/unpriced", "m/theirs"}
     assert items["m/x"]["matched"] is True
     assert items["m/x"]["price"]["input"] == 1.0
     assert items["m/unpriced"]["matched"] is False
     assert items["m/unpriced"]["price"] is None
-    assert items["m/x"]["requests"] == 1             # own aggregate only
+    assert items["m/theirs"]["requests"] == 1        # cross-user aggregate
 
 
 def test_models_admin_unchanged(qk, load_admin, monkeypatch):

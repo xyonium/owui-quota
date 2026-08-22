@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.21
+version: 0.5.22
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3343,8 +3343,11 @@ async def api_models(request: Request, user=Depends(_require_user)):
     used = {}  # model -> {"requests": n, "unpriced_requests": n, "cost_usd": x}
     led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {})
     for uid, u in led.items():
-        if mine and uid != user.id:
-            continue
+        # Self-service still shows the LOCAL model pool (every model anyone
+        # has used in the ledger) so the user can see what's available and at
+        # what cost — not just their own usage, and not the whole upstream
+        # pricing table (hundreds of rows nobody here uses). Requests/cost are
+        # aggregated across users for the list.
         for d in (u.get("days") or {}).values():
             for m, mm in ((d or {}).get("models") or {}).items():
                 # history recorded the upstream alias (prx.*) before
@@ -3357,9 +3360,6 @@ async def api_models(request: Request, user=Depends(_require_user)):
                 row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
                 row["cost_usd"] += mm.get("cost_usd", 0) or 0
 
-    # Self-service price list: only the user's own used models (each with its
-    # resolved price or an unmatched flag). Listing the whole upstream table
-    # flooded the page with hundreds of models nobody used.
     ids = sorted(used, key=str.lower)
     items = []
     for m in ids:
