@@ -211,6 +211,12 @@ def test_models_nonadmin_without_mine_sees_pool(qk, load_admin, monkeypatch):
     c, _ = _app(load_admin)
     items = c.get("/api/v1/quota-keeper/models").json()["items"]
     assert {it["model"] for it in items} == {"m/x", "m/y"}
+    # v0.5.31: browsing the shared pool must NOT leak other users' aggregate
+    # usage/cost or the admin's override config -- a non-admin gets only the
+    # price-reference fields (model/used/matched/how/price).
+    for it in items:
+        assert "cost_usd" not in it and "requests" not in it and "override" not in it
+        assert {"model", "used", "matched", "how", "price"} <= set(it)
 
 
 def test_me_usage_own_data_only(qk, load_admin, monkeypatch):

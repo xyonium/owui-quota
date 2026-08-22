@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.30
+version: 0.5.31
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2048,6 +2048,18 @@ tr.pe-cleared td{opacity:.45}
    </tr></thead>
    <tbody></tbody>
   </table></div>
+  <div id="pricePool" style="margin-top:18px">
+   <h3 style="margin:0 0 4px">Available models &amp; prices</h3>
+   <p class="hint">Every model used on this server (the local pool), with its resolved per-1M-token price — use this to pick a model, independent of the time-span stats above. <b>unpriced</b> means no price matched; it meters $0 until the admin configures one.</p>
+   <div class="scroll">
+   <table id="pricePoolT">
+    <thead><tr>
+     <th>Model</th><th class="num">Input $/M</th><th class="num">Cached $/M</th>
+     <th class="num">Output $/M</th><th>Match</th><th>Status</th>
+    </tr></thead>
+    <tbody><tr><td colspan="6" class="empty">Loading…</td></tr></tbody>
+   </table></div>
+  </div>
  </section>
 
  <section id="secRecent" hidden>
@@ -2232,9 +2244,12 @@ async function init(){
     // admin-only sections stay hidden. /users /groups /pricing are admin-only
     // so non-admins skip them.
     const get=async p=>{try{return await api(p)}catch(e){toast(p+' failed: '+e.message);return null}};
-    [STATE.cfg,STATE.users,STATE.groups,STATE.pricing]=await Promise.all(
-      isAdmin?[get('/config'),get('/users'),get('/groups'),get('/pricing')]
-             :[get('/config'),Promise.resolve([]),Promise.resolve([]),Promise.resolve({})]);
+    // /models is self-service: without ?mine=1 it returns the LOCAL POOL (every
+    // model anyone used, with resolved prices) for both roles -- the reference
+    // table for picking a model by price.
+    [STATE.cfg,STATE.users,STATE.groups,STATE.pricing,STATE.pricePool]=await Promise.all(
+      isAdmin?[get('/config'),get('/users'),get('/groups'),get('/pricing'),get('/models')]
+             :[get('/config'),Promise.resolve([]),Promise.resolve([]),Promise.resolve({}),get('/models')]);
     if(!STATE.cfg)throw new Error('config unavailable');
     STATE.users=STATE.users||[];STATE.groups=STATE.groups||[];STATE.pricing=STATE.pricing||{};
     STATE.tou=JSON.parse(JSON.stringify(STATE.cfg.tou||{}));
@@ -2249,6 +2264,7 @@ async function init(){
       lockNonAdminUi();
     }
     renderMeta();renderConfig();renderGroups();renderUsersQ();renderTou();initSpanUI();
+    renderPricePool();
     await loadStats();
     loadRecent();
   }catch(e){showFatal('Load failed: '+e.message)}
@@ -2625,6 +2641,33 @@ function renderModels(){
      <td>${ttags}</td>
     </tr>`;}).join('')||'<tr><td colspan="10" class="empty">No models in span</td></tr>';
 }
+// ---------- available-models price reference (local pool) ----------
+// Renders /models (the local pool: every model anyone used, with resolved
+// per-1M prices) as a model-picking reference. Independent of the time-span
+// stats table above it; shown to both roles (the endpoint is self-service).
+function renderPricePool(){
+  const tb=$('pricePoolT');if(!tb)return;
+  const items=(STATE.pricePool&&STATE.pricePool.items)||[];
+  const fmtP=v=>(typeof v==='number')?fmt(v,2):'<span class="muted">–</span>';
+  const rows=items.map(it=>{
+    const p=it.price||{};
+    const how=it.how?String(it.how):'';
+    const howShort=how.indexOf(':')<0?how:how.slice(0,how.indexOf(':'));
+    const match=it.matched?`<span class="tag matched" title="${esc(how)}">${esc(howShort||'matched')}</span>`
+                          :'<span class="tag">none</span>';
+    const status=it.unpriced_requests>0?'<span class="tag unpriced">unpriced</span>'
+                :(it.matched?'<span class="tag matched">priced</span>':'<span class="tag unpriced">no price</span>');
+    return `<tr>
+     <td>${esc(it.model)}</td>
+     <td class="num">${fmtP(p.input)}</td>
+     <td class="num">${fmtP(p.cached)}</td>
+     <td class="num">${fmtP(p.output)}</td>
+     <td>${match}</td>
+     <td>${status}</td>
+    </tr>`;}).join('');
+  tb.querySelector('tbody').innerHTML=rows||'<tr><td colspan="6" class="empty">No models recorded yet.</td></tr>';
+}
+
 // The /stats payload does not carry the fuzzy-matched pricing key per model
 // row, so the target is resolved on demand via /pricing/match and shown
 // inline as "→ target via how" (how: override|exact|suffix|segment|contains).
@@ -3461,6 +3504,7 @@ async def api_models(request: Request, user=Depends(_require_user)):
                 row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
                 row["cost_usd"] += mm.get("cost_usd", 0) or 0
 
+    is_admin = getattr(user, "role", "") == "admin"
     ids = sorted(used, key=str.lower)
     items = []
     for m in ids:
@@ -3472,19 +3516,23 @@ async def api_models(request: Request, user=Depends(_require_user)):
                 spec = v
                 break
         u = used.get(m) or {}
-        items.append(
-            {
-                "model": m,
-                "used": True,
-                "requests": u.get("requests", 0),
-                "unpriced_requests": u.get("unpriced_requests", 0),
-                "cost_usd": u.get("cost_usd", 0.0),
-                "matched": price is not None,
-                "how": how,
-                "price": price,
-                "override": spec,
-            }
-        )
+        row = {
+            "model": m,
+            "used": True,
+            "matched": price is not None,
+            "how": how,
+            "price": price,
+        }
+        if is_admin or mine:
+            # usage aggregates + the configured override are admin-facing (or
+            # own-data for ?mine=1). For a non-admin browsing the shared local
+            # pool these would leak OTHER users' aggregate usage/cost, so they
+            # are stripped -- the price-reference table only needs the price.
+            row["requests"] = u.get("requests", 0)
+            row["unpriced_requests"] = u.get("unpriced_requests", 0)
+            row["cost_usd"] = u.get("cost_usd", 0.0)
+            row["override"] = spec
+        items.append(row)
     return JSONResponse({"items": items, "pricing_fetched": bool(table)})
 
 
