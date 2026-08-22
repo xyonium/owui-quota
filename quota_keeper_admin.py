@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.14
+version: 0.5.15
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1906,8 +1906,9 @@ h3{margin:16px 0 4px;font-size:13px;color:var(--txt)}
 p.hint{margin:0 0 14px;color:var(--mut);font-size:12px}
 label{display:block;margin:10px 0 4px;font-size:12px;color:var(--mut)}
 label.inline{display:inline-flex;align-items:center;gap:5px;margin:0 6px 0 0;width:auto;font-size:12px;color:var(--mut)}
-input,select{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#0b1220;color:var(--txt);font:inherit}
-input:focus,select:focus{outline:1px solid var(--acc)}
+input,select,textarea{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#0b1220;color:var(--txt);font:inherit}
+input:focus,select:focus,textarea:focus{outline:1px solid var(--acc)}
+textarea{resize:vertical;min-height:36px}
 .row{display:grid;gap:12px}
 @media(min-width:760px){.row.c2{grid-template-columns:1fr 1fr}.row.c3{grid-template-columns:1fr 1fr 1fr}}
 button{padding:8px 14px;border-radius:8px;border:1px solid var(--line);background:#0b1220;color:var(--txt);cursor:pointer;font:inherit}
