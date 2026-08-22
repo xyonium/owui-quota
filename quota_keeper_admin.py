@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.17
+version: 0.5.18
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1284,6 +1284,9 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
                 rt["requests"] += drec.get("requests", 0)
                 rt["tokens"] += sum((drec.get("tokens") or {}).get(k, 0) or 0 for k in ("cached", "input", "output"))
             for m, mm in day_ms.items():
+                # history recorded the upstream alias (prx.*) before
+                # model_aliases existed — merge into the real name
+                m = qk_resolve_model_alias(cfg, m)
                 row["models"].add(m)
                 mk = models_rows.setdefault(
                     m,
@@ -1424,6 +1427,10 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
                             row["channels"][cname] += cnt or 0
                 # per-model rows inside the hour
                 for m, hm in ((hrec.get("models") or {}).items()):
+                    # history recorded the upstream alias (prx.*) before
+                    # model_aliases existed — merge into the real name so
+                    # stats agree with the alias config
+                    m = qk_resolve_model_alias(cfg, m)
                     if model and m != model:
                         continue
                     hm = hm or {}
