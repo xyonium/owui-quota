@@ -2211,24 +2211,31 @@ const STATE={
 async function init(){
   try{
     STATE.me=await api('/me');
-    if((STATE.me.user||{}).role!=='admin'){renderPersonal();return}
-    document.querySelectorAll('.admin-only').forEach(el=>el.classList.remove('admin-only'));
-    await loadAdmin();
+    const isAdmin=(STATE.me.user||{}).role==='admin';
+    if(isAdmin)document.querySelectorAll('.admin-only').forEach(el=>el.classList.remove('admin-only'));
+    // Everyone gets the shared dashboard (KPI + trend + models + recent);
+    // non-admins see their OWN stats (server-enforced via /stats) and the
+    // admin-only sections stay hidden. /users /groups /pricing are admin-only
+    // so non-admins skip them.
+    const get=async p=>{try{return await api(p)}catch(e){toast(p+' failed: '+e.message);return null}};
+    [STATE.cfg,STATE.users,STATE.groups,STATE.pricing]=await Promise.all(
+      isAdmin?[get('/config'),get('/users'),get('/groups'),get('/pricing')]
+             :[get('/config'),Promise.resolve([]),Promise.resolve([]),Promise.resolve({})]);
+    if(!STATE.cfg)throw new Error('config unavailable');
+    STATE.users=STATE.users||[];STATE.groups=STATE.groups||[];STATE.pricing=STATE.pricing||{};
+    STATE.tou=JSON.parse(JSON.stringify(STATE.cfg.tou||{}));
+    const secs=['secDash','secModels','secRecent'];
+    if(isAdmin)secs.push('secUsers','secGeneral','secSchedule','secPricing','secGroups','secUserq','secPricingEditor','secTou');
+    secs.forEach(id=>{const el=$(id);if(el)el.hidden=false});
+    if(!isAdmin){
+      // non-admin: no quota editors; show the personal header with a
+      // remaining-credits progress bar
+      renderPersonalHeader();
+    }
+    renderMeta();renderConfig();renderGroups();renderUsersQ();renderTou();initSpanUI();
+    await loadStats();
+    loadRecent();
   }catch(e){showFatal('Load failed: '+e.message)}
-}
-async function loadAdmin(){
-  // tolerant loader: one failing endpoint (e.g. a gateway rate-limit 403 on
-  // the parallel burst) toasts and degrades just that section instead of
-  // blanking the whole page
-  const get=async p=>{try{return await api(p)}catch(e){toast(p+' failed: '+e.message);return null}};
-  [STATE.cfg,STATE.users,STATE.groups,STATE.pricing]=await Promise.all([get('/config'),get('/users'),get('/groups'),get('/pricing')]);
-  if(!STATE.cfg)throw new Error('config unavailable');
-  STATE.users=STATE.users||[];STATE.groups=STATE.groups||[];STATE.pricing=STATE.pricing||{};
-  STATE.tou=JSON.parse(JSON.stringify(STATE.cfg.tou||{}));
-  ['secDash','secUsers','secModels','secRecent','secGeneral','secSchedule','secPricing','secGroups','secUserq','secPricingEditor','secTou'].forEach(id=>$(id).hidden=false);
-  renderMeta();renderConfig();renderGroups();renderUsersQ();renderTou();initSpanUI();
-  await loadStats();
-  loadRecent();  // feed auto-refreshes on page load; Refresh button is a manual re-pull
 }
 function renderMeta(){
   const p=STATE.pricing||{};
@@ -2236,109 +2243,39 @@ function renderMeta(){
 }
 
 // ---------- non-admin view ----------
-function renderPersonal(){
+function renderPersonalHeader(){
+  // Non-admin header: remaining-credits progress bar (period = daily or
+  // monthly per config) + today summary. The dashboard below is shared with
+  // the admin view, filtered to this user server-side via /stats.
   const me=STATE.me,u=me.user||{};
   const eff=me.effective_quota;
-  const pct=(eff>0)?Math.min(100,(me.used_credits||0)/eff*100):null;
+  const used=me.used_credits||0;
+  const pct=(eff>0)?Math.min(100,used/eff*100):null;
   const cls=pct===null?'':(pct>=100?'bad':pct>=80?'warn':'');
-  const tier=(me.tou&&me.tou.current_tier)?me.tou.current_tier:'off';
-  const trend=(me.trend||[]);
-  const cost7=trend.reduce((s,d)=>s+((d.cost_usd||0)),0);
-  const req7=trend.reduce((s,d)=>s+((d.requests||0)),0);
-  // /me exposes period credits (used_credits) and today's cost; a month cost
-  // in USD is not part of the /me payload, so the period figure is shown in
-  // credits (that IS the month figure when quota_period=monthly).
+  const period=(STATE.cfg.quota_period||'daily')==='monthly'?'month':'day';
+  const remain=(eff>0)?Math.max(0,eff-used):null;
   $('secPersonal').innerHTML=`
-   <h2>${esc(u.name||u.id)}</h2>
-   <p class="hint">${esc(u.email||'')} · role ${esc(u.role||'')}</p>
-   <div class="kpis">
-    <div class="kpi"><div class="lbl">Quota used</div>
-     <div class="val">${pct===null?'∞':fmt(pct,1)+'%'}</div>
-     ${pct===null?'<div class="small muted">no quota set</div>':`<div class="bar"><i class="${cls}" style="width:${pct.toFixed(1)}%"></i></div><div class="small muted">${fmt(me.used_credits,1)} / ${fmt(eff,0)} credits</div>`}</div>
-    <div class="kpi"><div class="lbl">Multiplier</div>
-     <div class="val">×${fmt(me.multiplier,2)}</div>
-     <div class="small muted">current TOU tier: ${esc(tier)}</div></div>
+   <h2>${esc(u.name||u.id)} <span class="small muted">${esc(u.email||'')}</span></h2>
+   <div class="kpi" style="max-width:560px">
+    <div class="lbl">Quota — this ${period}</div>
+    ${pct===null
+      ?'<div class="small muted">no quota set — unlimited</div>'
+      :`<div class="bar"><i class="${cls}" style="width:${pct.toFixed(1)}%"></i></div>
+         <div class="small muted">${fmt(used,0)} / ${fmt(eff,0)} credits used · ${fmt(remain,0)} remaining</div>`}
+   </div>
+   <div class="kpis" style="margin-top:12px">
     <div class="kpi"><div class="lbl">Today</div>
      <div class="val">$${fmt(me.today.cost_usd,2)}</div>
      <div class="small muted">${fmt(me.today.requests,0)} req · ${fmt((me.today.cache_rate||0)*100,0)}% cache · ${fmt(((me.today.tokens||{}).cached||0)+((me.today.tokens||{}).input||0)+((me.today.tokens||{}).output||0),0)} tok · ${fmt(me.today.credits||0,0)} cr</div></div>
-    <div class="kpi"><div class="lbl">Period credits</div>
-     <div class="val">${fmt(me.used_credits,0)}</div>
-     <div class="small muted">used this period (month if monthly)</div></div>
-   </div>
-   <p class="hint">7-day cost trend · $${fmt(cost7,2)} total, ${fmt(req7,0)} requests</p>
-   ${sparkSvg(trend.map(d=>d.cost_usd||0),560,56,'#38bdf8')}
-   <div class="spans" style="margin-top:16px">
-    <button data-myspan="7d" onclick="setMySpan('7d')">7d</button>
-    <button data-myspan="30d" onclick="setMySpan('30d')">30d</button>
-    <span class="small muted">by model · recent · prices</span>
-   </div>
-   <h3>By model</h3>
-   <div class="scroll"><table id="myModelsT"><thead><tr>
-    <th>Model</th><th class="num">Req</th><th class="num">Tokens</th><th class="num">Cache%</th><th class="num">Cost $</th><th>Share</th>
-   </tr></thead><tbody><tr><td colspan="6" class="empty">loading…</td></tr></tbody></table></div>
-   <h3>Recent activity <button style="margin-left:8px" onclick="loadMyRecent()">Refresh</button></h3>
-   <div class="scroll"><table id="myRecentT"><thead><tr>
-    <th>Time</th><th>Model</th><th>Via</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th><th>Tier</th>
-   </tr></thead><tbody><tr><td colspan="8" class="empty">loading…</td></tr></tbody></table></div>
-   <h3>Model prices</h3>
-   <p class="hint">价格为 0 的模型暂未匹配到价目；价格表由后台定期刷新，使用后会按最新价格自动计价（历史未计价记录由 admin reprice 回填）。</p>
-   <div class="scroll"><table id="myPricesT"><thead><tr>
-    <th>Model</th><th class="num">Input $/M</th><th class="num">Output $/M</th><th class="num">Cached $/M</th><th></th>
-   </tr></thead><tbody><tr><td colspan="5" class="empty">loading…</td></tr></tbody></table></div>`;
+    <div class="kpi"><div class="lbl">Multiplier</div>
+     <div class="val">×${fmt(me.multiplier,2)}</div>
+     <div class="small muted">current TOU tier: ${esc((me.tou&&me.tou.current_tier)||'off')}</div></div>
+   </div>`;
   $('secPersonal').hidden=false;
   $('meta').textContent='self-service view';
-  loadPersonal();
 }
 
 // ---------- personal page: by-model / recent / prices ----------
-function setMySpan(k){STATE.personal.span=k;localStorage.setItem('qk_myspan',k);
-  document.querySelectorAll('[data-myspan]').forEach(b=>b.classList.toggle('active',b.dataset.myspan===k));
-  loadMyUsage();}
-async function loadPersonal(){
-  document.querySelectorAll('[data-myspan]').forEach(b=>b.classList.toggle('active',b.dataset.myspan===STATE.personal.span));
-  loadMyUsage();loadMyRecent();loadMyPrices();  // independent lazy loads; each toasts on failure
-}
-async function loadMyUsage(){
-  try{STATE.personal.usage=await api('/me/usage?span='+STATE.personal.span);renderMyModels()}
-  catch(e){toast('Usage load failed: '+e.message)}
-}
-function renderMyModels(){
-  const u=STATE.personal.usage;if(!u)return;
-  const rows=u.models||[],tot=rows.reduce((s,m)=>s+(m.cost_usd||0),0)||1;
-  $('myModelsT').querySelector('tbody').innerHTML=rows.map(m=>{
-    const t=m.tokens||{},tt=(t.cached||0)+(t.input||0)+(t.output||0),pct=(m.cost_usd||0)/tot*100;
-    const ci=(t.cached||0)+(t.input||0),cp=ci?((t.cached||0)/ci*100):0;
-    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(tt,0)}</td><td class="num">${fmt(cp,0)}%</td><td class="num">$${fmt(m.cost_usd,4)}</td><td><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div><span class="pct">${pct.toFixed(1)}%</span></td></tr>`;
-  }).join('')||'<tr><td colspan="6" class="empty">No usage in this span.</td></tr>';
-}
-async function loadMyRecent(){
-  try{STATE.personal.recent=await api('/recent?mine=1');renderMyRecent()}
-  catch(e){toast('Recent load failed: '+e.message)}
-}
-function renderMyRecent(){
-  const items=((STATE.personal.recent||{}).items||[]);
-  $('myRecentT').querySelector('tbody').innerHTML=items.map(it=>{
-    const t=it.tokens||{},dt=new Date((it.ts||0)*1000),p=n=>String(n).padStart(2,'0');
-    const time=(dt.getMonth()+1)+'-'+p(dt.getDate())+' '+p(dt.getHours())+':'+p(dt.getMinutes());
-    const tier=(it.tou_tier&&it.tou_tier!=='off')?`<span class="tag t-${esc(it.tou_tier)}">${esc(it.tou_tier)}</span>`:'';
-    const chan=it.channel==='webui'?'webui':'api';
-    return `<tr><td class="small muted">${time}</td><td>${esc(it.model)}${it.priced===false?' <span class="tag unpriced">unpriced</span>':''}</td><td><span class="tag ch-${chan}">${chan}</span></td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(t.input,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(it.cost_usd,4)}</td><td>${tier}</td></tr>`;
-  }).join('')||'<tr><td colspan="8" class="empty">No activity yet.</td></tr>';
-}
-async function loadMyPrices(){
-  try{STATE.personal.models=await api('/models');renderMyPrices()}
-  catch(e){toast('Prices load failed: '+e.message)}
-}
-function renderMyPrices(){
-  const items=((STATE.personal.models||{}).items||[]).slice().sort((a,b)=>String(a.model).localeCompare(String(b.model)));
-  $('myPricesT').querySelector('tbody').innerHTML=items.map(it=>{
-    const p=it.price||{};
-    const tag=it.override?'<span class="tag manual">manual</span>':(it.matched?'':'<span class="tag unpriced">unmatched</span>');
-    const f=v=>(typeof v==='number')?fmt(v,2):'0';
-    return `<tr><td>${esc(it.model)}</td><td class="num">${f(p.input)}</td><td class="num">${f(p.output)}</td><td class="num">${f(p.cached)}</td><td>${tag}</td></tr>`;
-  }).join('')||'<tr><td colspan="5" class="empty">No models used yet.</td></tr>';
-}
-
 // ---------- SVG helpers ----------
 function sparkSvg(values,w,h,color){
   if(!values||values.length<2)return '<div class="small muted">no trend</div>';
@@ -3128,10 +3065,15 @@ def _mount_guard(app, page_path: str, api_prefix: str) -> int:
 qk_router = APIRouter()
 
 
-@qk_router.get("/config", dependencies=[Depends(_require_admin)])
-async def api_config(request: Request):
+@qk_router.get("/config", dependencies=[Depends(_require_user)])
+async def api_config(request: Request, user=Depends(_require_user)):
     cfg = qk_get_config()
     cfg["_time_multiplier"] = qk_time_multiplier(cfg)
+    # non-admins: strip the admin-only quota tables (they can see their own
+    # effective quota via /me); keep pricing/aliases/schedule for rendering
+    if getattr(user, "role", "") != "admin":
+        cfg = {k: v for k, v in cfg.items()
+               if k not in ("user_quotas", "group_quotas")}
     return JSONResponse(cfg)
 
 
@@ -3191,11 +3133,13 @@ async def api_recent(request: Request, user=Depends(_require_user)):
     return JSONResponse({"items": items})
 
 
-@qk_router.get("/stats", dependencies=[Depends(_require_admin)])
-async def api_stats(request: Request):
+@qk_router.get("/stats", dependencies=[Depends(_require_user)])
+async def api_stats(request: Request, user=Depends(_require_user)):
     q = request.query_params
     led_users = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {})
     gmap = await qk_group_ids_map(led_users.keys())
+    # non-admins can only ever query their own usage (server-enforced)
+    uid = q.get("user") if getattr(user, "role", "") == "admin" else user.id
     wstart = q.get("window_start")
     try:
         wstart = float(wstart) if wstart is not None else None
@@ -3205,10 +3149,10 @@ async def api_stats(request: Request):
         # rolling window (the "24h" span): per-request epoch timestamps from
         # recent.json -- no calendar-day/hour-bucket trimming, no timezone math
         return JSONResponse(
-            qk_stats_window(wstart, q.get("user"), q.get("model"), group_ids_map=gmap)
+            qk_stats_window(wstart, uid, q.get("model"), group_ids_map=gmap)
         )
     return JSONResponse(
-        qk_stats(q.get("from"), q.get("to"), q.get("user"), q.get("model"),
+        qk_stats(q.get("from"), q.get("to"), uid, q.get("model"),
                  q.get("granularity", "day"), group_ids_map=gmap)
     )
 

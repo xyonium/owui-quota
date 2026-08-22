@@ -379,11 +379,26 @@ def test_admin_read_endpoints_require_admin(load_admin, monkeypatch):
     assert c.get("/api/v1/quota-keeper/stats").status_code == 200
 
 
-def test_stats_forbidden_for_plain_user(load_admin, monkeypatch):
-    _stub_self_user(monkeypatch, role="user")
+def test_stats_self_service_for_plain_user(load_admin, monkeypatch):
+    # v0.5.24: /stats is self-service — a plain user gets 200 with their OWN
+    # usage only (server-enforced), never another user's
+    _stub_self_user(monkeypatch, role="user", uid="u1")
+    from pathlib import Path
+    from tests.conftest import write_json
+    write_json(Path(load_admin().QK_LEDGER_PATH), {"users": {
+        "u1": {"name": "U", "email": "u1@x", "days": {
+            "2026-08-21": {"requests": 2, "cost_usd": 0.01, "tokens": {"cached": 0, "input": 2, "output": 1}, "models": {"m/x": {"requests": 2}}},
+        }},
+        "u2": {"name": "V", "email": "v@x", "days": {
+            "2026-08-21": {"requests": 99, "cost_usd": 9.9, "tokens": {"cached": 0, "input": 99, "output": 99}, "models": {"m/y": {"requests": 99}}},
+        }},
+    }})
     c, _ = _app(load_admin)
-    assert c.get("/api/v1/quota-keeper/stats").status_code == 403
-    # /recent is no longer admin-only: a plain user gets their own feed
+    r = c.get("/api/v1/quota-keeper/stats?from=2026-08-21&to=2026-08-21")
+    assert r.status_code == 200
+    assert r.json()["kpi"]["requests"] == 2          # own only
+    assert [u["user_id"] for u in r.json()["users"]] == ["u1"]
+    # /recent is self-service too
     assert c.get("/api/v1/quota-keeper/recent").status_code == 200
 
 
@@ -559,16 +574,17 @@ def test_page_is_login_gated_not_admin_gated(load_admin, monkeypatch):
 
     page = client.get("/quota")
     assert page.status_code == 200, "non-admin must be able to load the page"
-    assert "renderPersonal" in page.text  # the role-split branch ships in the SPA
+    assert "renderPersonalHeader" in page.text  # the role-split branch ships in the SPA
     assert client.get("/api/v1/quota-keeper/me").status_code == 200
-    # ...but the admin surface stays closed to them. /recent and /models are
-    # now self-service (own-data-only via the server-enforced filter), so they
-    # return 200 here; the rest must stay admin-only.
-    for path in ("/config", "/users", "/groups", "/ledger", "/pricing", "/stats"):
+    # v0.5.24: the shared dashboard needs /config and /stats — they are now
+    # self-service (user-scoped server-side); the rest stay admin-only.
+    for path in ("/users", "/groups", "/ledger", "/pricing"):
         r = client.get(f"/api/v1/quota-keeper{path}")
         assert r.status_code == 403, f"{path} must stay admin-only (got {r.status_code})"
     # self-service endpoints reachable but scoped to the caller
     assert client.get("/api/v1/quota-keeper/recent?mine=1").status_code == 200
+    assert client.get("/api/v1/quota-keeper/config").status_code == 200
+    assert client.get("/api/v1/quota-keeper/stats").status_code == 200
     assert client.get("/api/v1/quota-keeper/models?mine=1").status_code == 200
     assert client.get("/api/v1/quota-keeper/me/usage").status_code == 200
 
