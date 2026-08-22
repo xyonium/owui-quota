@@ -310,6 +310,11 @@ v0.5.12 新增：
 
 32. **24h KPI 卡 200（recent 环形缓冲上限）**（filter v0.4.14 / admin v0.5.12 修复）：24h 视图的 KPI 从 recent.json 统计，而 recent 是 200 条环形缓冲 → 24h 内请求超 200 时 KPI 卡在 200（`window_partial` 标记但数字假）。修：`qk_stats_window` 的 **KPI 改从 ledger 的 hours 桶聚合**（精确、无截断；hours 桶新增 `channels` 字段，filter + admin 记账时同步写入）。recent 仍驱动 per-user/per-model 明细表和序列（截断仍以 `window_partial` 标记）。**模型过滤时** hours 桶不可用（跨模型）→ 回退 recent 累加。unpriced 从 day 级 models 按"窗口内有 hours 桶的 day"聚合。**注意**：hours 桶是整小时聚合，滚动窗口的当前部分小时会被整算（近似，可接受）。
 
+
+v0.5.16 新增：
+
+33. **24h 下 user ranking drill 显示 no usage**（admin v0.5.16 修复）：v0.5.12 改 24h KPI 用 ledger hours 桶后，点击 user ranking 的 drill 仍请求 `from/to&granularity=day`（不带 window_start）→ 走 day 聚合，与 24h 主统计不一致；且该 user 的 recent 条目可能被挤出 200 条缓冲 → "No usage in span"。修：(a) `toggleDrill` 24h 时传 `window_start&granularity=hour`；(b) `qk_stats_window` 在 `user=` 过滤时，per-model 表改从 **ledger 的 day/models 精确聚合**（窗口内有 hours 桶的 day），recent 循环跳过 mrows（防双算）。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。

@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.15
+version: 0.5.16
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1486,23 +1486,26 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
         row["models"].add(m)
         for k in ("cached", "input", "output"):
             row["tokens"][k] += float(tok.get(k) or 0.0)
-        mk = mrows.get(m)
-        if mk is None:
-            mk = mrows[m] = {
-                "model": m, "requests": 0,
-                "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
-                "cost_usd": 0.0, "users": set(), "unpriced_requests": 0,
-                "tou": {"peak": 0, "offpeak": 0, "normal": 0}, "cost_saved_usd": 0.0,
-            }
-        mk["requests"] += 1
-        mk["cost_usd"] += cost
-        mk["users"].add(uid)
-        mk["unpriced_requests"] += 0 if priced else 1
-        tier = it.get("tou_tier")
-        if tier in mk["tou"]:
-            mk["tou"][tier] += 1
-        for k in ("cached", "input", "output"):
-            mk["tokens"][k] += float(tok.get(k) or 0.0)
+        if not user:
+            # user-filtered per-model tables come from the ledger below
+            # (exact); recent would double-count or under-count here.
+            mk = mrows.get(m)
+            if mk is None:
+                mk = mrows[m] = {
+                    "model": m, "requests": 0,
+                    "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                    "cost_usd": 0.0, "users": set(), "unpriced_requests": 0,
+                    "tou": {"peak": 0, "offpeak": 0, "normal": 0}, "cost_saved_usd": 0.0,
+                }
+            mk["requests"] += 1
+            mk["cost_usd"] += cost
+            mk["users"].add(uid)
+            mk["unpriced_requests"] += 0 if priced else 1
+            tier = it.get("tou_tier")
+            if tier in mk["tou"]:
+                mk["tou"][tier] += 1
+            for k in ("cached", "input", "output"):
+                mk["tokens"][k] += float(tok.get(k) or 0.0)
         # hourly series keyed by the bucket's LOCAL (schedule-tz) day+hour so
         # the trend labels line up with the day-based spans
         bkey = datetime.fromtimestamp(ts, qk_local_now(cfg).tzinfo).strftime("%Y-%m-%dT%H")
@@ -1523,6 +1526,47 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
     # KPI totals are exact (ledger); the per-user/per-model TABLES below are
     # still recent-limited, so keep the partial flag for those.
     kpi["window_partial"] = bool(oldest is not None and oldest > wstart and len(items) >= 200)
+    # Drill-down: when a specific user is requested, the per-model table must
+    # be EXACT too (recent is a 200-entry subset that may not contain this
+    # user's requests under load). Aggregate the user's day-level models for
+    # days that have hour buckets inside the window.
+    if user:
+        for uid, u in led_all.items():
+            if uid != user and (u or {}).get("name") != user and (u or {}).get("email") != user:
+                continue
+            for day, drec in ((u or {}).get("days") or {}).items():
+                drec = drec or {}
+                in_window = False
+                for hour_str in (drec.get("hours") or {}):
+                    try:
+                        bts = datetime.strptime(f"{day}T{int(hour_str):02d}", "%Y-%m-%dT%H").replace(
+                            tzinfo=now_dt.tzinfo).timestamp()
+                    except Exception:
+                        continue
+                    if wstart <= bts <= now_dt.timestamp():
+                        in_window = True
+                        break
+                if not in_window:
+                    continue
+                for m, mm in ((drec.get("models") or {}).items()):
+                    mm = mm or {}
+                    mk = mrows.get(m)
+                    if mk is None:
+                        mk = mrows[m] = {
+                            "model": m, "requests": 0,
+                            "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                            "cost_usd": 0.0, "users": set(), "unpriced_requests": 0,
+                            "tou": {"peak": 0, "offpeak": 0, "normal": 0}, "cost_saved_usd": 0.0,
+                        }
+                    mk["requests"] += mm.get("requests", 0) or 0
+                    mk["cost_usd"] += mm.get("cost_usd", 0) or 0
+                    mk["users"].add(uid)
+                    mk["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
+                    for k in ("cached", "input", "output"):
+                        mk["tokens"][k] += (mm.get("tokens") or {}).get(k, 0) or 0
+                    for tname, tv in ((mm.get("tou") or {}).items()):
+                        if tname in mk["tou"]:
+                            mk["tou"][tname] += tv or 0
     for row in urows.values():
         row["models"] = len(row["models"])
     for mk in mrows.values():
@@ -2569,7 +2613,14 @@ async function toggleDrill(tr){
     dr.innerHTML='<td colspan="8" class="empty">loading…</td>';
     tr.after(dr);
     try{
-      data=await api(`/stats?user=${encodeURIComponent(uid)}&from=${sp.from}&to=${sp.to}&granularity=day`);
+      // 24h: match the main stats (rolling window via hours buckets), not a
+      // day-aggregated from/to query — otherwise the drill shows nothing while
+      // the KPI has data
+      if(sp.window_start){
+        data=await api(`/stats?user=${encodeURIComponent(uid)}&window_start=${sp.window_start}&granularity=hour`);
+      }else{
+        data=await api(`/stats?user=${encodeURIComponent(uid)}&from=${sp.from}&to=${sp.to}&granularity=day`);
+      }
     }catch(e){dr.innerHTML=`<td colspan="8" class="empty">${esc(e.message)}</td>`;return}
     STATE.drill[uid]=data;
     dr.remove();
