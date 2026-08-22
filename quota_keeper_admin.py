@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.32
+version: 0.5.33
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2138,21 +2138,21 @@ tr.pe-cleared td{opacity:.45}
   <div id="matchResult"></div>
  </section>
 
- <section id="secGroups" hidden>
-  <h2>Group quotas (highest wins)</h2>
+ <details id="secGroups" hidden>
+  <summary>Group quotas (highest wins)</summary>
   <p class="hint">A user in several groups gets the max of those group quotas. A user-level quota overrides groups entirely.</p>
   <div class="scroll">
   <table id="groups"><thead><tr><th>Group</th><th style="width:180px">Quota (credits)</th><th class="num">Members</th></tr></thead><tbody></tbody></table>
   </div>
- </section>
+ </details>
 
- <section id="secUserq" hidden>
-  <h2>User quotas (highest priority)</h2>
+ <details id="secUserq" hidden>
+  <summary>User quotas (highest priority)</summary>
   <p class="hint">Leave empty to inherit from groups / default. Used column is the current stats span.</p>
   <div class="scroll">
   <table id="userq"><thead><tr><th>User</th><th style="width:180px">Quota (credits)</th><th>Source</th><th class="num">Used (span)</th><th class="num">Quota%</th></tr></thead><tbody></tbody></table>
   </div>
- </section>
+ </details>
 
  <details id="secPricingEditor" hidden>
   <summary>Pricing editor (your models → match &amp; overrides)</summary>
