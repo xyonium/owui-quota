@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.18
+version: 0.5.19
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1902,6 +1902,12 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 .tag.ch-webui{color:var(--ok);border-color:var(--ok)}
 .tag.ch-api{color:var(--acc);border-color:var(--acc)}
 .toast{position:fixed;right:18px;bottom:18px;padding:10px 16px;border-radius:10px;background:var(--card);border:1px solid var(--line);box-shadow:0 8px 30px rgba(0,0,0,.4);opacity:0;transition:.25s;z-index:99}
+/* scrollbar matches the dark theme */
+*{scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+*::-webkit-scrollbar{width:9px;height:9px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:var(--line);border-radius:5px;border:2px solid transparent;background-clip:content-box}
+*::-webkit-scrollbar-thumb:hover{background:var(--acc);border:2px solid transparent;background-clip:content-box}
 .toast.show{opacity:1}
 .admin-only{display:none}
 .muted{color:var(--mut)}
@@ -2023,7 +2029,7 @@ tr.pe-cleared td{opacity:.45}
   <table id="modelsT">
    <thead><tr>
     <th>Model</th><th class="num">Requests</th><th class="num">Users</th>
-    <th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th>
+    <th class="num">Cached</th><th class="num">Cache%</th><th class="num">Input</th><th class="num">Output</th>
     <th class="num">Cost $</th><th class="num">Blended $/M</th><th class="num">Saved $</th><th>TOU</th>
    </tr></thead>
    <tbody></tbody>
@@ -2254,7 +2260,7 @@ function renderPersonal(){
      <div class="small muted">current TOU tier: ${esc(tier)}</div></div>
     <div class="kpi"><div class="lbl">Today</div>
      <div class="val">$${fmt(me.today.cost_usd,2)}</div>
-     <div class="small muted">${fmt(me.today.requests,0)} requests</div></div>
+     <div class="small muted">${fmt(me.today.requests,0)} req · ${fmt((me.today.cache_rate||0)*100,0)}% cache · ${fmt(((me.today.tokens||{}).cached||0)+((me.today.tokens||{}).input||0)+((me.today.tokens||{}).output||0),0)} tok · ${fmt(me.today.credits||0,0)} cr</div></div>
     <div class="kpi"><div class="lbl">Period credits</div>
      <div class="val">${fmt(me.used_credits,0)}</div>
      <div class="small muted">used this period (month if monthly)</div></div>
@@ -2268,8 +2274,8 @@ function renderPersonal(){
    </div>
    <h3>By model</h3>
    <div class="scroll"><table id="myModelsT"><thead><tr>
-    <th>Model</th><th class="num">Req</th><th class="num">Tokens</th><th class="num">Cost $</th><th>Share</th>
-   </tr></thead><tbody><tr><td colspan="5" class="empty">loading…</td></tr></tbody></table></div>
+    <th>Model</th><th class="num">Req</th><th class="num">Tokens</th><th class="num">Cache%</th><th class="num">Cost $</th><th>Share</th>
+   </tr></thead><tbody><tr><td colspan="6" class="empty">loading…</td></tr></tbody></table></div>
    <h3>Recent activity <button style="margin-left:8px" onclick="loadMyRecent()">Refresh</button></h3>
    <div class="scroll"><table id="myRecentT"><thead><tr>
     <th>Time</th><th>Model</th><th>Via</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th><th>Tier</th>
@@ -2301,8 +2307,9 @@ function renderMyModels(){
   const rows=u.models||[],tot=rows.reduce((s,m)=>s+(m.cost_usd||0),0)||1;
   $('myModelsT').querySelector('tbody').innerHTML=rows.map(m=>{
     const t=m.tokens||{},tt=(t.cached||0)+(t.input||0)+(t.output||0),pct=(m.cost_usd||0)/tot*100;
-    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(tt,0)}</td><td class="num">$${fmt(m.cost_usd,4)}</td><td><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div><span class="pct">${pct.toFixed(1)}%</span></td></tr>`;
-  }).join('')||'<tr><td colspan="5" class="empty">No usage in this span.</td></tr>';
+    const ci=(t.cached||0)+(t.input||0),cp=ci?((t.cached||0)/ci*100):0;
+    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(tt,0)}</td><td class="num">${fmt(cp,0)}%</td><td class="num">$${fmt(m.cost_usd,4)}</td><td><div class="bar"><i style="width:${pct.toFixed(1)}%"></i></div><span class="pct">${pct.toFixed(1)}%</span></td></tr>`;
+  }).join('')||'<tr><td colspan="6" class="empty">No usage in this span.</td></tr>';
 }
 async function loadMyRecent(){
   try{STATE.personal.recent=await api('/recent?mine=1');renderMyRecent()}
@@ -2569,6 +2576,7 @@ function renderModels(){
     const t=m.tokens||{},tou=m.tou||{};
     const ttags=['peak','offpeak','normal'].filter(n=>(tou[n]||0)>0).map(n=>`<span class="tag t-${n}">${n} ${fmt(tou[n],0)}</span>`).join('');
     const sv=m.cost_saved_usd||0;
+    const ci=(t.cached||0)+(t.input||0),cp=ci?((t.cached||0)/ci*100):0;
     return `<tr>
      <td>${esc(m.model)}
        ${m.unpriced_requests>0?`<span class="tag unpriced">unpriced</span><button class="small" onclick="reprice('${esc(m.model)}')">reprice</button>`:''}
@@ -2577,6 +2585,7 @@ function renderModels(){
      <td class="num">${fmt(m.requests,0)}</td>
      <td class="num">${fmt(m.users,0)}</td>
      <td class="num">${fmt(t.cached,0)}</td>
+     <td class="num">${fmt(cp,0)}%</td>
      <td class="num">${fmt(t.input,0)}</td>
      <td class="num">${fmt(t.output,0)}</td>
      <td class="num">$${fmt(m.cost_usd,2)}</td>
@@ -3215,8 +3224,10 @@ async def api_me(request: Request, user=Depends(_require_user)):
     now = qk_local_now(cfg)
     pref = now.strftime("%Y-%m-")
     used_month = sum((d or {}).get("cost_usd", 0) or 0 for k, d in days.items() if k.startswith(pref))
-    used_day = ((days.get(now.strftime("%Y-%m-%d")) or {}).get("cost_usd", 0)) or 0
+    today_d = days.get(now.strftime("%Y-%m-%d")) or {}
+    used_day = today_d.get("cost_usd", 0) or 0
     cpu_ = float(cfg.get("credits_per_usd") or 1000.0)
+    today_tok = today_d.get("tokens") or {}
     trend = []
     for i in range(6, -1, -1):
         kd = (now - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -3232,7 +3243,12 @@ async def api_me(request: Request, user=Depends(_require_user)):
             "effective_quota": (quota * mult) if quota is not None else None,
             "used_credits": used_month * cpu_ if (cfg.get("quota_period") == "monthly") else used_day * cpu_,
             "today": {"cost_usd": used_day,
-                      "requests": (days.get(now.strftime("%Y-%m-%d")) or {}).get("requests", 0)},
+                      "requests": today_d.get("requests", 0),
+                      "credits": used_day * cpu_,
+                      "tokens": today_tok,
+                      "cache_rate": ((today_tok.get("cached") or 0) /
+                                     ((today_tok.get("cached") or 0) + (today_tok.get("input") or 0)))
+                                     if ((today_tok.get("cached") or 0) + (today_tok.get("input") or 0)) else 0.0},
             "trend": trend,
             "tou": {"current_tier": None},  # UI contract field; wired once the page has a per-user model list
         }
@@ -3336,6 +3352,16 @@ async def api_models(request: Request, user=Depends(_require_user)):
                 row["requests"] += mm.get("requests", 0) or 0
                 row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
                 row["cost_usd"] += mm.get("cost_usd", 0) or 0
+
+    # Self-service price list: the user's own models PLUS every priced model
+    # in the table (so the page shows what's available at what cost, not just
+    # what they happened to use). Unpriced rows only appear if the user used
+    # them (flagged unmatched).
+    if mine:
+        for m in table:
+            if m in used:
+                continue
+            used.setdefault(m, {"requests": 0, "unpriced_requests": 0, "cost_usd": 0.0})
 
     ids = sorted(used, key=str.lower)
     items = []
