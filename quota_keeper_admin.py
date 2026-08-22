@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.24
+version: 0.5.25
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2227,10 +2227,12 @@ async function init(){
     const secs=['secDash','secModels','secRecent'];
     if(isAdmin)secs.push('secUsers','secGeneral','secSchedule','secPricing','secGroups','secUserq','secPricingEditor','secTou');
     secs.forEach(id=>{const el=$(id);if(el)el.hidden=false});
+    STATE.isAdmin=isAdmin;
     if(!isAdmin){
       // non-admin: no quota editors; show the personal header with a
       // remaining-credits progress bar
       renderPersonalHeader();
+      lockNonAdminUi();
     }
     renderMeta();renderConfig();renderGroups();renderUsersQ();renderTou();initSpanUI();
     await loadStats();
@@ -2244,24 +2246,30 @@ function renderMeta(){
 
 // ---------- non-admin view ----------
 function renderPersonalHeader(){
-  // Non-admin header: remaining-credits progress bar (period = daily or
-  // monthly per config) + today summary. The dashboard below is shared with
-  // the admin view, filtered to this user server-side via /stats.
+  // Non-admin header: a prominent REMAINING-credits progress bar keyed to the
+  // configured quota period (daily | monthly), then the today summary. The
+  // bar fills with what's LEFT (drains as you spend); it flips warn/bad as the
+  // remainder runs out. The dashboard below is shared with the admin view,
+  // filtered to this user server-side via /stats.
   const me=STATE.me,u=me.user||{};
-  const eff=me.effective_quota;
-  const used=me.used_credits||0;
-  const pct=(eff>0)?Math.min(100,used/eff*100):null;
-  const cls=pct===null?'':(pct>=100?'bad':pct>=80?'warn':'');
-  const period=(STATE.cfg.quota_period||'daily')==='monthly'?'month':'day';
-  const remain=(eff>0)?Math.max(0,eff-used):null;
+  const eff=me.effective_quota;         // resolved quota x time multiplier, in credits
+  const used=me.used_credits||0;        // credits already spent this period
+  const isMonthly=(STATE.cfg.quota_period||'daily')==='monthly';
+  const period=isMonthly?'Monthly':'Daily';
+  const unlimited=!(eff>0);
+  const remain=unlimited?null:Math.max(0,eff-used);
+  // fill = fraction of quota REMAINING (1 -> full bar, 0 -> empty)
+  const remPct=unlimited?null:Math.min(100,(remain/eff)*100);
+  const cls=remPct===null?'':(remPct<=0?'bad':remPct<=20?'bad':remPct<=40?'warn':'');
   $('secPersonal').innerHTML=`
    <h2>${esc(u.name||u.id)} <span class="small muted">${esc(u.email||'')}</span></h2>
    <div class="kpi" style="max-width:560px">
-    <div class="lbl">Quota — this ${period}</div>
-    ${pct===null
-      ?'<div class="small muted">no quota set — unlimited</div>'
-      :`<div class="bar"><i class="${cls}" style="width:${pct.toFixed(1)}%"></i></div>
-         <div class="small muted">${fmt(used,0)} / ${fmt(eff,0)} credits used · ${fmt(remain,0)} remaining</div>`}
+    <div class="lbl">${period} quota — credits remaining</div>
+    ${unlimited
+      ?'<div class="val">∞</div><div class="small muted">no quota set — unlimited</div>'
+      :`<div class="val">${fmt(remain,0)} <span class="small muted">/ ${fmt(eff,0)} credits</span></div>
+         <div class="bar"><i class="${cls}" style="width:${remPct.toFixed(1)}%"></i></div>
+         <div class="small muted">${fmt(remain,0)} left · ${fmt(used,0)} used this ${isMonthly?'month':'day'} (${fmt(100-remPct,1)}% spent)</div>`}
    </div>
    <div class="kpis" style="margin-top:12px">
     <div class="kpi"><div class="lbl">Today</div>
@@ -2273,6 +2281,28 @@ function renderPersonalHeader(){
    </div>`;
   $('secPersonal').hidden=false;
   $('meta').textContent='self-service view';
+}
+
+// Non-admin UI lock-down: the dashboard is shared with the admin view, but a
+// plain user must not (a) retarget the User filter at someone else, or (b)
+// touch the reprice/backfill controls (the /pricing/reprice route is
+// admin-only; exposing the button would just 403). The stats endpoints already
+// enforce own-data-only server-side -- this is presentation hardening.
+function lockNonAdminUi(){
+  const u=STATE.me.user||{};
+  // 1) pin the User filter to self and make it read-only
+  const fu=$('fUser');
+  if(fu){
+    fu.value=u.name||u.email||u.id||'';
+    fu.disabled=true;
+    fu.title='non-admin: your own usage only';
+  }
+  // 2) hide the models-section reprice/backfill row (Backfill days + Reprice)
+  const rd=$('repriceDays');
+  if(rd){
+    const row=rd.closest('.filters');
+    if(row)row.hidden=true;
+  }
 }
 
 // ---------- personal page: by-model / recent / prices ----------
@@ -2328,7 +2358,12 @@ function setCustom(which){
 async function loadStats(){
   const sp=spanDates();
   if(!sp){toast('Set both custom dates');return}
-  STATE.filter.user=$('fUser').value.trim();
+  // non-admins are pinned to their own usage regardless of the (disabled)
+  // fUser input; the server enforces this too, this just keeps the client
+  // consistent. Admins read the input freely.
+  STATE.filter.user=STATE.isAdmin===false
+    ?(STATE.me.user||{}).name||(STATE.me.user||{}).id||''
+    :$('fUser').value.trim();
   STATE.filter.model=$('fModel').value;
   const qs=new URLSearchParams({from:sp.from,to:sp.to,granularity:sp.gran});
   if(sp.window_start)qs.set('window_start',sp.window_start);
@@ -2516,7 +2551,7 @@ function renderModels(){
     const ci=(t.cached||0)+(t.input||0),cp=ci?((t.cached||0)/ci*100):0;
     return `<tr>
      <td>${esc(m.model)}
-       ${m.unpriced_requests>0?`<span class="tag unpriced">unpriced</span><button class="small" onclick="reprice('${esc(m.model)}')">reprice</button>`:''}
+       ${m.unpriced_requests>0?`<span class="tag unpriced">unpriced</span>${STATE.isAdmin!==false?`<button class="small" onclick="reprice('${esc(m.model)}')">reprice</button>`:''}`:''}
        <button class="small" data-mi="${i}" onclick="matchModel(this)">match</button>
        <span class="match-out"></span></td>
      <td class="num">${fmt(m.requests,0)}</td>
