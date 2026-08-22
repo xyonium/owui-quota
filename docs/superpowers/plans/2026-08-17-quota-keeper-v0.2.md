@@ -113,7 +113,7 @@ def test_modules_load(qk, load_admin):
 
 - [ ] **Step 3: Run**
 
-Run: `cd /home/eli/owui-quota && python3 -m pytest tests/test_smoke.py -v`
+Run: `cd <repo-root> && python3 -m pytest tests/test_smoke.py -v`
 Expected: PASS (2 modules imported). If fastapi/pydantic real packages interfere, ensure `_stub_pydantic` runs first (it does — loaders call it when absent).
 
 - [ ] **Step 4: Commit**

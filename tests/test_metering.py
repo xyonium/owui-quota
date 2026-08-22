@@ -418,3 +418,66 @@ def test_period_used_weekly_sums_iso_week(qk, monkeypatch, tmp_path):
     write_json(tmp_path / "quota_keeper" / "ledger.json", {"users": {"u1": {"days": days}}})
     qk.JC._store.clear()  # mtime cache: force re-read of the fresh ledger
     assert qk.qk_period_used_usd("u1", cfg) == pytest.approx(5.0)
+
+
+# --- Shared-helper sync guards (run against BOTH modules) -------------------
+# Regression: the filter shipped without defining QK_PRICE_FIELDS (it was only
+# defined in the admin module), so every qk_find_pricing call that consulted an
+# override raised NameError -- silently swallowed by the filter's fail-open
+# handler, so usage was never metered. These exercise the override paths on the
+# filter module too, which the rest of the suite only ran against admin.
+
+
+def test_price_fields_constant_defined_in_both(qk, load_admin):
+    for mod in (qk, load_admin()):
+        assert mod.QK_PRICE_FIELDS == ("input", "cached", "cache_write", "output")
+
+
+def test_find_pricing_override_shapes_both(qk, load_admin):
+    table = {"m/x": {"input": 1.0, "output": 2.0, "cached": None, "cache_write": None}}
+    for mod in (qk, load_admin()):
+        # legacy direct prices + multiplier
+        price, how = mod.qk_find_pricing("m/x", table, {"m/x": {"input": 5, "output": 10, "multiplier": 2}})
+        assert price["input"] == 10.0 and price["output"] == 20.0
+        assert how == "override:m/x*2.0"
+        # multiplier-only scales the upstream table match
+        price, how = mod.qk_find_pricing("m/x", table, {"m/x": {"multiplier": 3}})
+        assert price["input"] == 3.0 and price["output"] == 6.0
+        assert how == "exact:m/x*3.0"
+        # wrapped prices
+        price, how = mod.qk_find_pricing("m/x", table, {"m/x": {"prices": {"input": 7, "output": 9}}})
+        assert price["input"] == 7.0 and price["output"] == 9.0
+        # alias to a table key
+        price, how = mod.qk_find_pricing("other", table, {"other": {"alias": "m/x"}})
+        assert price["input"] == 1.0 and how.startswith("alias:m/x")
+
+
+def test_validate_config_override_paths_both(qk, load_admin):
+    for mod in (qk, load_admin()):
+        # valid override shapes -> no errors
+        assert not mod.qk_validate_config({"pricing": {"overrides": {"m/x": {"input": 1, "multiplier": 2}}}})
+        assert not mod.qk_validate_config({"pricing": {"overrides": {"m/x": {"multiplier": 3}}}})  # multiplier-only
+        assert not mod.qk_validate_config({"pricing": {"overrides": {"m/x": {"alias": "y"}}}})
+        # invalid multiplier (any shape) -> error
+        assert mod.qk_validate_config({"pricing": {"overrides": {"m/x": {"input": 1, "multiplier": -1}}}})
+        assert mod.qk_validate_config({"pricing": {"overrides": {"m/x": {"alias": "y", "multiplier": 0}}}})
+        # negative price field -> error
+        assert mod.qk_validate_config({"pricing": {"overrides": {"m/x": {"prices": {"input": -2}}}}})
+
+
+def test_record_usage_with_override_meters_cost(qk, tmp_path):
+    # The exact call that NameError'd before the fix: qk_record_usage always
+    # consults pricing.overrides via qk_find_pricing. With an override price
+    # configured, the model must meter a non-zero cost (priced, not unpriced).
+    from tests.conftest import write_json
+    cfg = qk.qk_get_config()
+    cfg["pricing"]["overrides"] = {"m/x": {"input": 10.0, "output": 20.0}}
+    qk.qk_atomic_write(qk.QK_CONFIG_PATH, cfg)
+    qk.JC._store.clear()
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u@x.com"},
+                       "m/x", {"cached": 0, "input": 1_000_000, "output": 1_000_000, "cache_write": 0})
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    mm = list(led["users"]["u1"]["days"].values())[0]["models"]["m/x"]
+    assert mm["unpriced_requests"] == 0
+    # input 1M @ $10 + output 1M @ $20 = $30 (TOU disabled -> rate 1)
+    assert mm["cost_usd"] == pytest.approx(30.0)

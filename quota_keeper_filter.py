@@ -174,6 +174,8 @@ def qk_deep_merge(base, patch):
 
 _QK_NUM = lambda v: not isinstance(v, bool) and isinstance(v, (int, float))
 
+QK_PRICE_FIELDS = ("input", "cached", "cache_write", "output")
+
 
 def qk_validate_config(cfg) -> list:
     errs = []

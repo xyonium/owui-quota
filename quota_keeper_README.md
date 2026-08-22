@@ -71,7 +71,7 @@
 ## 数据与安全
 
 - 所有数据存放在 `$DATA_DIR/quota_keeper/`（config.json / ledger.json / pricing_cache.json / recent.json），原子写入 + 文件锁，不改动 Open WebUI 数据库。
-- API 挂载在 `/api/v1/quota-keeper/*`，页面在 `/quota`（两者都经 Event 函数 Valves 可改前缀），全部要求 admin 会话。
+- API 挂载在 `/api/v1/quota-keeper/*`，页面在 `/quota`（两者都经 Event 函数 Valves 可改前缀），全部要求**登录会话**；其中 admin-only 路由强制 `role=admin`，而 `/me`、`/recent`、`/stats`、`/models` 对非管理员按会话用户本人数据服务端限流（`/quota` 页面对 admin 渲染完整控制台、对普通用户渲染自助卡片）。
 - Filter 默认 fail-open（计量/查询出错不阻断对话），admin 默认豁免，后台任务（标题/标签生成）不拦截但仍记账。
 - 流式响应在终止 chunk 上读取 usage（OpenAI 风格 `prompt_tokens_details.cached_tokens` 与 Anthropic 风格 `cache_read_input_tokens` 均支持），非流式在 outlet 读取；按响应 id 去重防重复记账。
 
@@ -140,7 +140,7 @@
 | 管理台「用户」「组」列表为空，或组配额不生效；日志有 `users fetch failed: 'coroutine' object is not iterable` | OWUI >= 0.10 的 models 层全面 async 化（`get_users` 变协程且返回分页 dict、`get_groups` 必填 `filter`、`UserModel` 不再有 `group_ids`），v0.2.0-0.2.2 的同步调用全部落空 | **两个函数文件都**升级到 >= 0.2.3（filter 的组配额解析也在此修复） |
 | 改了 `route_prefix` / `api_prefix` Valve | 保存 Valve 即触发重挂载，**新路径立即生效**；旧前缀路由找不到归属、残留在路由表直到重启（无害空壳） | 重启容器清掉旧前缀 |
 | 重启容器后全部 404 且日志没有 quota-keeper 行 | Event 函数未启用，或 OWUI < 0.10 不支持 Event 类型 | 启用函数 / 升级 OWUI |
-| `/quota` 返回 401/403 | 未登录或会话失效；页面要求 admin 会话，普通用户的自助卡片数据走 `/me` | 先登录 OWUI；API 用 `Authorization: Bearer` |
+| `/quota` 返回 401/403 | 未登录或会话失效；页面只需登录会话（admin 见控制台，普通用户见自助卡片），但 admin-only API 要求 `role=admin` | 先登录 OWUI；API 用 `Authorization: Bearer` |
 | 用 `:main` / `:main-slim` 滚动镜像，重启后行为变了 | 滚动 tag 每次拉新构建，行为可能变化 | `docker exec open-webui env \| grep WEBUI_BUILD_VERSION` 记录当前构建；生产建议锁定 release tag |
 
 ### 端到端验证计量
