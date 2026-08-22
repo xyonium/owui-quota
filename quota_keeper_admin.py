@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.19
+version: 0.5.20
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3353,16 +3353,9 @@ async def api_models(request: Request, user=Depends(_require_user)):
                 row["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
                 row["cost_usd"] += mm.get("cost_usd", 0) or 0
 
-    # Self-service price list: the user's own models PLUS every priced model
-    # in the table (so the page shows what's available at what cost, not just
-    # what they happened to use). Unpriced rows only appear if the user used
-    # them (flagged unmatched).
-    if mine:
-        for m in table:
-            if m in used:
-                continue
-            used.setdefault(m, {"requests": 0, "unpriced_requests": 0, "cost_usd": 0.0})
-
+    # Self-service price list: only the user's own used models (each with its
+    # resolved price or an unmatched flag). Listing the whole upstream table
+    # flooded the page with hundreds of models nobody used.
     ids = sorted(used, key=str.lower)
     items = []
     for m in ids:
