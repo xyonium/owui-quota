@@ -389,3 +389,32 @@ def test_model_aliases_validated(load_admin):
     assert not adm.qk_validate_config({"model_aliases": {"prx.x": "gemini-3.7-flash"}})
     assert adm.qk_validate_config({"model_aliases": {"prx.x": 42}})         # non-str value
     assert adm.qk_validate_config({"model_aliases": "oops"})                # non-dict
+
+
+def test_quota_period_weekly_accepted(qk, load_admin):
+    # v0.4.16: weekly joins daily|monthly as a valid quota_period on BOTH files
+    # (shared validation block must stay in sync).
+    for mod in (qk, load_admin()):
+        assert not mod.qk_validate_config({"quota_period": "weekly"})
+        assert mod.qk_validate_config({"quota_period": "fortnightly"})  # still rejected
+
+
+def test_period_used_weekly_sums_iso_week(qk, monkeypatch, tmp_path):
+    # weekly period sums Mon..today of the ISO week only -- last Sunday (prev
+    # week) and the same-weekday-last-week are excluded.
+    from datetime import timedelta
+    from tests.conftest import write_json
+
+    cfg = qk.qk_get_config()
+    cfg["quota_period"] = "weekly"
+    now = qk.qk_local_now(cfg)
+    monday = now - timedelta(days=now.weekday())
+    last_sunday = monday - timedelta(days=1)
+    days = {
+        monday.strftime("%Y-%m-%d"): {"cost_usd": 2.0},        # in-week
+        now.strftime("%Y-%m-%d"): {"cost_usd": 3.0},           # today, in-week
+        last_sunday.strftime("%Y-%m-%d"): {"cost_usd": 99.0},  # prev week, excluded
+    }
+    write_json(tmp_path / "quota_keeper" / "ledger.json", {"users": {"u1": {"days": days}}})
+    qk.JC._store.clear()  # mtime cache: force re-read of the fresh ledger
+    assert qk.qk_period_used_usd("u1", cfg) == pytest.approx(5.0)

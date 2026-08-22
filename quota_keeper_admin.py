@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.25
+version: 0.5.26
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -183,8 +183,8 @@ def qk_validate_config(cfg) -> list:
         return ["config must be an object"]
     if "credits_per_usd" in cfg and not (_QK_NUM(cfg["credits_per_usd"]) and cfg["credits_per_usd"] > 0):
         errs.append("credits_per_usd must be a positive number")
-    if "quota_period" in cfg and cfg["quota_period"] not in (None, "daily", "monthly"):
-        errs.append("quota_period must be daily|monthly")
+    if "quota_period" in cfg and cfg["quota_period"] not in (None, "daily", "weekly", "monthly"):
+        errs.append("quota_period must be daily|weekly|monthly")
     for key in ("user_quotas", "group_quotas"):
         if key in cfg and not isinstance(cfg[key], dict):
             errs.append(f"{key} must be an object")
@@ -2056,7 +2056,7 @@ tr.pe-cleared td{opacity:.45}
   <p class="hint">Credits are derived from real cost (USD); 1000 credits = $1 by default. Effective quota = resolved quota (user &gt; max group &gt; default) × time multiplier.</p>
   <div class="row c3">
    <div><label>Credits per USD</label><input id="credits_per_usd" type="number" step="0.01"/></div>
-   <div><label>Quota period</label><select id="quota_period"><option value="daily">daily</option><option value="monthly">monthly</option></select></div>
+   <div><label>Quota period</label><select id="quota_period"><option value="daily">daily</option><option value="weekly">weekly</option><option value="monthly">monthly</option></select></div>
    <div><label>Default quota (credits, empty = unlimited)</label><input id="default_quota_credits" type="number" step="0.01" placeholder="unlimited"/></div>
   </div>
  </section>
@@ -2254,8 +2254,9 @@ function renderPersonalHeader(){
   const me=STATE.me,u=me.user||{};
   const eff=me.effective_quota;         // resolved quota x time multiplier, in credits
   const used=me.used_credits||0;        // credits already spent this period
-  const isMonthly=(STATE.cfg.quota_period||'daily')==='monthly';
-  const period=isMonthly?'Monthly':'Daily';
+  const periodKey=me.quota_period||STATE.cfg.quota_period||'daily';
+  const period={daily:'Daily',weekly:'Weekly',monthly:'Monthly'}[periodKey]||'Daily';
+  const periodNoun={daily:'day',weekly:'week',monthly:'month'}[periodKey]||'day';
   const unlimited=!(eff>0);
   const remain=unlimited?null:Math.max(0,eff-used);
   // fill = fraction of quota REMAINING (1 -> full bar, 0 -> empty)
@@ -2269,18 +2270,44 @@ function renderPersonalHeader(){
       ?'<div class="val">∞</div><div class="small muted">no quota set — unlimited</div>'
       :`<div class="val">${fmt(remain,0)} <span class="small muted">/ ${fmt(eff,0)} credits</span></div>
          <div class="bar"><i class="${cls}" style="width:${remPct.toFixed(1)}%"></i></div>
-         <div class="small muted">${fmt(remain,0)} left · ${fmt(used,0)} used this ${isMonthly?'month':'day'} (${fmt(100-remPct,1)}% spent)</div>`}
+         <div class="small muted">${fmt(remain,0)} left · ${fmt(used,0)} used this ${periodNoun} (${fmt(100-remPct,1)}% spent)</div>`}
    </div>
    <div class="kpis" style="margin-top:12px">
     <div class="kpi"><div class="lbl">Today</div>
      <div class="val">$${fmt(me.today.cost_usd,2)}</div>
      <div class="small muted">${fmt(me.today.requests,0)} req · ${fmt((me.today.cache_rate||0)*100,0)}% cache · ${fmt(((me.today.tokens||{}).cached||0)+((me.today.tokens||{}).input||0)+((me.today.tokens||{}).output||0),0)} tok · ${fmt(me.today.credits||0,0)} cr</div></div>
-    <div class="kpi"><div class="lbl">Multiplier</div>
-     <div class="val">×${fmt(me.multiplier,2)}</div>
-     <div class="small muted">current TOU tier: ${esc((me.tou&&me.tou.current_tier)||'off')}</div></div>
+    ${renderTouCard(me.tou||{})}
    </div>`;
   $('secPersonal').hidden=false;
   $('meta').textContent='self-service view';
+}
+
+// TOU summary card for the personal header: current tier + the full three-tier
+// rate table with active windows, plus which policy level resolved. The day
+// numbering matches qk_tou_rate (JS style: 0=Sunday .. 6=Saturday; empty=all).
+function renderTouCard(tou){
+  if(!tou||!tou.enabled){
+    return `<div class="kpi"><div class="lbl">TOU pricing</div>
+     <div class="val">off</div>
+     <div class="small muted">time-of-use pricing not enabled</div></div>`;
+  }
+  const cur=tou.current_tier||'off';
+  const curRate=tou.current_rate!=null?tou.current_rate:1.0;
+  const srcLbl={model:'model'+(tou.model?': '+tou.model:''),default:'default policy',off:'—'}[tou.policy_source]
+    ||(tou.policy_source&&tou.policy_source.startsWith('provider:')?'provider: '+tou.policy_source.slice(9):(tou.policy_source||'—'));
+  const DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+  const dayStr=ds=>{if(!ds||!ds.length||ds.length>=7)return '每天';return ds.map(d=>DOW[d]||d).join('/')};
+  const rows=(tou.tiers||[]).map(t=>{
+    const wins=(t.windows||[]).map(w=>`${esc(w.start)}-${esc(w.end)} ${dayStr(w.days)}`).join(', ')||'其余时段';
+    const active=t.name===cur?';font-weight:600':'';
+    const dot=t.name===cur?'● ':'';
+    return `<div class="small" style="display:flex;justify-content:space-between;gap:8px${active}">
+      <span>${dot}${t.name} ×${fmt(t.rate,2)}</span><span class="muted" style="text-align:right">${esc(wins)}</span></div>`;
+  }).join('');
+  const hol=(tou.holidays||[]).length?`<div class="small muted">节假日按 offpeak/最低档计费 (${(tou.holidays||[]).length} 天)</div>`:'';
+  return `<div class="kpi" style="min-width:300px"><div class="lbl">TOU pricing — 当前 ${esc(cur)} ×${fmt(curRate,2)}</div>
+   <div class="small muted" style="margin-bottom:4px">生效模型: ${esc(tou.model||'(default)')} · 策略来源: ${esc(srcLbl)}</div>
+   ${rows}${hol}</div>`;
 }
 
 // Non-admin UI lock-down: the dashboard is shared with the admin view, but a
@@ -3201,10 +3228,15 @@ async def api_me(request: Request, user=Depends(_require_user)):
     led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}).get(user.id) or {}
     days = led.get("days") or {}
     now = qk_local_now(cfg)
+    period = cfg.get("quota_period") or "daily"
     pref = now.strftime("%Y-%m-")
     used_month = sum((d or {}).get("cost_usd", 0) or 0 for k, d in days.items() if k.startswith(pref))
     today_d = days.get(now.strftime("%Y-%m-%d")) or {}
     used_day = today_d.get("cost_usd", 0) or 0
+    monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+    today_k = now.strftime("%Y-%m-%d")
+    used_week = sum((d or {}).get("cost_usd", 0) or 0 for k, d in days.items() if monday <= k <= today_k)
+    used_period = used_month if period == "monthly" else (used_week if period == "weekly" else used_day)
     cpu_ = float(cfg.get("credits_per_usd") or 1000.0)
     today_tok = today_d.get("tokens") or {}
     trend = []
@@ -3213,14 +3245,56 @@ async def api_me(request: Request, user=Depends(_require_user)):
         dd = days.get(kd) or {}
         trend.append({"day": kd, "requests": dd.get("requests", 0),
                       "cost_usd": dd.get("cost_usd", 0) or 0})
+    # TOU: resolve the current tier against the user's most-recently-used model
+    # (policy is model/provider-scoped). Fall back to the default policy when
+    # the user has no recorded model yet.
+    last_model = None
+    for k in sorted(days.keys(), reverse=True):
+        ms = ((days.get(k) or {}).get("models") or {})
+        if ms:
+            # most-used model that day, alias-resolved for display consistency
+            last_model = max(ms.items(), key=lambda kv: (kv[1] or {}).get("cost_usd", 0) or 0)[0]
+            break
+    tou = cfg.get("tou") or {}
+    tou_summary = {"enabled": bool(tou.get("enabled")), "current_tier": None,
+                   "current_rate": 1.0, "model": last_model, "policy_source": None, "tiers": []}
+    if tou.get("enabled"):
+        probe = last_model or ""
+        rate, tier = qk_tou_rate(cfg, probe, now)
+        # policy source label: which level resolved (model / provider / default)
+        src = "off"
+        if qk_tou_resolve_policy(cfg, probe) is not None:
+            models_cfg = tou.get("models") or {}
+            prov = probe.split("/")[0] if "/" in probe else "_default"
+            if probe and (probe.lower() in models_cfg or any("*" in k and fnmatch.fnmatchcase(probe.lower(), k.lower()) for k in models_cfg)):
+                src = "model"
+            elif prov in (tou.get("providers") or {}):
+                src = "provider:" + prov
+            else:
+                src = "default"
+        tiers_cfg = tou.get("tiers") or {}
+        tier_rows = []
+        for tname in ("peak", "normal", "offpeak"):
+            t = tiers_cfg.get(tname) or {}
+            wins = t.get("windows") or []
+            tier_rows.append({
+                "name": tname,
+                "rate": float(t.get("rate", 1.0)) if isinstance(t.get("rate"), (int, float)) else 1.0,
+                "windows": [{"start": w.get("start", "00:00"), "end": w.get("end", "00:00"),
+                             "days": w.get("days")} for w in wins],
+            })
+        tou_summary.update({"current_tier": tier, "current_rate": rate,
+                            "policy_source": src, "tiers": tier_rows,
+                            "holidays": tou.get("holidays") or []})
     return JSONResponse(
         {
             "user": {"id": user.id, "name": user.name, "email": user.email, "role": user.role},
             "quota": quota,
             "quota_source": source,
+            "quota_period": period,
             "multiplier": mult,
             "effective_quota": (quota * mult) if quota is not None else None,
-            "used_credits": used_month * cpu_ if (cfg.get("quota_period") == "monthly") else used_day * cpu_,
+            "used_credits": used_period * cpu_,
             "today": {"cost_usd": used_day,
                       "requests": today_d.get("requests", 0),
                       "credits": used_day * cpu_,
@@ -3229,7 +3303,7 @@ async def api_me(request: Request, user=Depends(_require_user)):
                                      ((today_tok.get("cached") or 0) + (today_tok.get("input") or 0)))
                                      if ((today_tok.get("cached") or 0) + (today_tok.get("input") or 0)) else 0.0},
             "trend": trend,
-            "tou": {"current_tier": None},  # UI contract field; wired once the page has a per-user model list
+            "tou": tou_summary,
         }
     )
 

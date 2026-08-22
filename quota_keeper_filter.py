@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.15
+version: 0.4.16
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -50,7 +50,7 @@ DEFAULT_PRICING_URL = (
 
 DEFAULT_CONFIG = {
     "credits_per_usd": 1000.0,          # 1000 credits = 1 USD
-    "quota_period": "daily",            # daily | monthly
+    "quota_period": "daily",            # daily | weekly | monthly
     "default_quota_credits": None,      # None = unlimited
     "user_quotas": {},                  # user_id -> credits (highest priority)
     "group_quotas": {},                 # group_id -> credits (max wins among groups)
@@ -181,8 +181,8 @@ def qk_validate_config(cfg) -> list:
         return ["config must be an object"]
     if "credits_per_usd" in cfg and not (_QK_NUM(cfg["credits_per_usd"]) and cfg["credits_per_usd"] > 0):
         errs.append("credits_per_usd must be a positive number")
-    if "quota_period" in cfg and cfg["quota_period"] not in (None, "daily", "monthly"):
-        errs.append("quota_period must be daily|monthly")
+    if "quota_period" in cfg and cfg["quota_period"] not in (None, "daily", "weekly", "monthly"):
+        errs.append("quota_period must be daily|weekly|monthly")
     for key in ("user_quotas", "group_quotas"):
         if key in cfg and not isinstance(cfg[key], dict):
             errs.append(f"{key} must be an object")
@@ -734,12 +734,23 @@ def qk_period_used_usd(uid: str, cfg: dict) -> float:
     led = JC.get(QK_LEDGER_PATH, {"users": {}}) or {}
     days = ((led.get("users") or {}).get(uid) or {}).get("days") or {}
     now = qk_local_now(cfg)
-    if (cfg.get("quota_period") or "daily") == "monthly":
+    period = cfg.get("quota_period") or "daily"
+    if period == "monthly":
         pref = now.strftime("%Y-%m-")
         return sum(
             (d or {}).get("cost_usd", 0) or 0
             for k, d in days.items()
             if k.startswith(pref)
+        )
+    if period == "weekly":
+        # ISO week, Monday-start, in the configured local timezone (same
+        # boundary convention as daily/monthly). Sum this week's Mon..today.
+        monday = (now - timedelta(days=now.weekday())).strftime("%Y-%m-%d")
+        today = now.strftime("%Y-%m-%d")
+        return sum(
+            (d or {}).get("cost_usd", 0) or 0
+            for k, d in days.items()
+            if monday <= k <= today
         )
     return ((days.get(now.strftime("%Y-%m-%d")) or {}).get("cost_usd", 0)) or 0
 
