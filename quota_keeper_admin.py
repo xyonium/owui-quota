@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.28
+version: 0.5.29
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2612,8 +2612,7 @@ function renderModels(){
     return `<tr>
      <td>${esc(m.model)}
        ${m.unpriced_requests>0?`<span class="tag unpriced">unpriced</span>${STATE.isAdmin!==false?`<button class="small" onclick="reprice('${esc(m.model)}')">reprice</button>`:''}`:''}
-       <button class="small" data-mi="${i}" onclick="matchModel(this)">match</button>
-       <span class="match-out"></span></td>
+       ${STATE.isAdmin!==false?`<button class="small" data-mi="${i}" onclick="matchModel(this)">match</button><span class="match-out"></span>`:''}</td>
      <td class="num">${fmt(m.requests,0)}</td>
      <td class="num">${fmt(m.users,0)}</td>
      <td class="num">${fmt(t.cached,0)}</td>
