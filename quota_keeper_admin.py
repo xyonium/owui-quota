@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.29
+version: 0.5.30
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2298,7 +2298,7 @@ function renderPersonalHeader(){
      <div style="display:flex;gap:22px;flex-wrap:wrap">
       ${mini('Requests',fmt(me.today.requests,0))}
       ${mini('Tokens',fmt(todayTok,0))}
-      ${mini('Cache rate',fmt((me.today.cache_rate||0)*100,0)+'%')}
+      ${mini('Cache rate',fmt((me.today.cache_rate||0)*100,2)+'%')}
      </div></div>
     ${renderTouCard(me.tou||{})}
    </div>`;
@@ -2462,7 +2462,7 @@ function renderKpis(){
     {lbl:'Tokens',val:fmt(tot||0,0),sp:sparkSvg(tokPer,140,34,'#9085e9')},
     {lbl:'Cost $',val:'$'+fmt(k.cost_usd||0,2),sp:sparkSvg(costPer,140,34,'#38bdf8')},
     {lbl:'Credits',val:fmt((k.cost_usd||0)*cpu,0),sp:sparkSvg(costPer.map(v=>v*cpu),140,34,'#34d399')},
-    {lbl:'Cache rate',val:fmt((k.cache_rate||0)*100,1)+'%',
+    {lbl:'Cache rate',val:fmt((k.cache_rate||0)*100,2)+'%',
      sub:`cached ${fmt(tk.cached||0,0)} / in ${fmt(ci,0)}`},
     {lbl:'Unpriced',val:fmt(k.unpriced_requests||0,0),
      sub:`of ${fmt(k.requests||0,0)} req`},
@@ -2616,7 +2616,7 @@ function renderModels(){
      <td class="num">${fmt(m.requests,0)}</td>
      <td class="num">${fmt(m.users,0)}</td>
      <td class="num">${fmt(t.cached,0)}</td>
-     <td class="num">${fmt(cp,0)}%</td>
+     <td class="num">${fmt(cp,2)}%</td>
      <td class="num">${fmt(ci,0)}</td>
      <td class="num">${fmt(t.output,0)}</td>
      <td class="num">$${fmt(m.cost_usd,2)}</td>
@@ -2689,7 +2689,7 @@ function renderRecent(){
      <td class="num">${fmt(t.cached,0)}</td>
      <td class="num">${fmt(ci,0)}</td>
      <td class="num">${fmt(t.output,0)}</td>
-     <td class="num">${fmt(cp,0)}%</td>
+     <td class="num">${fmt(cp,2)}%</td>
      <td class="num">$${fmt(it.cost_usd,4)}</td>
      <td>${tier}</td></tr>`;}).join('')||'<tr><td colspan="10" class="empty">No activity recorded yet — send a chat through the filter first.</td></tr>';
 }
