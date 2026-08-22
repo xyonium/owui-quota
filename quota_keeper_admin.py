@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.20
+version: 0.5.21
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3347,6 +3347,10 @@ async def api_models(request: Request, user=Depends(_require_user)):
             continue
         for d in (u.get("days") or {}).values():
             for m, mm in ((d or {}).get("models") or {}).items():
+                # history recorded the upstream alias (prx.*) before
+                # model_aliases existed — merge into the real name so the
+                # list shows what users actually used, not stale aliases
+                m = qk_resolve_model_alias(cfg, m)
                 row = used.setdefault(m, {"requests": 0, "unpriced_requests": 0, "cost_usd": 0.0})
                 mm = mm or {}
                 row["requests"] += mm.get("requests", 0) or 0
