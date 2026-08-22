@@ -826,7 +826,16 @@ def test_stats_window_24h(load_admin, monkeypatch):
     assert out["kpi"]["channels"] == {"webui": 1, "api": 1}
     b0 = out["series"][0]
     assert set(("bucket", "cost", "requests", "tokens")) <= set(b0)
-    assert all(set(b["cost"]) == {"_"} for b in out["series"])
+    # v0.5.27: window series cost is keyed BY MODEL (not a single "_" aggregate)
+    # so the 24h trend chart can stack per-model bars + show a per-model legend.
+    assert all("_" not in b["cost"] for b in out["series"])
+    # m/x at hour 23 ($0.01), m/y at hour 01 ($0.02)
+    bycost = {}
+    for b in out["series"]:
+        for m, c in b["cost"].items():
+            bycost[m] = bycost.get(m, 0) + c
+    assert abs(bycost.get("m/x", 0) - 0.01) < 1e-9
+    assert abs(bycost.get("m/y", 0) - 0.02) < 1e-9
     assert sum(b["requests"] for b in out["series"]) == 2  # 25h-old item trimmed out
     # item1 tokens 0+100+50=150, item2 10+90+40=140
     assert abs(sum(b["tokens"] for b in out["series"]) - (150.0 + 140.0)) < 1e-9

@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.26
+version: 0.5.27
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1466,10 +1466,18 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
                     for k in ("cached", "input", "output"):
                         mk["tokens"][k] += (hm.get("tokens") or {}).get(k, 0) or 0
                     row["models"].add(m)
-                # series bucket by local hour
+                    # series cost keyed BY MODEL (v0.5.27): the trend chart
+                    # stacks per-model cost per bucket, so the 24h view needs
+                    # the same per-model split qk_stats already produces for
+                    # day granularity -- not a single "_" aggregate.
+                    mcost = hm.get("cost_usd", 0) or 0
+                    if mcost:
+                        bkey = f"{day}T{int(hour_str):02d}"
+                        sb = series.setdefault(bkey, {})
+                        sb[m] = sb.get(m, 0) + mcost
+                # requests/tokens series stay model-agnostic (per-hour totals)
                 bkey = f"{day}T{int(hour_str):02d}"
-                sb = series.setdefault(bkey, {})
-                sb["_"] = sb.get("_", 0) + hcost
+                series.setdefault(bkey, {})
                 rt = series_rt.setdefault(bkey, {"requests": 0, "tokens": 0.0})
                 rt["requests"] += hreq
                 rt["tokens"] += sum((hrec.get("tokens") or {}).get(k, 0) or 0 for k in ("cached", "input", "output"))
@@ -2020,7 +2028,7 @@ tr.pe-cleared td{opacity:.45}
  <section id="secModels" hidden>
   <h2>Models</h2>
   <p class="hint">Blended $/M = cost per 1M tokens across all usage. The match button resolves the fuzzy pricing target via /pricing/match (the /stats payload does not carry the matched key per model) and shows it inline. <b>unpriced</b> means some recorded requests had no price at write time — after configuring a price, run reprice to backfill the last N days at the current price and clear the tag.</p>
-  <div class="filters">
+  <div class="filters admin-only" id="repriceBar">
    <div class="f"><span>Backfill days</span><input id="repriceDays" type="number" value="30" min="1" max="3650" style="width:70px"/></div>
    <button onclick="reprice(null)">Reprice all unpriced</button>
    <span class="hint" id="repriceOut"></span>
@@ -2262,9 +2270,14 @@ function renderPersonalHeader(){
   // fill = fraction of quota REMAINING (1 -> full bar, 0 -> empty)
   const remPct=unlimited?null:Math.min(100,(remain/eff)*100);
   const cls=remPct===null?'':(remPct<=0?'bad':remPct<=20?'bad':remPct<=40?'warn':'');
+  // Today card: headline = today's credits spent, then three clearly-separated
+  // mini-stats (requests / tokens / cache rate) each with its own label.
+  const tk=me.today.tokens||{};
+  const todayTok=(tk.cached||0)+(tk.input||0)+(tk.output||0);
+  const mini=(l,v)=>`<div style="min-width:76px"><div class="lbl" style="font-size:10px">${l}</div><div style="font-size:16px;font-weight:600;margin-top:2px">${v}</div></div>`;
   $('secPersonal').innerHTML=`
    <h2>${esc(u.name||u.id)} <span class="small muted">${esc(u.email||'')}</span></h2>
-   <div class="kpi" style="max-width:560px">
+   <div class="kpi" style="width:100%;max-width:none">
     <div class="lbl">${period} quota — credits remaining</div>
     ${unlimited
       ?'<div class="val">∞</div><div class="small muted">no quota set — unlimited</div>'
@@ -2274,8 +2287,13 @@ function renderPersonalHeader(){
    </div>
    <div class="kpis" style="margin-top:12px">
     <div class="kpi"><div class="lbl">Today</div>
-     <div class="val">$${fmt(me.today.cost_usd,2)}</div>
-     <div class="small muted">${fmt(me.today.requests,0)} req · ${fmt((me.today.cache_rate||0)*100,0)}% cache · ${fmt(((me.today.tokens||{}).cached||0)+((me.today.tokens||{}).input||0)+((me.today.tokens||{}).output||0),0)} tok · ${fmt(me.today.credits||0,0)} cr</div></div>
+     <div class="val">${fmt(me.today.credits||0,0)} <span class="small muted" style="font-size:13px">credits</span></div>
+     <div class="small muted" style="margin-bottom:8px">$${fmt(me.today.cost_usd,2)} today</div>
+     <div style="display:flex;gap:22px;flex-wrap:wrap">
+      ${mini('Requests',fmt(me.today.requests,0))}
+      ${mini('Tokens',fmt(todayTok,0))}
+      ${mini('Cache rate',fmt((me.today.cache_rate||0)*100,0)+'%')}
+     </div></div>
     ${renderTouCard(me.tou||{})}
    </div>`;
   $('secPersonal').hidden=false;
@@ -2293,20 +2311,29 @@ function renderTouCard(tou){
   }
   const cur=tou.current_tier||'off';
   const curRate=tou.current_rate!=null?tou.current_rate:1.0;
-  const srcLbl={model:'model'+(tou.model?': '+tou.model:''),default:'default policy',off:'—'}[tou.policy_source]
-    ||(tou.policy_source&&tou.policy_source.startsWith('provider:')?'provider: '+tou.policy_source.slice(9):(tou.policy_source||'—'));
+  const applies=cur!=='off';  // does a TOU policy actually match the current model?
+  // Policy-source label: which level matched + the verbatim configured pattern
+  // (glob like *deepseek* or an exact model key), so the user can see WHY the
+  // current model is or isn't TOU-priced. "当前模型" is just the model being
+  // evaluated, not a claim that TOU applies to it.
+  let srcLbl;
+  if(!applies)srcLbl='不匹配任何 TOU 策略';
+  else if(tou.policy_source==='model')srcLbl='模型匹配: '+(tou.matched_pattern||tou.model||'');
+  else if(tou.policy_source&&tou.policy_source.startsWith('provider:'))srcLbl='提供商: '+tou.policy_source.slice(9);
+  else srcLbl='default policy';
   const DOW=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
   const dayStr=ds=>{if(!ds||!ds.length||ds.length>=7)return '每天';return ds.map(d=>DOW[d]||d).join('/')};
   const rows=(tou.tiers||[]).map(t=>{
     const wins=(t.windows||[]).map(w=>`${esc(w.start)}-${esc(w.end)} ${dayStr(w.days)}`).join(', ')||'其余时段';
-    const active=t.name===cur?';font-weight:600':'';
-    const dot=t.name===cur?'● ':'';
+    const active=applies&&t.name===cur?';font-weight:600':'';
+    const dot=applies&&t.name===cur?'● ':'';
     return `<div class="small" style="display:flex;justify-content:space-between;gap:8px${active}">
       <span>${dot}${t.name} ×${fmt(t.rate,2)}</span><span class="muted" style="text-align:right">${esc(wins)}</span></div>`;
   }).join('');
   const hol=(tou.holidays||[]).length?`<div class="small muted">节假日按 offpeak/最低档计费 (${(tou.holidays||[]).length} 天)</div>`:'';
-  return `<div class="kpi" style="min-width:300px"><div class="lbl">TOU pricing — 当前 ${esc(cur)} ×${fmt(curRate,2)}</div>
-   <div class="small muted" style="margin-bottom:4px">生效模型: ${esc(tou.model||'(default)')} · 策略来源: ${esc(srcLbl)}</div>
+  const headline=applies?`当前 ${esc(cur)} ×${fmt(curRate,2)}`:'当前模型不生效';
+  return `<div class="kpi" style="min-width:300px"><div class="lbl">TOU pricing — ${headline}</div>
+   <div class="small muted" style="margin-bottom:4px">当前模型: ${esc(tou.model||'(无记录)')} · ${esc(srcLbl)}</div>
    ${rows}${hol}</div>`;
 }
 
@@ -2324,12 +2351,11 @@ function lockNonAdminUi(){
     fu.disabled=true;
     fu.title='non-admin: your own usage only';
   }
-  // 2) hide the models-section reprice/backfill row (Backfill days + Reprice)
-  const rd=$('repriceDays');
-  if(rd){
-    const row=rd.closest('.filters');
-    if(row)row.hidden=true;
-  }
+  // 2) the models-section reprice/backfill bar carries .admin-only so it is
+  // display:none by default and only re-shown for admins in init(); belt-and-
+  // braces hide it here too in case of a stale cached page.
+  const rb=$('repriceBar');
+  if(rb)rb.hidden=true;
 }
 
 // ---------- personal page: by-model / recent / prices ----------
@@ -3257,21 +3283,36 @@ async def api_me(request: Request, user=Depends(_require_user)):
             break
     tou = cfg.get("tou") or {}
     tou_summary = {"enabled": bool(tou.get("enabled")), "current_tier": None,
-                   "current_rate": 1.0, "model": last_model, "policy_source": None, "tiers": []}
+                   "current_rate": 1.0, "model": last_model, "policy_source": None,
+                   "matched_pattern": None, "tiers": []}
     if tou.get("enabled"):
         probe = last_model or ""
         rate, tier = qk_tou_rate(cfg, probe, now)
-        # policy source label: which level resolved (model / provider / default)
+        # Which policy level resolved, and the verbatim pattern the admin
+        # configured (e.g. the "*deepseek*" glob) so the UI can show exactly
+        # why the current model is or isn't TOU-priced.
         src = "off"
+        matched_pattern = None
         if qk_tou_resolve_policy(cfg, probe) is not None:
             models_cfg = tou.get("models") or {}
+            p_low = probe.lower()
             prov = probe.split("/")[0] if "/" in probe else "_default"
-            if probe and (probe.lower() in models_cfg or any("*" in k and fnmatch.fnmatchcase(probe.lower(), k.lower()) for k in models_cfg)):
-                src = "model"
-            elif prov in (tou.get("providers") or {}):
-                src = "provider:" + prov
+            if probe and p_low in models_cfg:
+                src, matched_pattern = "model", p_low
             else:
-                src = "default"
+                glob_hit = next(
+                    (k for k in models_cfg
+                     if "*" in str(k) and fnmatch.fnmatchcase(p_low, str(k).lower())),
+                    None)
+                if probe and glob_hit is not None:
+                    src, matched_pattern = "model", str(glob_hit)
+                elif prov in (tou.get("providers") or {}):
+                    src, matched_pattern = "provider:" + prov, prov
+                else:
+                    src = "default"
+        else:
+            # no policy matched -> TOU does not apply to the current model
+            tier, rate = "off", 1.0
         tiers_cfg = tou.get("tiers") or {}
         tier_rows = []
         for tname in ("peak", "normal", "offpeak"):
@@ -3284,7 +3325,8 @@ async def api_me(request: Request, user=Depends(_require_user)):
                              "days": w.get("days")} for w in wins],
             })
         tou_summary.update({"current_tier": tier, "current_rate": rate,
-                            "policy_source": src, "tiers": tier_rows,
+                            "policy_source": src, "matched_pattern": matched_pattern,
+                            "tiers": tier_rows,
                             "holidays": tou.get("holidays") or []})
     return JSONResponse(
         {
