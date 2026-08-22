@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.14
+version: 0.4.15
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -642,7 +642,9 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         d["cost_saved_usd"] = round(d.get("cost_saved_usd", 0.0) + (base_cost - cost), 8)
         for k in ("cached", "input", "output"):
             d["tokens"][k] = d["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
-        # hourly bucket (consumed by the dashboard at granularity=hour)
+        # hourly bucket (consumed by the dashboard at granularity=hour).
+        # v0.5.17: per-model breakdown inside the hour (24h stats aggregate
+        # hours, so KPI/user/model figures stay consistent).
         h = d.setdefault("hours", {}).setdefault(
             str(now_local.hour),
             {
@@ -650,6 +652,7 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
                 "cost_usd": 0.0,
                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
                 "channels": {"webui": 0, "api": 0},
+                "models": {},
             },
         )
         if count_request:
@@ -659,6 +662,19 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        if count_request:
+            hm = h.setdefault("models", {}).setdefault(
+                model,
+                {"requests": 0, "cost_usd": 0.0,
+                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                 "channels": {"webui": 0, "api": 0}},
+            )
+            hm["requests"] = hm.get("requests", 0) + 1
+            hm["cost_usd"] = round(hm.get("cost_usd", 0.0) + cost, 8)
+            for k in ("cached", "input", "output"):
+                hm["tokens"][k] = hm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+            hchm = hm.setdefault("channels", {"webui": 0, "api": 0})
+            hchm[channel if channel in hchm else "api"] = hchm.get(channel if channel in hchm else "api", 0) + 1
         mm = d["models"].setdefault(
             model,
             {

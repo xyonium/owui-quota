@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.16
+version: 0.5.17
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -857,6 +857,7 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
                 "cost_usd": 0.0,
                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
                 "channels": {"webui": 0, "api": 0},
+                "models": {},
             },
         )
         if count_request:
@@ -866,6 +867,19 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        if count_request:
+            hm = h.setdefault("models", {}).setdefault(
+                model,
+                {"requests": 0, "cost_usd": 0.0,
+                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                 "channels": {"webui": 0, "api": 0}},
+            )
+            hm["requests"] = hm.get("requests", 0) + 1
+            hm["cost_usd"] = round(hm.get("cost_usd", 0.0) + cost, 8)
+            for k in ("cached", "input", "output"):
+                hm["tokens"][k] = hm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+            hchm = hm.setdefault("channels", {"webui": 0, "api": 0})
+            hchm[channel if channel in hchm else "api"] = hchm.get(channel if channel in hchm else "api", 0) + 1
         mm = d["models"].setdefault(
             model,
             {
@@ -1338,218 +1352,99 @@ def qk_stats(from_=None, to=None, user=None, model=None, granularity="day",
 
 
 def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
-    """Rolling-window stats ("24h" span) computed from recent.json's per-request
-    epoch timestamps.
+    """Rolling-window stats ("24h" span) — v0.5.17 rewrite.
 
-    The ledger path (qk_stats window mode) has to trim by calendar day/hour
-    buckets, which means timezone conversions and day-boundary special cases --
-    any one wrong and the span reads 0. recent.json instead carries one epoch
-    `ts` per recorded request, so "the last 24 hours" is a single comparison
-    (ts >= now-86400) with no timezone or bucket arithmetic at all. Trade-off:
-    the ring buffer holds the newest 200 requests, so the result is partial
-    beyond that (flagged via kpi.window_partial); the UI surfaces it.
+    EVERYTHING (KPI, per-user, per-model) is summed from the ledger's HOUR
+    buckets, which carry per-model breakdowns (v0.5.17+; older hours are
+    backfilled from day×models). KPI == sum(users) == sum(models) by
+    construction. No recent.json, no share scaling.
     """
     cfg = qk_get_config()
-    rec = qk_load_json(QK_RECENT_PATH, {"items": []})
-    items = rec.get("items") or []
     try:
         wstart = float(window_start_ts)
     except Exception:
         wstart = 0.0
-    users_by_id = {uid: (u or {}) for uid, u in
-                   (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}).items()}
+    led_all = qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}
+    now_dt = qk_local_now(cfg)
+    now_ts = now_dt.timestamp()
     kpi = {"requests": 0, "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
            "cost_usd": 0.0, "unpriced_requests": 0, "channels": {"webui": 0, "api": 0}}
     series, urows, mrows = {}, {}, {}
-    series_rt = {}  # bucket -> {"requests": n, "tokens": t}
-    # v0.5.12: KPI totals come from the LEDGER's hourly buckets (exact, no
-    # 200-entry ring-buffer cap). recent.json still drives the per-user /
-    # per-model tables and the series (partial beyond 200 is surfaced via
-    # kpi.window_partial). Hour buckets are keyed by local (schedule-tz)
-    # day+hour; the rolling window includes every bucket whose hour boundary
-    # falls inside [wstart, now], so the current partial hour is included.
-    led_all = qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {}
-    now_dt = qk_local_now(cfg)
-    # hour buckets are cross-model, so a model filter can't use them for KPI —
-    # fall back to the recent-based loop below (kpi stays 0 here and recent
-    # re-accumulates it when a model filter is active).
-    if not model:
-        for uid, u in led_all.items():
-            if user and user not in (uid, (u or {}).get("name", ""), (u or {}).get("email", "")):
-                continue
-            for day, drec in ((u or {}).get("days") or {}).items():
-                drec = drec or {}
-                for hour_str, hrec in ((drec.get("hours") or {}).items()):
-                    try:
-                        bts = datetime.strptime(f"{day}T{int(hour_str):02d}", "%Y-%m-%dT%H").replace(
-                            tzinfo=now_dt.tzinfo).timestamp()
-                    except Exception:
-                        continue
-                    if bts < wstart or bts > now_dt.timestamp():
-                        continue
-                    if not isinstance(hrec, dict):
-                        continue
-                    kpi["requests"] += hrec.get("requests", 0) or 0
-                    kpi["cost_usd"] += hrec.get("cost_usd", 0) or 0
+    series_rt = {}
+    _unpriced_days_seen = set()
+    for uid, u in led_all.items():
+        if user and user not in (uid, (u or {}).get("name", ""), (u or {}).get("email", "")):
+            continue
+        for day, drec in ((u or {}).get("days") or {}).items():
+            drec = drec or {}
+            for hour_str, hrec in ((drec.get("hours") or {}).items()):
+                if not isinstance(hrec, dict):
+                    continue
+                try:
+                    bts = datetime.strptime(f"{day}T{int(hour_str):02d}", "%Y-%m-%dT%H").replace(
+                        tzinfo=now_dt.tzinfo).timestamp()
+                except Exception:
+                    continue
+                if not (wstart <= bts <= now_ts):
+                    continue
+                hreq = hrec.get("requests", 0) or 0
+                hcost = hrec.get("cost_usd", 0) or 0
+                if not model:
+                    kpi["requests"] += hreq
+                    kpi["cost_usd"] += hcost
                     for k in ("cached", "input", "output"):
                         kpi["tokens"][k] += (hrec.get("tokens") or {}).get(k, 0) or 0
                     hch = hrec.get("channels") or {}
-                    if not hch:
-                        # historical hour buckets (pre-v0.5.12) have no
-                        # channels field: approximate from the DAY-level
-                        # channels by this hour's request share
-                        dch = drec.get("channels") or {}
-                        hreq = hrec.get("requests", 0) or 0
-                        dreq = drec.get("requests", 0) or 0
-                        if dch and dreq > 0:
-                            for cname, dcnt in dch.items():
-                                if cname in kpi["channels"]:
-                                    kpi["channels"][cname] += (dcnt or 0) * hreq / dreq
-                    else:
-                        for cname, cnt in hch.items():
+                    for cname, cnt in hch.items():
+                        if cname in kpi["channels"]:
+                            kpi["channels"][cname] += cnt or 0
+                # per-user row
+                row = urows.get(uid)
+                if row is None:
+                    row = urows[uid] = {
+                        "user_id": uid,
+                        "name": (u or {}).get("name", ""),
+                        "email": (u or {}).get("email", ""),
+                        "requests": 0, "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+                        "cost_usd": 0.0, "models": set(), "unpriced_requests": 0,
+                        "channels": {"webui": 0, "api": 0},
+                    }
+                    quota, source = qk_resolve_quota(
+                        cfg, {"id": uid},
+                        None if group_ids_map is None else group_ids_map.get(uid, []))
+                    row["quota"], row["quota_source"] = quota, source
+                    row["multiplier"] = qk_time_multiplier(cfg)
+                if not model:
+                    row["requests"] += hreq
+                    row["cost_usd"] += hcost
+                    for k in ("cached", "input", "output"):
+                        row["tokens"][k] += (hrec.get("tokens") or {}).get(k, 0) or 0
+                    for cname, cnt in hch.items():
+                        if cname in row["channels"]:
+                            row["channels"][cname] += cnt or 0
+                # per-model rows inside the hour
+                for m, hm in ((hrec.get("models") or {}).items()):
+                    if model and m != model:
+                        continue
+                    hm = hm or {}
+                    if model:
+                        # model filter: KPI/user accumulate only this model's
+                        # hour share
+                        kpi["requests"] += hm.get("requests", 0) or 0
+                        kpi["cost_usd"] += hm.get("cost_usd", 0) or 0
+                        for k in ("cached", "input", "output"):
+                            kpi["tokens"][k] += (hm.get("tokens") or {}).get(k, 0) or 0
+                        hmch = hm.get("channels") or {}
+                        for cname, cnt in hmch.items():
                             if cname in kpi["channels"]:
                                 kpi["channels"][cname] += cnt or 0
-    # unpriced_requests is not in the hour buckets (day/model level only).
-    # Include a day's unpriced count when ANY of its hour buckets falls inside
-    # the rolling window (a day whose first hour is before wstart still has
-    # hours inside it — excluding by the day boundary under-counts).
-    if not model:
-        for uid, u in led_all.items():
-            if user and user not in (uid, (u or {}).get("name", ""), (u or {}).get("email", "")):
-                continue
-            for day, drec in ((u or {}).get("days") or {}).items():
-                drec = drec or {}
-                in_window = False
-                for hour_str in (drec.get("hours") or {}):
-                    try:
-                        bts = datetime.strptime(f"{day}T{int(hour_str):02d}", "%Y-%m-%dT%H").replace(
-                            tzinfo=now_dt.tzinfo).timestamp()
-                    except Exception:
-                        continue
-                    if wstart <= bts <= now_dt.timestamp():
-                        in_window = True
-                        break
-                if not in_window:
-                    continue
-                for mm in (drec.get("models") or {}).values():
-                    kpi["unpriced_requests"] += (mm or {}).get("unpriced_requests", 0) or 0
-    for it in items:
-        try:
-            ts = float(it.get("ts") or 0)
-        except Exception:
-            continue
-        if ts < wstart:
-            continue
-        uid = it.get("user_id") or ""
-        if user and user not in (uid, it.get("name") or "", it.get("email") or ""):
-            continue
-        m = str(it.get("model") or "unknown")
-        if model and m != model:
-            continue
-        tok = it.get("tokens") or {}
-        cost = float(it.get("cost_usd") or 0.0)
-        priced = it.get("priced", True)
-        chan = it.get("channel") if it.get("channel") in ("webui", "api") else "api"
-        # KPI totals come from the ledger hours buckets above (exact). With a
-        # model filter the hour buckets can't be used (they're cross-model), so
-        # fall back to accumulating from recent here.
-        if model:
-            kpi["requests"] += 1
-            kpi["cost_usd"] += cost
-            kpi["unpriced_requests"] += 0 if priced else 1
-            kpi["channels"][chan] += 1
-            for k in ("cached", "input", "output"):
-                kpi["tokens"][k] += float(tok.get(k) or 0.0)
-        # else: channels come from the ledger hours buckets above (exact,
-        # incl. the day-level fallback for pre-v0.5.12 hours) — do not add
-        # recent here or it double-counts.
-        row = urows.get(uid)
-        if row is None:
-            info = users_by_id.get(uid) or {}
-            row = urows[uid] = {
-                "user_id": uid,
-                "name": it.get("name") or info.get("name", ""),
-                "email": it.get("email") or info.get("email", ""),
-                "requests": 0, "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
-                "cost_usd": 0.0, "models": set(), "unpriced_requests": 0,
-                "channels": {"webui": 0, "api": 0},
-            }
-            quota, source = qk_resolve_quota(
-                cfg, {"id": uid},
-                None if group_ids_map is None else group_ids_map.get(uid, []))
-            row["quota"], row["quota_source"] = quota, source
-            row["multiplier"] = qk_time_multiplier(cfg)
-        row["requests"] += 1
-        row["cost_usd"] += cost
-        row["unpriced_requests"] += 0 if priced else 1
-        row["channels"][chan] += 1
-        row["models"].add(m)
-        for k in ("cached", "input", "output"):
-            row["tokens"][k] += float(tok.get(k) or 0.0)
-        if not user:
-            # user-filtered per-model tables come from the ledger below
-            # (exact); recent would double-count or under-count here.
-            mk = mrows.get(m)
-            if mk is None:
-                mk = mrows[m] = {
-                    "model": m, "requests": 0,
-                    "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
-                    "cost_usd": 0.0, "users": set(), "unpriced_requests": 0,
-                    "tou": {"peak": 0, "offpeak": 0, "normal": 0}, "cost_saved_usd": 0.0,
-                }
-            mk["requests"] += 1
-            mk["cost_usd"] += cost
-            mk["users"].add(uid)
-            mk["unpriced_requests"] += 0 if priced else 1
-            tier = it.get("tou_tier")
-            if tier in mk["tou"]:
-                mk["tou"][tier] += 1
-            for k in ("cached", "input", "output"):
-                mk["tokens"][k] += float(tok.get(k) or 0.0)
-        # hourly series keyed by the bucket's LOCAL (schedule-tz) day+hour so
-        # the trend labels line up with the day-based spans
-        bkey = datetime.fromtimestamp(ts, qk_local_now(cfg).tzinfo).strftime("%Y-%m-%dT%H")
-        sb = series.setdefault(bkey, {})
-        sb["_"] = sb.get("_", 0) + cost
-        rt = series_rt.setdefault(bkey, {"requests": 0, "tokens": 0.0})
-        rt["requests"] += 1
-        rt["tokens"] += sum(float(tok.get(k) or 0.0) for k in ("cached", "input", "output"))
-    ci = kpi["tokens"]["cached"] + kpi["tokens"]["input"]
-    kpi["cache_rate"] = (kpi["tokens"]["cached"] / ci) if ci else 0.0
-    oldest = None
-    for it in items:
-        try:
-            oldest = float(it.get("ts") or 0)
-            break
-        except Exception:
-            continue
-    # KPI totals are exact (ledger); the per-user/per-model TABLES below are
-    # still recent-limited, so keep the partial flag for those.
-    kpi["window_partial"] = bool(oldest is not None and oldest > wstart and len(items) >= 200)
-    # Drill-down: when a specific user is requested, the per-model table must
-    # be EXACT too (recent is a 200-entry subset that may not contain this
-    # user's requests under load). Aggregate the user's day-level models for
-    # days that have hour buckets inside the window.
-    if user:
-        for uid, u in led_all.items():
-            if uid != user and (u or {}).get("name") != user and (u or {}).get("email") != user:
-                continue
-            for day, drec in ((u or {}).get("days") or {}).items():
-                drec = drec or {}
-                in_window = False
-                for hour_str in (drec.get("hours") or {}):
-                    try:
-                        bts = datetime.strptime(f"{day}T{int(hour_str):02d}", "%Y-%m-%dT%H").replace(
-                            tzinfo=now_dt.tzinfo).timestamp()
-                    except Exception:
-                        continue
-                    if wstart <= bts <= now_dt.timestamp():
-                        in_window = True
-                        break
-                if not in_window:
-                    continue
-                for m, mm in ((drec.get("models") or {}).items()):
-                    mm = mm or {}
+                        row["requests"] += hm.get("requests", 0) or 0
+                        row["cost_usd"] += hm.get("cost_usd", 0) or 0
+                        for k in ("cached", "input", "output"):
+                            row["tokens"][k] += (hm.get("tokens") or {}).get(k, 0) or 0
+                        for cname, cnt in hmch.items():
+                            if cname in row["channels"]:
+                                row["channels"][cname] += cnt or 0
                     mk = mrows.get(m)
                     if mk is None:
                         mk = mrows[m] = {
@@ -1558,15 +1453,28 @@ def qk_stats_window(window_start_ts, user=None, model=None, group_ids_map=None):
                             "cost_usd": 0.0, "users": set(), "unpriced_requests": 0,
                             "tou": {"peak": 0, "offpeak": 0, "normal": 0}, "cost_saved_usd": 0.0,
                         }
-                    mk["requests"] += mm.get("requests", 0) or 0
-                    mk["cost_usd"] += mm.get("cost_usd", 0) or 0
+                    mk["requests"] += hm.get("requests", 0) or 0
+                    mk["cost_usd"] += hm.get("cost_usd", 0) or 0
                     mk["users"].add(uid)
-                    mk["unpriced_requests"] += mm.get("unpriced_requests", 0) or 0
                     for k in ("cached", "input", "output"):
-                        mk["tokens"][k] += (mm.get("tokens") or {}).get(k, 0) or 0
-                    for tname, tv in ((mm.get("tou") or {}).items()):
-                        if tname in mk["tou"]:
-                            mk["tou"][tname] += tv or 0
+                        mk["tokens"][k] += (hm.get("tokens") or {}).get(k, 0) or 0
+                    row["models"].add(m)
+                # series bucket by local hour
+                bkey = f"{day}T{int(hour_str):02d}"
+                sb = series.setdefault(bkey, {})
+                sb["_"] = sb.get("_", 0) + hcost
+                rt = series_rt.setdefault(bkey, {"requests": 0, "tokens": 0.0})
+                rt["requests"] += hreq
+                rt["tokens"] += sum((hrec.get("tokens") or {}).get(k, 0) or 0 for k in ("cached", "input", "output"))
+                # unpriced: day-level models (hours have no unpriced field).
+                # Count once per day that contributed a window hour.
+                if day not in _unpriced_days_seen:
+                    _unpriced_days_seen.add(day)
+                    for mm in ((drec.get("models") or {}).values()):
+                        kpi["unpriced_requests"] += (mm or {}).get("unpriced_requests", 0) or 0
+    ci = kpi["tokens"]["cached"] + kpi["tokens"]["input"]
+    kpi["cache_rate"] = (kpi["tokens"]["cached"] / ci) if ci else 0.0
+    kpi["window_partial"] = False
     for row in urows.values():
         row["models"] = len(row["models"])
     for mk in mrows.values():

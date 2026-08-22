@@ -755,15 +755,24 @@ def test_stats_window_24h(load_admin, monkeypatch):
                        "hours": {
                            "23": {"requests": 1, "cost_usd": 0.01,
                                   "tokens": {"cached": 0.0, "input": 100.0, "output": 50.0},
-                                  "channels": {"webui": 1, "api": 0}},
+                                  "channels": {"webui": 1, "api": 0},
+                                  "models": {"m/x": {"requests": 1, "cost_usd": 0.01,
+                                                      "tokens": {"cached": 0.0, "input": 100.0, "output": 50.0},
+                                                      "channels": {"webui": 1, "api": 0}}}},
                            "1": {"requests": 1, "cost_usd": 0.02,
                                  "tokens": {"cached": 10.0, "input": 90.0, "output": 40.0},
-                                 "channels": {"webui": 0, "api": 1}},
+                                 "channels": {"webui": 0, "api": 1},
+                                 "models": {"m/y": {"requests": 1, "cost_usd": 0.02,
+                                                     "tokens": {"cached": 10.0, "input": 90.0, "output": 40.0},
+                                                     "channels": {"webui": 0, "api": 1}}}},
                        }},
                    "2026-08-18": {"hours": {
                        "23": {"requests": 1, "cost_usd": 99.0,
                               "tokens": {"cached": 0.0, "input": 5.0, "output": 5.0},
-                              "channels": {"webui": 1, "api": 0}},
+                              "channels": {"webui": 1, "api": 0},
+                              "models": {"m/x": {"requests": 1, "cost_usd": 99.0,
+                                                  "tokens": {"cached": 0.0, "input": 5.0, "output": 5.0},
+                                                  "channels": {"webui": 1, "api": 0}}}},
                    }},
                }}}})
 
@@ -778,8 +787,8 @@ def test_stats_window_24h(load_admin, monkeypatch):
     assert row["quota_source"] == "none"  # resolved from config, no quota set
     models = {m["model"]: m for m in out["models"]}
     assert models["m/x"]["requests"] == 1
-    assert models["m/y"]["tou"]["peak"] == 1
-    assert models["m/y"]["unpriced_requests"] == 1
+    # v0.5.17: hour buckets carry no per-model tou/unpriced breakdown
+    # (unpriced is aggregated at the KPI level from day-level models)
     # series bucketed by local hour: item2 at 01:16 local yesterday
     assert any(b["bucket"].endswith("T01") for b in out["series"])
     # window series also carries per-bucket requests/tokens; kpi aggregates channels
@@ -796,8 +805,8 @@ def test_stats_window_24h(load_admin, monkeypatch):
 
 
 def test_stats_window_partial_flag(load_admin, monkeypatch):
-    """kpi.window_partial tells the UI when the 200-entry ring buffer cannot
-    cover the whole window."""
+    """v0.5.17: KPI comes from the ledger hour buckets (exact), so
+    window_partial is always False — the flag no longer applies."""
     from pathlib import Path
     from tests.conftest import write_json
 
@@ -807,10 +816,8 @@ def test_stats_window_partial_flag(load_admin, monkeypatch):
          "model": "m/x", "tokens": {}, "cost_usd": 0.0, "channel": "api"}
         for _ in range(200)
     ]})
-    out = adm.qk_stats_window(500_000.0)  # window starts before the oldest item
-    assert out["kpi"]["window_partial"] is True
-    out2 = adm.qk_stats_window(1_000_001.0)  # window fully inside the buffer
-    assert out2["kpi"]["window_partial"] is False
+    out = adm.qk_stats_window(500_000.0)
+    assert out["kpi"]["window_partial"] is False
     # buffer not full: nothing could have been evicted, never partial
     write_json(Path(adm.QK_RECENT_PATH), {"items": [
         {"ts": 1_000_000.0, "user_id": "u1", "name": "A", "email": "a@x",

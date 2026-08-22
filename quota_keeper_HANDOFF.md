@@ -315,6 +315,11 @@ v0.5.16 新增：
 
 33. **24h 下 user ranking drill 显示 no usage**（admin v0.5.16 修复）：v0.5.12 改 24h KPI 用 ledger hours 桶后，点击 user ranking 的 drill 仍请求 `from/to&granularity=day`（不带 window_start）→ 走 day 聚合，与 24h 主统计不一致；且该 user 的 recent 条目可能被挤出 200 条缓冲 → "No usage in span"。修：(a) `toggleDrill` 24h 时传 `window_start&granularity=hour`；(b) `qk_stats_window` 在 `user=` 过滤时，per-model 表改从 **ledger 的 day/models 精确聚合**（窗口内有 hours 桶的 day），recent 循环跳过 mrows（防双算）。
 
+
+v0.5.17 新增：
+
+34. **24h 统计彻底统一（KPI = 用户 = 模型）**（filter v0.4.15 / admin v0.5.17）：v0.5.12-0.5.16 的 24h 修补造成三套数字（KPI 用 hours 桶、用户表用 recent 200 截断、模型表用 day/models 整天）互相矛盾（用户报告 24h 用户汇总 90 vs 分模型 94+10=104）。v0.5.17 重写 `qk_stats_window`：**全部从 ledger 的 hours 桶累加**，hours 桶新增 **per-model 字段**（`models: {m: {requests, cost, tokens, channels}}`，filter + admin 记账写入）；KPI/用户/模型同源，**天然一致**。历史 hours 桶回填 per-model（从 day/models 按小时 requests 占比分摊，162 个桶已迁移）。模型过滤时 KPI/用户按匹配模型的 hour share 累加。unpriced 从 day 级 models 按"有窗口小时桶的 day"累加。hours 桶 per-model 无 tou/unpriced 字段（模型表这两项为 0，unpriced 只在 KPI）。
+
 ## 9. 后续开发路线（按用户早前需求延伸）
 
 - **P0 真机验证**：部署到测试实例，跑网页对话 + curl 直连两种流量，核对 ledger 与 analytics 差值；抓 stream() 实际 event 形状。
