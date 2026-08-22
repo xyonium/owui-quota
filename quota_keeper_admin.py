@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.31
+version: 0.5.32
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -221,12 +221,16 @@ def qk_validate_config(cfg) -> list:
                 if not isinstance(v, dict):
                     errs.append(f"pricing.overrides.{k} must be an object or null")
                     continue
+                # multiplier is validated for ALL shapes (alias / prices /
+                # legacy-direct / multiplier-only), not just alias (v0.5.32)
+                mult = v.get("multiplier")
+                if mult is not None and not (_QK_NUM(mult) and mult > 0):
+                    errs.append(f"pricing.overrides.{k}.multiplier must be a positive number")
                 if "alias" in v:
                     if not isinstance(v.get("alias"), str) or not v["alias"].strip():
                         errs.append(f"pricing.overrides.{k}.alias must be a non-empty string")
-                    mult = v.get("multiplier")
-                    if mult is not None and not (_QK_NUM(mult) and mult > 0):
-                        errs.append(f"pricing.overrides.{k}.multiplier must be a positive number")
+                elif "multiplier" in v and not any(f in v for f in QK_PRICE_FIELDS) and "prices" not in v:
+                    pass  # multiplier-only: scales the upstream table match; no price fields to check
                 else:
                     pr = v.get("prices") if "prices" in v else v
                     if not isinstance(pr, dict):
@@ -500,16 +504,53 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
     (returns None): plan-tier/free $0 rows would otherwise meter 0 forever.
 
     Override value shapes (a None value means "cleared" and is skipped):
-      legacy direct:  {"input": x, "cached": y, "cache_write": z, "output": w}
-      wrapped direct: {"prices": {...same...}}
-      alias:          {"alias": "<model key>", "multiplier": m}
-    Alias targets resolve through the same matching chain (table lookup AND
-    nested overrides, up to 8 hops, cycle-safe); multiplier scales the
-    resolved per-1M prices (default 1)."""
+      legacy direct:  {"input": x, ..., "multiplier": m?}
+      wrapped direct: {"prices": {...same...}, "multiplier": m?}
+      alias:          {"alias": "<model key>", "multiplier": m?}
+      multiplier-only:{"multiplier": m}   (scales the upstream table match)
+    `multiplier` is INDEPENDENT of `alias` (v0.5.32): it scales a manual
+    override (legacy or wrapped prices), an alias target, OR -- alone -- the
+    price the upstream table matches. Alias targets resolve through the same
+    matching chain (table lookup AND nested overrides, up to 8 hops,
+    cycle-safe). Default multiplier is 1."""
     m = (model_id or "").strip().lower()
     if not m:
         return None, None
     ov = {str(k).strip().lower(): v for k, v in (overrides or {}).items()}
+
+    def _mult(spec):
+        v = spec.get("multiplier")
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else 1.0
+
+    def _table_match(vs):
+        """exact -> path-suffix -> tail-segment -> contains over the pricing
+        table only (no overrides). Returns (price|None, how|None)."""
+        if not table:
+            return None, None
+        for cand in vs:
+            if cand in table:
+                return table[cand], "exact:" + cand
+        best = None
+        for cand in vs:
+            for k in table:
+                if cand.endswith("/" + k) and (best is None or len(k) > len(best[1])):
+                    best = ("suffix", k)
+        if best:
+            return table[best[1]], best[0] + ":" + best[1]
+        for cand in vs:
+            segs = cand.split("/")
+            for i in range(len(segs)):
+                tail = "/".join(segs[i:])
+                if tail in table:
+                    return table[tail], "segment:" + tail
+        best = None
+        for cand in vs:
+            for k in table:
+                if len(k) >= 4 and k in cand and (best is None or len(k) > len(best[1])):
+                    best = ("contains", k)
+        if best:
+            return table[best[1]], best[0] + ":" + best[1]
+        return None, None
 
     def resolve(mid, depth):
         if depth > 8:
@@ -519,46 +560,30 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
             spec = ov.get(cand)
             if not isinstance(spec, dict):
                 continue
-            if "alias" in spec or "prices" in spec:
-                if "alias" in spec:
-                    target = str(spec.get("alias") or "").strip().lower()
-                    if target and target != cand:
-                        base, how = resolve(target, depth + 1)
-                        if base is not None:
-                            mult = spec.get("multiplier")
-                            mult = float(mult) if isinstance(mult, (int, float)) and not isinstance(mult, bool) else 1.0
-                            return _qk_scale_price(base, mult), "alias:" + target + ("*" + str(mult) if mult != 1.0 else "")
-                else:
-                    p = spec.get("prices")
-                    if isinstance(p, dict):
-                        return p, "override:" + cand
-            else:  # legacy direct price dict
+            mult = _mult(spec)
+            if "alias" in spec:
+                target = str(spec.get("alias") or "").strip().lower()
+                if target and target != cand:
+                    base, how = resolve(target, depth + 1)
+                    if base is not None:
+                        return _qk_scale_price(base, mult), "alias:" + target + ("*" + str(mult) if mult != 1.0 else "")
+            elif "prices" in spec:
+                p = spec.get("prices")
+                if isinstance(p, dict):
+                    return _qk_scale_price(p, mult), "override:" + cand + ("*" + str(mult) if mult != 1.0 else "")
+            elif "multiplier" in spec and any(f in spec for f in QK_PRICE_FIELDS):
+                # legacy direct price dict that ALSO carries a multiplier:
+                # scale the manual prices, don't treat the multiplier key as a price
+                return _qk_scale_price(spec, mult), "override:" + cand + ("*" + str(mult) if mult != 1.0 else "")
+            elif "multiplier" in spec:
+                # multiplier-only: scale whatever the upstream table matches
+                base, how = _table_match(vs)
+                if base is not None:
+                    return _qk_scale_price(base, mult), how + "*" + str(mult)
+                return None, None
+            else:  # legacy direct price dict (price fields only, no multiplier)
                 return spec, "override:" + cand
-        if table:
-            for cand in vs:
-                if cand in table:
-                    return table[cand], "exact:" + cand
-            best = None
-            for cand in vs:
-                for k in table:
-                    if cand.endswith("/" + k) and (best is None or len(k) > len(best[1])):
-                        best = ("suffix", k)
-            if best:
-                return table[best[1]], best[0] + ":" + best[1]
-            for cand in vs:
-                segs = cand.split("/")
-                for i in range(len(segs)):
-                    tail = "/".join(segs[i:])
-                    if tail in table:
-                        return table[tail], "segment:" + tail
-            best = None
-            for cand in vs:
-                for k in table:
-                    if len(k) >= 4 and k in cand and (best is None or len(k) > len(best[1])):
-                        best = ("contains", k)
-            if best:
-                return table[best[1]], best[0] + ":" + best[1]
-        return None, None
+        return _table_match(vs)
 
     price, how = resolve(m, 0)
     if price is not None and ((price.get("input") or 0) + (price.get("output") or 0)) <= 0:
@@ -2872,7 +2897,10 @@ function rebuildPeOrig(){
     let base={prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''};
     const o=it.override;
     if(o){
-      if(o.alias!==undefined&&o.alias!==null){base.alias=o.alias;base.mult=(o.multiplier!==undefined&&o.multiplier!==null)?o.multiplier:'';}
+      // multiplier is read for EVERY shape (alias / prices / legacy-direct /
+      // multiplier-only), not just alias -- v0.5.32
+      base.mult=(o.multiplier!==undefined&&o.multiplier!==null)?o.multiplier:'';
+      if(o.alias!==undefined&&o.alias!==null){base.alias=o.alias;}
       else{const p=(o.prices&&typeof o.prices==='object')?o.prices:o;base.prices={input:p.input??null,cached:p.cached??null,cache_write:p.cache_write??null,output:p.output??null};}
     }
     STATE.pe.orig[it.model]={
@@ -2982,17 +3010,30 @@ function collectOverrides(){
     if(o.cleared){ov[k]=null;return}
     const eff=peEff(o);
     if(!eff)return;
+    const hasMult=eff.mult!==''&&eff.mult!==null&&!isNaN(eff.mult);
     if(eff.alias){
       const out={alias:eff.alias};
-      if(eff.mult!==''&&eff.mult!==null&&!isNaN(eff.mult))out.multiplier=Number(eff.mult);
+      if(hasMult)out.multiplier=Number(eff.mult);
       ov[k]=out;
       return;
     }
     if(!o.cur)return; // untouched rows never emit (deep-merge preserves stored overrides)
-    const p=eff.prices||{};
-    const hasVal=Object.values(p).some(v=>v!==null&&v!==undefined);
-    if(!hasVal)return;
-    ov[k]={prices:p};
+    // judge by the user's ACTUAL edits (o.cur), not peEff's upstream-backfilled
+    // prices: a multiplier-only row has all cur.prices null, and backfilling the
+    // upstream price into eff.prices would wrongly freeze it into a manual override
+    const cp=(o.cur&&o.cur.prices)||{};
+    const userSetPrice=Object.values(cp).some(v=>v!==null&&v!==undefined);
+    if(userSetPrice){
+      // manual prices (optionally discounted by a multiplier for quick sales)
+      const out={prices:eff.prices};
+      if(hasMult)out.multiplier=Number(eff.mult);
+      ov[k]=out;
+      return;
+    }
+    if(hasMult){
+      // multiplier-only: scale the upstream table match (no manual price, no alias)
+      ov[k]={multiplier:Number(eff.mult)};
+    }
   });
   return ov;
 }

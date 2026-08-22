@@ -137,6 +137,53 @@ def test_override_validation(admin_client):
                   json={"pricing": {"overrides": {"k": {"alias": "x", "multiplier": 0}}}}).status_code == 400
     assert c.post("/api/v1/quota-keeper/config",
                   json={"pricing": {"overrides": {"k": "junk"}}}).status_code == 400
+
+
+# ---- multiplier independent of alias (v0.5.32 / 0.4.17) ---------------------
+
+def test_multiplier_scales_wrapped_prices(admin_client):
+    # {prices:{...}, multiplier:m}: manual override price discounted by m
+    c, adm = _app(admin_client)
+    ov = {"m": {"prices": {"input": 1.0, "output": 2.0}, "multiplier": 0.5}}
+    price, how = _find(adm, "m", {}, ov)
+    assert price == {"input": 0.5, "output": 1.0}
+    assert how == "override:m*0.5"
+
+
+def test_multiplier_scales_legacy_direct_prices(admin_client):
+    # legacy bare price dict that ALSO carries a multiplier: scale the prices,
+    # and do NOT treat the multiplier key as a price field
+    c, adm = _app(admin_client)
+    ov = {"m": {"input": 4.0, "output": 8.0, "multiplier": 0.25}}
+    price, how = _find(adm, "m", {}, ov)
+    assert price == {"input": 1.0, "output": 2.0}
+    assert how == "override:m*0.25"
+
+
+def test_multiplier_only_scales_upstream_table_match(admin_client):
+    # {multiplier:m} alone: scale whatever the upstream pricing table matches;
+    # no longer mis-parsed as a price dict (which used to yield empty prices)
+    c, adm = _app(admin_client)
+    table = {"deepseek-chat": {"input": 0.27, "output": 1.10}}
+    ov = {"deepseek-chat": {"multiplier": 0.8}}
+    price, how = _find(adm, "deepseek-chat", table, ov)
+    assert abs(price["input"] - 0.216) < 1e-9 and abs(price["output"] - 0.88) < 1e-9
+    assert how.startswith("exact:deepseek-chat*0.8")
+    # no table match -> unpriced (NOT a bogus empty-price override)
+    assert _find(adm, "deepseek-chat", {}, ov) == (None, None)
+
+
+def test_multiplier_validation_all_shapes(admin_client):
+    c, adm = _app(admin_client)
+    # multiplier-only with a valid multiplier passes
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": {"multiplier": 0.8}}}}).status_code == 200
+    # multiplier on wrapped prices validated
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": {"prices": {"input": 1.0}, "multiplier": 0}}}}).status_code == 400
+    # multiplier-only with a bad multiplier rejected
+    assert c.post("/api/v1/quota-keeper/config",
+                  json={"pricing": {"overrides": {"k": {"multiplier": -1}}}}).status_code == 400
     assert c.post("/api/v1/quota-keeper/config",
                   json={"pricing": {"overrides": {"k": {"prices": {"input": -1}}}}}).status_code == 400
     # null tombstone is legal (clears an override on the deep-merge)

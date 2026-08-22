@@ -189,7 +189,20 @@ def test_overrides_save_preserves_non_visible_rows():
       throw new Error('alias wiped on second save: ' + JSON.stringify(ov2));
     if (ov2['zebra/model-ccc'] || ov2['zebra/model-aaa'] && ov2['zebra/model-aaa'].prices === undefined)
       throw new Error('untouched rows emitted: ' + JSON.stringify(ov2));
-    window.__result = 'OK overrides=' + JSON.stringify(ov2);
+    // v0.5.32: multiplier is independent of alias. Drive collectOverrides()
+    // directly (a pure function of STATE.pe.orig) for the three mult shapes.
+    // (a) multiplier-only: all cur.prices null, no alias -> emit {multiplier}
+    STATE.pe.orig['zebra/model-ccc'] = {manual:false,cleared:false,base:{prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''},cur:{prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:0.8},how:'exact:zebra/model-ccc',price:{input:1.0,output:2.0},used:true,requests:1,unpriced_requests:0};
+    // (b) manual prices + multiplier -> emit {prices, multiplier}
+    STATE.pe.orig['zebra/model-aaa'].cur = {prices:{input:5.5,cached:null,cache_write:null,output:null},alias:'',mult:0.5};
+    const ovMult = collectOverrides();
+    const mo = ovMult['zebra/model-ccc'];
+    if (!(mo && mo.multiplier === 0.8 && mo.prices === undefined && mo.alias === undefined))
+      throw new Error('multiplier-only not emitted cleanly: ' + JSON.stringify(mo));
+    const mp = ovMult['zebra/model-aaa'];
+    if (!(mp && mp.multiplier === 0.5 && mp.prices && mp.prices.input === 5.5))
+      throw new Error('prices+multiplier not emitted: ' + JSON.stringify(mp));
+    window.__result = 'OK overrides=' + JSON.stringify(ov2) + ' mult=' + JSON.stringify(ovMult);
     return;
     await new Promise(r2 => setTimeout(r2, 60));
     const body = window.FAKE.posted;
