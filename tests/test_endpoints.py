@@ -178,19 +178,32 @@ def test_models_mine_own_models_with_prices(qk, load_admin, monkeypatch):
     r = c.get("/api/v1/quota-keeper/models?mine=1")
     assert r.status_code == 200
     items = {it["model"]: it for it in r.json()["items"]}
-    # v0.5.22: mine=1 shows the LOCAL model pool (every model anyone used),
-    # so the user sees what's available — not just their own usage
-    assert set(items) == {"m/x", "m/unpriced", "m/theirs"}
+    # v0.5.23: mine=1 filters to the caller's OWN used models
+    assert set(items) == {"m/x", "m/unpriced"}       # u2's m/theirs absent
     assert items["m/x"]["matched"] is True
     assert items["m/x"]["price"]["input"] == 1.0
     assert items["m/unpriced"]["matched"] is False
     assert items["m/unpriced"]["price"] is None
-    assert items["m/theirs"]["requests"] == 1        # cross-user aggregate
+    assert items["m/x"]["requests"] == 1             # own aggregate only
 
 
 def test_models_admin_unchanged(qk, load_admin, monkeypatch):
     # admin without ?mine sees all users' models (existing behavior)
     _stub_webui_auth(monkeypatch)
+    qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, "m/x",
+                       {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    qk.qk_record_usage({"id": "u2", "name": "V", "email": "v@x"}, "m/y",
+                       {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
+    c, _ = _app(load_admin)
+    items = c.get("/api/v1/quota-keeper/models").json()["items"]
+    assert {it["model"] for it in items} == {"m/x", "m/y"}
+
+
+def test_models_nonadmin_without_mine_sees_pool(qk, load_admin, monkeypatch):
+    # v0.5.23: a plain user WITHOUT ?mine sees the local model pool (all
+    # users' used models) — the price list has reference value; mine=1 still
+    # narrows to their own
+    _stub_self_user(monkeypatch, uid="u1")
     qk.qk_record_usage({"id": "u1", "name": "U", "email": "u1@x"}, "m/x",
                        {"cached": 0, "input": 1, "output": 1, "cache_write": 0})
     qk.qk_record_usage({"id": "u2", "name": "V", "email": "v@x"}, "m/y",

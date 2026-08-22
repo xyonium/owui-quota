@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.22
+version: 0.5.23
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2326,7 +2326,7 @@ function renderMyRecent(){
   }).join('')||'<tr><td colspan="8" class="empty">No activity yet.</td></tr>';
 }
 async function loadMyPrices(){
-  try{STATE.personal.models=await api('/models?mine=1');renderMyPrices()}
+  try{STATE.personal.models=await api('/models');renderMyPrices()}
   catch(e){toast('Prices load failed: '+e.message)}
 }
 function renderMyPrices(){
@@ -3339,15 +3339,15 @@ async def api_models(request: Request, user=Depends(_require_user)):
     ov = ((cfg.get("pricing") or {}).get("overrides")) or {}
     table = (qk_load_json(QK_PRICING_PATH, {}) or {}).get("table") or {}
 
-    mine = request.query_params.get("mine") == "1" or getattr(user, "role", "") != "admin"
+    # mine=1 (explicit) filters to the caller's OWN used models; without it,
+    # everyone (admin or not) sees the LOCAL model pool — every model anyone
+    # has used in the ledger, with resolved prices.
+    mine = request.query_params.get("mine") == "1"
     used = {}  # model -> {"requests": n, "unpriced_requests": n, "cost_usd": x}
     led = (qk_load_json(QK_LEDGER_PATH, {"users": {}}).get("users") or {})
     for uid, u in led.items():
-        # Self-service still shows the LOCAL model pool (every model anyone
-        # has used in the ledger) so the user can see what's available and at
-        # what cost — not just their own usage, and not the whole upstream
-        # pricing table (hundreds of rows nobody here uses). Requests/cost are
-        # aggregated across users for the list.
+        if mine and uid != user.id:
+            continue
         for d in (u.get("days") or {}).values():
             for m, mm in ((d or {}).get("models") or {}).items():
                 # history recorded the upstream alias (prx.*) before
