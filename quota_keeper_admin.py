@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.27
+version: 0.5.28
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1964,6 +1964,12 @@ tr.pe-cleared td{opacity:.45}
 .prow input[type=number]{width:90px;padding:6px 8px}
 .prow input[type=checkbox]{width:auto}
 .fatal{margin:0 0 18px;padding:12px 16px;border:1px solid var(--bad);border-radius:10px;color:var(--bad);background:rgba(248,113,113,.08);white-space:pre-wrap;word-break:break-all}
+/* .admin-only must beat the display rules of layout classes it is combined
+   with (.filters{display:flex}, .kpis{display:grid}, ...). Those are defined
+   ABOVE the original .admin-only rule, so at equal specificity the later
+   layout rule won and admin-only elements (e.g. the reprice bar) stayed
+   visible to non-admins. Reinforce it here, last, with higher specificity. */
+.admin-only, .filters.admin-only, .kpis.admin-only, div.admin-only{display:none !important}
 </style>
 </head>
 <body>
@@ -2037,7 +2043,7 @@ tr.pe-cleared td{opacity:.45}
   <table id="modelsT">
    <thead><tr>
     <th>Model</th><th class="num">Requests</th><th class="num">Users</th>
-    <th class="num">Cached</th><th class="num">Cache%</th><th class="num">Input</th><th class="num">Output</th>
+    <th class="num">Cached</th><th class="num">Cache%</th><th class="num" title="Total input tokens (cached + cache-miss); billing still splits cached/miss/output by price">Input</th><th class="num">Output</th>
     <th class="num">Cost $</th><th class="num">Blended $/M</th><th class="num">Saved $</th><th>TOU</th>
    </tr></thead>
    <tbody></tbody>
@@ -2052,7 +2058,7 @@ tr.pe-cleared td{opacity:.45}
   <table id="recentT">
    <thead><tr>
     <th>Time</th><th>User</th><th>Model</th><th title="webui = sent from the Open WebUI page (chat_id present); api = direct API call">Via</th>
-    <th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th>
+    <th class="num">Cached</th><th class="num" title="Total input tokens (cached + cache-miss)">Input</th><th class="num">Output</th>
     <th class="num">Cache%</th><th class="num">Cost $</th><th>Tier</th>
    </tr></thead>
    <tbody><tr><td colspan="10" class="empty">Press Refresh to load.</td></tr></tbody>
@@ -2574,7 +2580,8 @@ async function toggleDrill(tr){
   }
   const rows=(data.models||[]).map(m=>{
     const t=m.tokens||{};
-    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(t.input,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(m.cost_usd,2)}</td></tr>`;
+    const tin=(t.cached||0)+(t.input||0);  // total input (cached + cache-miss)
+    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(tin,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(m.cost_usd,2)}</td></tr>`;
   }).join('')||'<tr><td colspan="6" class="empty">No usage in span</td></tr>';
   const dr=document.createElement('tr');dr.className='drill';
   dr.innerHTML=`<td colspan="8"><table style="max-width:760px"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th></tr></thead><tbody>${rows}</tbody></table></td>`;
@@ -2611,7 +2618,7 @@ function renderModels(){
      <td class="num">${fmt(m.users,0)}</td>
      <td class="num">${fmt(t.cached,0)}</td>
      <td class="num">${fmt(cp,0)}%</td>
-     <td class="num">${fmt(t.input,0)}</td>
+     <td class="num">${fmt(ci,0)}</td>
      <td class="num">${fmt(t.output,0)}</td>
      <td class="num">$${fmt(m.cost_usd,2)}</td>
      <td class="num">${fmt(m.blended_per_m,2)}</td>
@@ -2681,7 +2688,7 @@ function renderRecent(){
      <td>${esc(it.model)}${it.priced===false?' <span class="tag unpriced">unpriced</span>':''}</td>
      <td><span class="tag ch-${chan}">${chan}</span></td>
      <td class="num">${fmt(t.cached,0)}</td>
-     <td class="num">${fmt(t.input,0)}</td>
+     <td class="num">${fmt(ci,0)}</td>
      <td class="num">${fmt(t.output,0)}</td>
      <td class="num">${fmt(cp,0)}%</td>
      <td class="num">$${fmt(it.cost_usd,4)}</td>

@@ -589,6 +589,29 @@ def test_page_is_login_gated_not_admin_gated(load_admin, monkeypatch):
     assert client.get("/api/v1/quota-keeper/me/usage").status_code == 200
 
 
+def test_reprice_bar_hidden_from_nonadmin(load_admin, monkeypatch):
+    """v0.5.28 regression: the reprice/backfill bar must actually be hidden for
+    non-admins. It carries .admin-only, but .admin-only{display:none} was defined
+    BEFORE .filters{display:flex} in the stylesheet, so at equal specificity the
+    later flex rule won and the bar stayed visible. Pin both the markup contract
+    (the bar has .admin-only) and the CSS ordering (a reinforcing high-specificity
+    !important rule appears AFTER the .filters rule)."""
+    _stub_self_user(monkeypatch, uid="u1", role="user")
+    adm = load_admin()
+    client = TestClient(_spa_shell_app())
+    _mount_via_event(adm, client.app)
+    page = client.get("/quota")
+    assert page.status_code == 200
+    text = page.text
+    # the bar is marked admin-only (init removes the class only for admins)
+    assert 'id="repriceBar"' in text and "filters admin-only" in text
+    # the reinforcing rule exists and is placed AFTER .filters{display:flex}
+    flex = text.index(".filters{display:flex")
+    reinforce = text.index(".filters.admin-only")
+    assert reinforce > flex, "admin-only reinforcement must come after .filters{flex}"
+    assert "!important" in text[reinforce:reinforce + 200]
+
+
 def test_unauthenticated_requests_401(load_admin, monkeypatch):
     """get_current_user raising HTTPException(401) (no/invalid token) must
     surface as 401 -- not be masked into a different error."""
