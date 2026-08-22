@@ -1976,6 +1976,10 @@ tr.detail td{background:rgba(11,18,32,.5);padding:10px 10px 10px 28px}
 tr.pe-cleared td{opacity:.45}
 .pageinfo{font-size:12px;color:var(--mut)}
 .scroll{overflow:auto;max-height:440px}
+/* sticky column headers inside every scrollable table. Opaque --card background
+   covers rows scrolling underneath; box-shadow re-creates the header separator
+   (under border-collapse a th border-bottom does NOT stick with the cell). */
+.scroll thead th{position:sticky;top:0;z-index:2;background:var(--card);box-shadow:0 1px 0 var(--line)}
 /* TOU editor */
 .chips{display:flex;gap:4px}
 .chip{width:32px;height:26px;border-radius:6px;border:1px solid var(--line);background:#0b1220;color:var(--mut);font-size:11px;padding:0;cursor:pointer}
