@@ -481,3 +481,131 @@ def test_record_usage_with_override_meters_cost(qk, tmp_path):
     assert mm["unpriced_requests"] == 0
     # input 1M @ $10 + output 1M @ $20 = $30 (TOU disabled -> rate 1)
     assert mm["cost_usd"] == pytest.approx(30.0)
+
+
+# ---- topup delta semantics: full-usage repeats must not double tokens --------
+#
+# The topup paths (stream() with an already-seen response id; the OWUI 0.11
+# stream-end outlet whose body id is the message id) were designed for PARTIAL
+# usage deltas (Anthropic message_delta). When the second event carries the
+# FULL usage of an already-recorded response (stream-end outlet echoes
+# messages[-1].usage, or a duplicate usage chunk in the stream), the tokens
+# were added a second time into the day/hour/day-model buckets -- while the
+# hour per-model bucket skipped topups entirely. Day-granularity stats summed
+# two equally-doubled buckets (looked consistent); the 24h window view sums
+# hour buckets for KPI/users but hour per-model buckets for the model table,
+# exposing the doubling as KPI == 2x sum(models) for API-only users.
+
+
+def _tok_sum(t):
+    return sum((t or {}).get(k, 0.0) or 0.0 for k in ("cached", "input", "output"))
+
+
+def test_stream_end_outlet_full_usage_topup_not_double_counted(qk):
+    """stream() records the terminal chunk's full usage; the 0.11 stream-end
+    outlet repeats the SAME full usage on messages[-1].usage. Tokens/cost must
+    be recorded once at every bucket level (day, hour, day-model, hour-model)."""
+    f = qk.Filter()
+    import asyncio
+    md = {"session_id": "s", "message_id": "msg-1", "user_id": "u1",
+          "model_name": "gpt-x"}  # no chat_id -> api channel
+    usage = {"prompt_tokens": 1000, "completion_tokens": 500}
+    asyncio.run(f.stream({"id": "chatcmpl-1", "model": "gpt-x", "usage": dict(usage)},
+                         __user__=_user(), __metadata__=md))
+    body = {"model": "gpt-x", "id": "msg-1",
+            "messages": [{"role": "user", "content": "hi"},
+                         {"id": "msg-1", "role": "assistant", "content": "ok",
+                          "usage": dict(usage)}]}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert d["tokens"]["input"] == 1000 and d["tokens"]["output"] == 500  # not 2x
+    mm = d["models"]["gpt-x"]
+    assert mm["requests"] == 1
+    assert mm["tokens"]["input"] == 1000 and mm["tokens"]["output"] == 500
+    h = list(d["hours"].values())[0]
+    assert h["tokens"]["input"] == 1000 and h["tokens"]["output"] == 500
+    hm = h["models"]["gpt-x"]
+    assert hm["tokens"]["input"] == 1000 and hm["tokens"]["output"] == 500
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {})
+    assert len(rec["items"]) == 1  # the zero-delta topup is not a new response
+
+
+def test_stream_duplicate_usage_chunk_same_rid_not_double_counted(qk):
+    """Two usage-bearing stream events sharing the response id (e.g. upstream
+    usage chunk + a second forwarded/synthesized one): the repeat is a
+    zero-delta topup, tokens must not be added twice."""
+    f = qk.Filter()
+    import asyncio
+    md = {"session_id": "s", "model_name": "gpt-x"}
+    ev = {"id": "chatcmpl-2", "model": "gpt-x",
+          "usage": {"prompt_tokens": 1000, "completion_tokens": 500}}
+    asyncio.run(f.stream(dict(ev), __user__=_user(), __metadata__=md))
+    asyncio.run(f.stream(dict(ev), __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert d["tokens"]["input"] == 1000 and d["tokens"]["output"] == 500
+    h = list(d["hours"].values())[0]
+    assert h["models"]["gpt-x"]["tokens"]["input"] == 1000
+
+
+def test_anthropic_partials_land_in_hour_model_bucket(qk):
+    """Partial-usage topups (Anthropic message_delta) must ALSO reach the hour
+    per-model bucket, otherwise the 24h model table undercounts vs the KPI."""
+    f = qk.Filter()
+    import asyncio
+    asyncio.run(f.stream({"id": "r7", "message": {"usage": {"input_tokens": 40}},
+                          "model": "claude-x"}, __user__=_user(), __metadata__={}))
+    asyncio.run(f.stream({"id": "r7", "usage": {"output_tokens": 7},
+                          "model": "claude-x"}, __user__=_user(), __metadata__={}))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert d["tokens"]["input"] == 40 and d["tokens"]["output"] == 7
+    h = list(d["hours"].values())[0]
+    assert h["tokens"]["input"] == 40 and h["tokens"]["output"] == 7
+    hm = h["models"]["claude-x"]
+    assert hm["tokens"]["input"] == 40 and hm["tokens"]["output"] == 7
+
+
+def test_stream_topup_cumulative_output_not_over_added(qk):
+    """Anthropic message_start usage includes output_tokens=1 and message_delta
+    reports CUMULATIVE output: the topup must record the delta (7-1), not add
+    the cumulative value on top (which would yield 8)."""
+    f = qk.Filter()
+    import asyncio
+    asyncio.run(f.stream({"id": "r8", "message": {"usage": {"input_tokens": 40, "output_tokens": 1}},
+                          "model": "claude-x"}, __user__=_user(), __metadata__={}))
+    asyncio.run(f.stream({"id": "r8", "usage": {"output_tokens": 7},
+                          "model": "claude-x"}, __user__=_user(), __metadata__={}))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert d["tokens"]["input"] == 40 and d["tokens"]["output"] == 7  # not 8
+
+
+def test_stats_views_consistent_after_full_usage_topup(qk, load_admin):
+    """KPI/user tokens must equal the per-model sum in BOTH stats views after
+    a full-usage topup (day view sums day buckets, 24h view sums hour buckets)."""
+    import asyncio, time
+    f = qk.Filter()
+    md = {"session_id": "s", "message_id": "msg-1", "user_id": "u1",
+          "model_name": "gpt-x"}
+    usage = {"prompt_tokens": 1000, "completion_tokens": 500}
+    asyncio.run(f.stream({"id": "chatcmpl-1", "model": "gpt-x", "usage": dict(usage)},
+                         __user__=_user(), __metadata__=md))
+    asyncio.run(f.outlet({"model": "gpt-x", "id": "msg-1",
+                          "messages": [{"role": "assistant", "content": "ok",
+                                        "usage": dict(usage)}]},
+                         __user__=_user(), __metadata__=md))
+    adm = load_admin()
+    day = adm.qk_stats()
+    win = adm.qk_stats_window(time.time() - 86400)
+    for name, out in (("day", day), ("24h", win)):
+        kpi = _tok_sum(out["kpi"]["tokens"])
+        usr = sum(_tok_sum(r["tokens"]) for r in out["users"])
+        mod = sum(_tok_sum(m["tokens"]) for m in out["models"])
+        assert kpi == 1500 and usr == 1500 and mod == 1500, \
+            f"{name} view: kpi={kpi} users={usr} models={mod}"

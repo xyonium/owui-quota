@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.36
+version: 0.5.37
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -892,19 +892,23 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        # per-model breakdown inside the hour (24h stats aggregate hours).
+        # cost/tokens accumulate on topups too (same rule as the day-level
+        # model bucket): a partial-usage topup's delta belongs to this model;
+        # request/channel counters stay per-request (topups are not requests).
+        hm = h.setdefault("models", {}).setdefault(
+            model,
+            {"requests": 0, "cost_usd": 0.0,
+             "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+             "channels": {"webui": 0, "api": 0}},
+        )
         if count_request:
-            hm = h.setdefault("models", {}).setdefault(
-                model,
-                {"requests": 0, "cost_usd": 0.0,
-                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
-                 "channels": {"webui": 0, "api": 0}},
-            )
             hm["requests"] = hm.get("requests", 0) + 1
-            hm["cost_usd"] = round(hm.get("cost_usd", 0.0) + cost, 8)
-            for k in ("cached", "input", "output"):
-                hm["tokens"][k] = hm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
             hchm = hm.setdefault("channels", {"webui": 0, "api": 0})
             hchm[channel if channel in hchm else "api"] = hchm.get(channel if channel in hchm else "api", 0) + 1
+        hm["cost_usd"] = round(hm.get("cost_usd", 0.0) + cost, 8)
+        for k in ("cached", "input", "output"):
+            hm["tokens"][k] = hm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
         mm = d["models"].setdefault(
             model,
             {

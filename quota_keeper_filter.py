@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.17
+version: 0.4.18
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -689,19 +689,23 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         h["cost_usd"] = round(h.get("cost_usd", 0.0) + cost, 8)
         for k in ("cached", "input", "output"):
             h["tokens"][k] = h["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        # per-model breakdown inside the hour (24h stats aggregate hours).
+        # cost/tokens accumulate on topups too (same rule as the day-level
+        # model bucket): a partial-usage topup's delta belongs to this model;
+        # request/channel counters stay per-request (topups are not requests).
+        hm = h.setdefault("models", {}).setdefault(
+            model,
+            {"requests": 0, "cost_usd": 0.0,
+             "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
+             "channels": {"webui": 0, "api": 0}},
+        )
         if count_request:
-            hm = h.setdefault("models", {}).setdefault(
-                model,
-                {"requests": 0, "cost_usd": 0.0,
-                 "tokens": {"cached": 0.0, "input": 0.0, "output": 0.0},
-                 "channels": {"webui": 0, "api": 0}},
-            )
             hm["requests"] = hm.get("requests", 0) + 1
-            hm["cost_usd"] = round(hm.get("cost_usd", 0.0) + cost, 8)
-            for k in ("cached", "input", "output"):
-                hm["tokens"][k] = hm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
             hchm = hm.setdefault("channels", {"webui": 0, "api": 0})
             hchm[channel if channel in hchm else "api"] = hchm.get(channel if channel in hchm else "api", 0) + 1
+        hm["cost_usd"] = round(hm.get("cost_usd", 0.0) + cost, 8)
+        for k in ("cached", "input", "output"):
+            hm["tokens"][k] = hm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
         mm = d["models"].setdefault(
             model,
             {
@@ -912,16 +916,42 @@ class Filter:
 
     # -- helpers ------------------------------------------------------------
 
-    def _mark_seen(self, key: str, model: str = "", channel: str = "api") -> bool:
+    def _mark_seen(self, key: str, model: str = "", channel: str = "api",
+                   tok_rec: dict = None) -> bool:
         if key in self._seen:
             return False
         # store the model/channel recorded first so later topups for the same
         # response (stream-end outlet) reuse the same name instead of falling
-        # back to an upstream-echoed alias (prx.*) from the outlet body
-        self._seen[key] = (model, channel)
+        # back to an upstream-echoed alias (prx.*) from the outlet body.
+        # tok_rec tracks the cumulative recorded usage so a repeated
+        # usage-bearing event only contributes its per-field delta -- a repeat
+        # carrying the FULL usage (OWUI 0.11 stream-end outlet echoing
+        # messages[-1].usage, or a duplicated usage chunk) adds nothing.
+        self._seen[key] = (model, channel, tok_rec if tok_rec is not None else {})
         while len(self._seen) > 4096:
             self._seen.popitem(last=False)
         return True
+
+    def _mark_msgid(self, mid: str, model: str, channel: str, tok_rec: dict) -> None:
+        self._seen_msgids[mid] = (model, channel, tok_rec)
+        while len(self._seen_msgids) > 4096:
+            self._seen_msgids.popitem(last=False)
+
+    @staticmethod
+    def _usage_delta(tok_rec: dict, tok: dict) -> dict:
+        """Per-field positive delta of `tok` over the already-recorded
+        `tok_rec` (mutated to include the delta). Returns {} for a pure
+        repeat; cumulative reporters (Anthropic message_delta output) yield
+        only the increment."""
+        delta = {}
+        for k, v in (tok or {}).items():
+            if not isinstance(v, (int, float)):
+                continue
+            d = v - (tok_rec.get(k) or 0.0)
+            if d > 0:
+                delta[k] = d
+                tok_rec[k] = (tok_rec.get(k) or 0.0) + d
+        return delta
 
     def _record(self, user: dict, model: str, tok: dict, rid: str = "", channel: str = "api") -> None:
         # orphan (no user yet) is stashed WITHOUT marking seen, so the same
@@ -934,15 +964,16 @@ class Filter:
                 self._orphan.popitem(last=False)
             return
         rid = rid or f"{time.time_ns()}"
-        if not self._mark_seen(rid, model, channel):
+        tok_rec = {k: float(v) for k, v in tok.items() if isinstance(v, (int, float))}
+        if not self._mark_seen(rid, model, channel, tok_rec):
             return
         qk_record_usage(user, model, tok, channel=channel)
 
     def _seen_info(self, key: str):
         """(model, channel) recorded first for a response id, for topup reuse."""
         v = self._seen.get(key)
-        if isinstance(v, tuple) and len(v) == 2:
-            return v
+        if isinstance(v, tuple) and len(v) >= 2:
+            return v[0], v[1]
         return None, None
 
     # -- enforcement ----------------------------------------------------------
@@ -1033,24 +1064,34 @@ class Filter:
             if model.startswith("prx."):
                 model = model[4:]
             chan = "webui" if (__metadata__ or {}).get("chat_id") else "api"
-            # mark the message id so the stream-end outlet call (0.11) tops up
-            # instead of double-recording (its rid is the message id, not rid).
-            # Store the same (model, channel) pair used for rid so the topup
-            # can reuse the real model name (outlet body echoes the alias).
             _mid = (__metadata__ or {}).get("message_id")
-            if _mid:
-                self._seen_msgids[str(_mid)] = (model, chan)
-                while len(self._seen_msgids) > 4096:
-                    self._seen_msgids.popitem(last=False)
             if rid in self._seen:
-                # Later partial usage for an already-recorded id: contribute
-                # its own fields additively (no new request). Anthropic sends
-                # input in message_start and cumulative output in
-                # message_delta, so plain addition matches the real totals;
-                # input is counted once from the first event.
-                qk_record_usage(__user__ or {}, model, tok, count_request=False, channel=chan)
+                # Later usage event for an already-recorded id: record only the
+                # per-field DELTA over what was recorded (no new request).
+                # Anthropic sends input in message_start and cumulative output
+                # in message_delta (delta = the increment); a repeated event
+                # carrying the FULL usage (duplicated chunk) contributes a zero
+                # delta -- previously it was added again in full, doubling
+                # tokens/cost in the day/hour/day-model buckets.
+                smodel, schan, tok_rec = self._seen[rid]
+                if _mid:
+                    self._mark_msgid(str(_mid), smodel, schan, tok_rec)
+                delta = self._usage_delta(tok_rec, tok)
+                if delta:
+                    qk_record_usage(__user__ or {}, smodel or model, delta,
+                                    count_request=False, channel=schan or chan)
                 return event
             self._record(__user__ or {}, model, tok, rid, channel=chan)
+            # mark the message id so the stream-end outlet call (0.11) tops up
+            # instead of double-recording (its rid is the message id, not rid).
+            # The entry shares the recorded-usage dict so the outlet topup
+            # computes its delta against what stream() already recorded; an
+            # orphan (no user yet) marks an empty record so the topup still
+            # records the full usage once the user is resolved.
+            if _mid:
+                ent = self._seen.get(rid)
+                self._mark_msgid(str(_mid), model, chan,
+                                 ent[2] if ent is not None else {})
         except Exception as e:
             log.warning("quota-keeper stream error: %s", e)
         return event
@@ -1105,10 +1146,17 @@ class Filter:
                     # name it was recorded under (the outlet body echoes the
                     # upstream alias prx.* while stream() recorded the real
                     # name), otherwise the topup lands under a phantom alias
-                    smodel, _schan = self._seen_msgids[rid]
+                    # row. Only the per-field DELTA over the recorded usage is
+                    # applied: this outlet echoes the FULL usage, which must
+                    # contribute nothing the second time (previously added in
+                    # full -> tokens/cost doubled in day/hour/day-model).
+                    smodel, _schan, tok_rec = self._seen_msgids[rid]
                     if smodel:
                         model = smodel
-                    qk_record_usage(__user__ or {}, model, tok, count_request=False, channel=chan)
+                    delta = self._usage_delta(tok_rec, tok)
+                    if delta:
+                        qk_record_usage(__user__ or {}, model, delta,
+                                        count_request=False, channel=chan)
                 else:
                     self._record(__user__ or {}, model, tok, rid, channel=chan)
             elif rid and (__user__ or {}).get("id") and rid in self._orphan:
