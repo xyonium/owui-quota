@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.37
+version: 0.5.38
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -736,11 +736,48 @@ def qk_cost_usd(tok: dict, price) -> float:
     return c
 
 
+def qk_extract_usage_obj(ev) -> Optional[dict]:
+    """Locate the usage object inside a response body / stream event dict.
+    Handles the top-level OpenAI shape, Anthropic message_start (usage nested
+    under "message"), Gemini usageMetadata / usage_metadata (and
+    Antigravity-style response.usageMetadata wrappers), and OpenAI
+    choices[0].usage. Returns None when no usage container is present."""
+    if not isinstance(ev, dict):
+        return None
+    u = ev.get("usage")
+    if isinstance(u, dict):
+        return u
+    msg = ev.get("message")
+    if isinstance(msg, dict) and isinstance(msg.get("usage"), dict):
+        # Anthropic message_start nests usage under "message"
+        return msg["usage"]
+    for key in ("usageMetadata", "usage_metadata"):
+        u = ev.get(key)
+        if isinstance(u, dict):
+            return u
+    resp = ev.get("response")
+    if isinstance(resp, dict):
+        for key in ("usageMetadata", "usage_metadata"):
+            u = resp.get(key)
+            if isinstance(u, dict):
+                return u
+    ch = ev.get("choices")
+    if isinstance(ch, list) and ch and isinstance(ch[0], dict):
+        u = ch[0].get("usage")
+        if isinstance(u, dict):
+            return u
+    return None
+
+
 def qk_normalize_usage(u) -> Optional[dict]:
-    """Normalize OpenAI / Anthropic / Responses API / generic usage into
-    cached/input/output(+write). The OpenAI Responses API reports cache inside
-    `input_tokens_details.cached_tokens` and its `input_tokens` is the TOTAL
-    input (cache included); Anthropic's `input_tokens` excludes cache."""
+    """Normalize OpenAI / Anthropic / Responses API / Gemini / generic usage
+    into cached/input/output(+write). The OpenAI Responses API reports cache
+    inside `input_tokens_details.cached_tokens` and its `input_tokens` is the
+    TOTAL input (cache included); Anthropic's `input_tokens` excludes cache.
+    Gemini's `usageMetadata` (camelCase or snake_case) reports cache as
+    `cachedContentTokenCount` with `promptTokenCount` as the TOTAL input
+    (cache included) -- previously unsupported, so Gemini traffic recorded
+    cached~=0 and billed cached reads at full input price."""
     if not isinstance(u, dict):
         return None
 
@@ -764,6 +801,11 @@ def qk_normalize_usage(u) -> Optional[dict]:
     itd = u.get("input_tokens_details")
     if cached_oai is None and isinstance(itd, dict) and isinstance(itd.get("cached_tokens"), (int, float)):
         cached_oai = float(itd["cached_tokens"])
+    # generic flat cached count: OpenAI-compatible Gemini gateways often add a
+    # top-level cached_tokens alongside prompt_tokens (Gemini CLI, qwen-code
+    # shims, LiteLLM gemini pass-through)
+    if cached_oai is None:
+        cached_oai = g("cached_tokens")
 
     if pt is not None:
         cached = (cached_oai or 0.0) + (cr or 0.0)
@@ -780,7 +822,20 @@ def qk_normalize_usage(u) -> Optional[dict]:
             inp = max(0.0, inp - cached)
         out = ao or 0.0
     else:
-        return None
+        # Gemini usageMetadata (camelCase / snake_case; also nested under
+        # "response" by Antigravity-style wrappers, unwrapped by callers).
+        # promptTokenCount is the TOTAL prompt incl. the cached part.
+        ptc = g("promptTokenCount", "prompt_token_count")
+        ctc = g("candidatesTokenCount", "candidates_token_count")
+        if ctc is None:
+            ctc = g("outputTokenCount", "output_token_count")
+        cct = g("cachedContentTokenCount", "cached_content_token_count")
+        if ptc is None and ctc is None and cct is None:
+            return None
+        cached = cct or 0.0
+        inp = max(0.0, (ptc or 0.0) - cached)
+        out = ctc or 0.0
+        cw = None
     if inp == 0 and out == 0 and cached == 0 and not cw:
         return None
     return {"cached": cached, "input": inp, "output": out, "cache_write": cw or 0.0}
@@ -1030,8 +1085,10 @@ def qk_ingest_extract_usage(data: dict) -> Optional[dict]:
     """Pull the usage object from a parsed JSON event/body. Handles the
     Anthropic streaming shapes (message_start carries cumulative usage,
     message_delta carries deltas), the OpenAI Responses API
-    (response.completed carries response.usage), and the plain OpenAI
-    completion shape (top-level or choices[0].usage)."""
+    (response.completed carries response.usage), the plain OpenAI
+    completion shape (top-level or choices[0].usage), and the Gemini
+    usageMetadata / usage_metadata shapes (camelCase or snake_case, also
+    nested under "response" by Antigravity-style wrappers)."""
     if not isinstance(data, dict):
         return None
     if data.get("type") == "message_start":
@@ -1055,13 +1112,7 @@ def qk_ingest_extract_usage(data: dict) -> Optional[dict]:
         if isinstance(resp, dict):
             return qk_normalize_usage(resp.get("usage"))
         return None
-    u = data.get("usage")
-    if isinstance(u, dict):
-        return qk_normalize_usage(u)
-    ch = data.get("choices")
-    if isinstance(ch, list) and ch and isinstance(ch[0], dict):
-        return qk_normalize_usage(ch[0].get("usage"))
-    return None
+    return qk_normalize_usage(qk_extract_usage_obj(data))
 
 
 def qk_ingest_merge_usage(acc: dict, part: dict) -> dict:
