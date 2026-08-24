@@ -402,12 +402,17 @@ def test_quota_period_weekly_accepted(qk, load_admin):
 def test_period_used_weekly_sums_iso_week(qk, monkeypatch, tmp_path):
     # weekly period sums Mon..today of the ISO week only -- last Sunday (prev
     # week) and the same-weekday-last-week are excluded.
-    from datetime import timedelta
+    # "now" is pinned to a fixed Wednesday: building the fixture from the real
+    # today makes the monday/today dict keys collide whenever today IS a
+    # Monday ({monday: 2.0} silently overwritten by {today: 3.0}), so the test
+    # used to fail one day per week.
+    from datetime import datetime, timedelta
     from tests.conftest import write_json
 
+    now = datetime(2026, 8, 19, 12, 0)  # a Wednesday
+    monkeypatch.setattr(qk, "qk_local_now", lambda cfg=None: now)
     cfg = qk.qk_get_config()
     cfg["quota_period"] = "weekly"
-    now = qk.qk_local_now(cfg)
     monday = now - timedelta(days=now.weekday())
     last_sunday = monday - timedelta(days=1)
     days = {
