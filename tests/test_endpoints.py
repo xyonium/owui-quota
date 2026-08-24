@@ -1312,17 +1312,16 @@ def test_rename_model_into_new_name_creates_bucket(load_admin):
 
 # ---- ledger dedup repair script (scripts/qk_dedup_repair.py) -----------------
 #
-# The pre-0.4.18 topup bug recorded a repeated full-usage event a second time
-# into the day/hour/day-model buckets, doubling tokens+cost for affected
-# responses while request counters stayed correct. The hour per-model buckets
-# (count_request=True only) hold the TRUE usage, so a day is repairable when
-# every hour carries per-model data and each hour's excess over the per-model
-# sum is exactly the per-model sum (pure full-repeat doubling, all fields).
-# Anything else (genuine partial topups, mixed patterns, legacy hours without
-# per-model data) is skipped and reported, never guessed at.
-#
-# The repair is a ONE-OFF maintenance script (scripts/qk_dedup_repair.py),
-# deliberately not shipped inside the admin plugin.
+# The pre-0.4.18 topup bug: OWUI 0.11 fires outlet() a second time at the end
+# of a WEBUI streaming chat with a rebuilt body whose messages[-1].usage
+# carries the FULL usage; the filter recorded it again as a topup, doubling
+# tokens/cost in the day/hour/day-model buckets (request counters guarded).
+# Direct api requests never take that path (production ledger: every api-only
+# hour sums to exactly 1.0x). The hour per-model buckets only ever received
+# count_request=True records, so where they are real they hold the TRUE usage
+# and the day is repaired EXACTLY from them. Backfill-era days (v0.5.17
+# migration synthesised hm from day totals) have no anchor: report-only by
+# default, optional channel-share deflation with estimate_backfill=True.
 
 
 def _load_dedup_script():
@@ -1336,27 +1335,27 @@ def _load_dedup_script():
 
 
 def _doubled_ledger(day="2026-08-19"):
-    """One user, one day, two api hours (9, 10), model m/x; every bucket above
-    the hour per-model level holds exactly 2x the true usage."""
+    """One user, one day, two webui hours (9, 10), model m/x; every bucket
+    above the hour per-model level holds exactly 2x the true usage."""
     hours = {}
     for h in ("9", "10"):
         hours[h] = {
             "requests": 1, "cost_usd": 0.6,
             "tokens": {"cached": 0.0, "input": 200.0, "output": 100.0},
-            "channels": {"webui": 0, "api": 1},
+            "channels": {"webui": 1, "api": 0},
             "models": {"m/x": {"requests": 1, "cost_usd": 0.3,
                                "tokens": {"cached": 0.0, "input": 100.0, "output": 50.0},
-                               "channels": {"webui": 0, "api": 1}}},
+                               "channels": {"webui": 1, "api": 0}}},
         }
     return {"users": {"u1": {"name": "A", "email": "a@x", "days": {day: {
         "requests": 2, "cost_usd": 1.2,
         "tokens": {"cached": 0.0, "input": 400.0, "output": 200.0},
-        "channels": {"webui": 0, "api": 2},
+        "channels": {"webui": 2, "api": 0},
         "tou": {"peak": 0, "offpeak": 0, "normal": 2},
         "cost_saved_usd": 0.12,
         "models": {"m/x": {"requests": 2, "cost_usd": 1.2,
                            "tokens": {"cached": 0.0, "input": 400.0, "output": 200.0},
-                           "channels": {"webui": 0, "api": 2},
+                           "channels": {"webui": 2, "api": 0},
                            "priced": True, "unpriced_requests": 0,
                            "tou": {"peak": 0, "offpeak": 0, "normal": 2},
                            "cost_saved_usd": 0.12}},
@@ -1407,26 +1406,83 @@ def test_dedup_repair_halves_doubled_buckets(tmp_path):
     assert rep2["days_repaired"] == 0 and rep2["days_clean"] == 1
 
 
-def test_dedup_repair_skips_ambiguous_partial_topup(tmp_path):
-    """A genuine partial topup (Anthropic delta: input matches the per-model
-    sum exactly, output exceeds it by less than 2x) is REAL usage, not a
-    repeat -- the day must be skipped and reported, never 'repaired'."""
+def test_dedup_repair_partially_doubled_day(tmp_path):
+    """Only SOME requests in an hour doubled (e.g. 6 of 7 webui): the excess
+    over the hour per-model sums is still exactly the double-count, and the
+    anchored repair removes exactly it."""
+    from tests.conftest import write_json
+    import json
+
+    lp = tmp_path / "ledger.json"
+    led = _doubled_ledger()
+    d = led["users"]["u1"]["days"]["2026-08-19"]
+    # hour 9: TWO webui requests, one of them doubled -> hm holds 2x a
+    # request (the truth), h holds 3x (truth + one full topup)
+    h9 = d["hours"]["9"]
+    h9["requests"] = 2
+    h9["tokens"] = {"cached": 0.0, "input": 300.0, "output": 150.0}
+    h9["cost_usd"] = 0.9
+    h9["channels"] = {"webui": 2, "api": 0}
+    h9["models"]["m/x"]["requests"] = 2
+    h9["models"]["m/x"]["channels"] = {"webui": 2, "api": 0}
+    h9["models"]["m/x"]["tokens"] = {"cached": 0.0, "input": 200.0, "output": 100.0}
+    h9["models"]["m/x"]["cost_usd"] = 0.6
+    # day: 3 requests, truth = {i:300,o:150} / cost 0.9; 2 topups on top
+    d["requests"] = 3
+    d["channels"] = {"webui": 3, "api": 0}
+    d["tokens"] = {"cached": 0.0, "input": 500.0, "output": 250.0}
+    d["cost_usd"] = 1.5
+    d["models"]["m/x"]["requests"] = 3
+    d["models"]["m/x"]["channels"] = {"webui": 3, "api": 0}
+    d["models"]["m/x"]["tokens"] = {"cached": 0.0, "input": 500.0, "output": 250.0}
+    d["models"]["m/x"]["cost_usd"] = 1.5
+    write_json(lp, led)
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False)
+    assert rep["days_repaired"] == 1
+    assert rep["tokens_removed"]["input"] == 200.0   # exactly the 2 topups
+    assert rep["tokens_removed"]["output"] == 100.0
+    led = json.load(open(lp))
+    d = led["users"]["u1"]["days"]["2026-08-19"]
+    assert d["tokens"]["input"] == 300.0 and d["tokens"]["output"] == 150.0
+    assert abs(d["cost_usd"] - 0.9) < 1e-6
+    assert d["hours"]["9"]["tokens"]["input"] == 200.0  # rebuilt from hm
+    assert d["requests"] == 3  # untouched
+
+
+def test_dedup_repair_skips_when_anchor_exceeds_bucket(tmp_path):
+    """sum(hm) > day-model bucket is impossible under the topup bug -- the
+    anchor is untrustworthy, skip the day."""
     from tests.conftest import write_json
 
     lp = tmp_path / "ledger.json"
     led = _doubled_ledger()
     d = led["users"]["u1"]["days"]["2026-08-19"]
-    h9 = d["hours"]["9"]
-    h9["tokens"] = {"cached": 0.0, "input": 100.0, "output": 57.0}
-    h9["cost_usd"] = 0.31
-    d["tokens"] = {"cached": 0.0, "input": 300.0, "output": 157.0}
+    d["models"]["m/x"]["tokens"] = {"cached": 0.0, "input": 150.0, "output": 75.0}
     write_json(lp, led)
     before = lp.read_text()
     rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False)
     assert rep["days_repaired"] == 0
     assert rep["days_skipped_ambiguous"] == 1
-    assert rep["skipped"][0]["reason"] == "ambiguous-excess"
-    assert lp.read_text() == before  # untouched
+    assert lp.read_text() == before
+
+
+def test_dedup_repair_skips_phantom_hour(tmp_path):
+    """An hour with usage but no per-model data on an otherwise-anchored day
+    (boundary-crossing topup or legacy record): not attributable, skip."""
+    from tests.conftest import write_json
+
+    lp = tmp_path / "ledger.json"
+    led = _doubled_ledger()
+    d = led["users"]["u1"]["days"]["2026-08-19"]
+    d["hours"]["23"] = {"requests": 0, "cost_usd": 0.3,
+                        "tokens": {"cached": 0.0, "input": 100.0, "output": 50.0},
+                        "channels": {"webui": 0, "api": 0}, "models": {}}
+    write_json(lp, led)
+    before = lp.read_text()
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False)
+    assert rep["days_repaired"] == 0
+    assert rep["days_skipped_ambiguous"] == 1
+    assert lp.read_text() == before
 
 
 def test_dedup_repair_skips_legacy_day_without_hours(tmp_path):
@@ -1441,6 +1497,84 @@ def test_dedup_repair_skips_legacy_day_without_hours(tmp_path):
     assert rep["days_repaired"] == 0
     assert rep["days_skipped_legacy"] == 1
     assert rep["skipped"][0]["reason"] == "legacy-hours"
+    assert lp.read_text() == before
+
+
+def _backfilled_ledger(day="2026-08-18", channels=None):
+    """v0.5.17-migration shape: hm entries are synthetic fractions summing
+    exactly to the day-model buckets -- no anchor survives. channels sets the
+    channel counters at every level (default: two webui requests)."""
+    ch = channels or {"webui": 2, "api": 0}
+    hours = {}
+    for h, share in (("9", 1 / 3), ("10", 2 / 3)):
+        hours[h] = {
+            "requests": 1, "cost_usd": 0.6 * share,
+            "tokens": {"cached": 0.0, "input": 200.0 * share, "output": 100.0 * share},
+            "channels": dict(ch),
+            "models": {"m/x": {"requests": 1, "cost_usd": 0.6 * share,
+                               "tokens": {"cached": 0.0, "input": 200.0 * share,
+                                          "output": 100.0 * share},
+                               "channels": dict(ch)}},
+        }
+    return {"users": {"u1": {"name": "A", "email": "a@x", "days": {day: {
+        "requests": 2, "cost_usd": 0.6,
+        "tokens": {"cached": 0.0, "input": 200.0, "output": 100.0},
+        "channels": dict(ch),
+        "cost_saved_usd": 0.06,
+        "models": {"m/x": {"requests": 2, "cost_usd": 0.6,
+                           "tokens": {"cached": 0.0, "input": 200.0, "output": 100.0},
+                           "channels": dict(ch),
+                           "cost_saved_usd": 0.06}},
+        "hours": hours,
+    }}}}}
+
+
+def test_dedup_repair_backfill_day_untouched_by_default(tmp_path):
+    from tests.conftest import write_json
+
+    lp = tmp_path / "ledger.json"
+    write_json(lp, _backfilled_ledger())
+    before = lp.read_text()
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False)
+    assert rep["days_repaired"] == 0
+    assert rep["days_backfill_untouched"] == 1
+    assert lp.read_text() == before
+
+
+def test_dedup_repair_backfill_estimate_halves_webui(tmp_path):
+    """estimate_backfill=True on a pure-webui backfilled day: factor
+    (a+w)/(a+2w) = 1/2 -- the 'halve the webui share' heuristic; day/hour
+    totals are rebuilt from the scaled per-model buckets."""
+    from tests.conftest import write_json
+    import json
+
+    lp = tmp_path / "ledger.json"
+    write_json(lp, _backfilled_ledger())
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False,
+                                               estimate_backfill=True)
+    assert rep["days_estimated"] == 1
+    assert abs(rep["est_tokens_removed"]["input"] - 100.0) < 1e-6
+    led = json.load(open(lp))
+    d = led["users"]["u1"]["days"]["2026-08-18"]
+    assert abs(d["tokens"]["input"] - 100.0) < 1e-6
+    assert abs(d["models"]["m/x"]["tokens"]["input"] - 100.0) < 1e-6
+    assert abs(d["cost_usd"] - 0.3) < 1e-6
+    hsum = sum(h["tokens"]["input"] for h in d["hours"].values())
+    assert abs(hsum - 100.0) < 1e-6  # hours rebuilt consistently
+    assert d["requests"] == 2
+
+
+def test_dedup_repair_backfill_estimate_leaves_api_untouched(tmp_path):
+    """Pure-api backfilled day: factor is 1.0, nothing is estimated."""
+    from tests.conftest import write_json
+
+    lp = tmp_path / "ledger.json"
+    write_json(lp, _backfilled_ledger(channels={"webui": 0, "api": 2}))
+    before = lp.read_text()
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False,
+                                               estimate_backfill=True)
+    assert rep["days_estimated"] == 0
+    assert rep["days_backfill_untouched"] == 1
     assert lp.read_text() == before
 
 

@@ -1,39 +1,47 @@
 #!/usr/bin/env python3
-"""One-off repair for ledger buckets double-counted by the pre-0.4.18 topup bug.
+"""One-off repair for ledger buckets inflated by the pre-0.4.18 topup bug.
 
-Background: a repeated usage-bearing event for an already-recorded response id
-(OWUI 0.11 stream-end outlet echoing messages[-1].usage, or a duplicate usage
-chunk sharing the response id) was added IN FULL a second time into the
-day/hour/day-model buckets, doubling tokens/cost for affected responses
-(request counters were guarded and stayed correct). The hour per-model buckets
-(count_request=True only) therefore hold the TRUE usage; everything above them
-absorbed the repeat.
+Background: for webui streaming chats, OWUI 0.11 fires outlet() a second time
+at stream end with a rebuilt message body whose messages[-1].usage carries the
+FULL usage; the filter recorded it again as a "topup" (count_request=False),
+adding the full tokens/cost a second time into the day/hour/day-model buckets.
+Request counters were guarded and stayed correct. Direct API requests never
+take that path and were never doubled (verified on the production ledger:
+every api-only hour sums to exactly 1.0x, webui hours to ~2.0x).
 
-A day is repaired ONLY when the doubling is exactly verifiable:
-  - every hour of the day carries per-model data (v0.5.17+ buckets), and
-  - for every token field AND cost, each hour's total is either equal to its
-    per-model sum (clean hour) or exactly twice it (pure full-repeat doubling),
-  - and the day totals agree with their per-model sums.
-The repair rebuilds hour totals, day per-model buckets and day totals from the
-hour per-model sums (exact under pure doubling; cost_saved_usd is scaled by
-the bucket's cost ratio, exact when the doubling was uniform). recent.json
-needs no repair: topups never entered it (per-request records only).
+The hour per-model buckets (hm, v0.5.17+) only ever received count_request=True
+records, so where they are REAL they hold the TRUE usage. Two day shapes:
 
-Days with any other excess shape (genuine Anthropic partial-usage topups whose
-deltas are real usage, mixed patterns, legacy hours without per-model data)
-are SKIPPED and reported -- never guessed at.
+  ANCHORED days (post-backfill era): sum(hm) < day/model totals -- the excess
+      is exactly the double-count. Repair rebuilds hour totals, day per-model
+      buckets and day totals from the hour per-model sums. EXACT.
+  BACKFILL-ERA days (pre-v0.5.17): the v0.5.17 migration synthesised hm from
+      day totals, so sum(hm) == day totals and no anchor survives. Doubling is
+      undetectable there; by default these days are only REPORTED. With
+      --estimate-backfill they are deflated by the per-model channel share
+      factor (a+w)/(a+2w) -- i.e. "halve the webui share", generalised so pure
+      api buckets stay untouched. ESTIMATE: assumes every webui streaming
+      request doubled and none of the api requests did; residual error is the
+      token-mix difference between channels.
+
+cost_saved_usd is scaled by the bucket's cost ratio in both modes.
+recent.json needs no repair: topups never entered it (per-request records).
+Days whose shapes fit neither mode (genuine partial-usage topups, phantom
+hours from boundary-crossing topups, backfill contamination with excess,
+anchors exceeding their buckets) are SKIPPED and reported, never guessed at.
 
 Usage (the plugins may stay online; the script locks the sibling `.lock`
 file -- the same fcntl lock the plugins take around every ledger write, so
 repairs are mutually exclusive with live metering):
 
     python3 scripts/qk_dedup_repair.py                 # dry run, report only
-    python3 scripts/qk_dedup_repair.py --apply         # write the repair
-    python3 scripts/qk_dedup_repair.py --ledger /app/backend/data/quota_keeper/ledger.json --apply
+    python3 scripts/qk_dedup_repair.py --apply         # repair anchored days
+    python3 scripts/qk_dedup_repair.py --apply --estimate-backfill
+                                                       # + deflate backfill-era days
 
 IMPORTANT: update the two Functions in Open WebUI to >= 0.5.37 / 0.4.18
-FIRST -- an old Filter keeps double-recording new requests while you repair,
-so the dashboard drifts back to 2x within minutes.
+FIRST -- an old Filter keeps double-recording new webui requests while you
+repair, so the dashboard drifts back within minutes.
 
 Back up ledger.json before --apply (cp ledger.json ledger.json.bak).
 """
@@ -76,19 +84,40 @@ def _atomic_write(path: str, obj) -> None:
         raise
 
 
-def qk_dedup_repair(ledger_path: str, dry_run: bool = True) -> dict:
+def _tok_sum(t) -> float:
+    return sum(float((t or {}).get(k, 0.0) or 0.0) for k in TOK_FIELDS)
+
+
+def _channel_factor(bucket: dict) -> float:
+    """(a+w)/(a+2w): the deflation factor when every webui request doubled
+    and no api request did. 1.0 for pure-api or unattributed buckets."""
+    ch = (bucket or {}).get("channels") or {}
+    a = float(ch.get("api", 0) or 0)
+    w = float(ch.get("webui", 0) or 0)
+    if a + w <= 0:
+        return 1.0
+    return (a + w) / (a + 2.0 * w)
+
+
+def qk_dedup_repair(ledger_path: str, dry_run: bool = True,
+                    estimate_backfill: bool = False) -> dict:
     """See module docstring. Returns a report dict; dry_run=True computes
     without writing."""
     report = {
         "dry_run": bool(dry_run),
+        "estimate_backfill": bool(estimate_backfill),
         "ledger": ledger_path,
         "users_scanned": 0,
         "days_repaired": 0,
+        "days_estimated": 0,
         "days_clean": 0,
         "days_skipped_legacy": 0,
         "days_skipped_ambiguous": 0,
+        "days_backfill_untouched": 0,
         "tokens_removed": {k: 0.0 for k in TOK_FIELDS},
         "cost_removed_usd": 0.0,
+        "est_tokens_removed": {k: 0.0 for k in TOK_FIELDS},
+        "est_cost_removed_usd": 0.0,
         "skipped": [],
     }
 
@@ -117,134 +146,231 @@ def qk_dedup_repair(ledger_path: str, dry_run: bool = True) -> dict:
                     drec = drec or {}
                     hours = drec.get("hours") or {}
                     dmodels = drec.get("models") or {}
-                    # classify hours: clean | doubled | anything-else
-                    kinds = {}
+                    dtok = drec.get("tokens") or {}
+                    has_usage = _tok_sum(dtok) > 0 or bool(dmodels)
+                    if not hours:
+                        if has_usage:
+                            _skip(uid, day, "legacy")
+                        else:
+                            report["days_clean"] += 1
+                        continue
+
+                    # --- build the hour per-model anchor -------------------
+                    T = {}        # m -> {tokens per field, "cost"}
+                    frac = False  # fractional hm tokens = synthetic backfill
+                    phantom = False  # hour with usage but no per-model data
                     for hk, hrec in hours.items():
                         hrec = hrec or {}
                         hmods = hrec.get("models") or {}
-                        htok = hrec.get("tokens") or {}
                         if not hmods:
-                            # legacy hour (pre-v0.5.17): no per-model data.
-                            # Only ignorable if it recorded nothing at all.
-                            if any((htok.get(k) or 0.0) for k in TOK_FIELDS) \
+                            if _tok_sum(hrec.get("tokens")) > 0 \
                                     or (hrec.get("cost_usd") or 0.0):
-                                kinds[hk] = "legacy"
-                            else:
-                                kinds[hk] = "clean"
+                                phantom = True
                             continue
-                        mtok = {k: 0.0 for k in TOK_FIELDS}
-                        mcost = 0.0
-                        for hm in hmods.values():
+                        for m, hm in hmods.items():
+                            hm = hm or {}
+                            e = T.setdefault(
+                                m, {k: 0.0 for k in TOK_FIELDS} | {"cost": 0.0})
                             for k in TOK_FIELDS:
-                                mtok[k] += ((hm or {}).get("tokens") or {}).get(k, 0.0) or 0.0
-                            mcost += float((hm or {}).get("cost_usd") or 0.0)
-                        hcost = float(hrec.get("cost_usd") or 0.0)
-                        if all(_close(float(htok.get(k) or 0.0), mtok[k])
-                               for k in TOK_FIELDS) and _close(hcost, mcost):
-                            kinds[hk] = "clean"
-                        elif all(_close(float(htok.get(k) or 0.0), 2.0 * mtok[k])
-                                 for k in TOK_FIELDS) and _close(hcost, 2.0 * mcost):
-                            kinds[hk] = "doubled"
-                        else:
-                            kinds[hk] = "ambiguous"
-                    has_usage = any((drec.get("tokens") or {}).get(k, 0.0)
-                                    for k in TOK_FIELDS) or dmodels
-                    if "legacy" in kinds.values() or (has_usage and not hours):
-                        _skip(uid, day, "legacy")
-                        continue
-                    if "ambiguous" in kinds.values():
+                                v = float((hm.get("tokens") or {}).get(k, 0.0) or 0.0)
+                                if abs(v - round(v)) > 1e-6:
+                                    frac = True
+                                e[k] += v
+                            e["cost"] += float(hm.get("cost_usd") or 0.0)
+
+                    if phantom:
+                        # boundary-crossing topup or legacy record: the usage
+                        # cannot be attributed to a model at hour level
                         _skip(uid, day, "ambiguous")
                         continue
-                    doubled_hours = [hk for hk, k in kinds.items() if k == "doubled"]
-                    if not doubled_hours:
-                        report["days_clean"] += 1
-                        continue
-                    # every model recorded at day level must be covered by the
-                    # hour per-model data, and vice versa -- otherwise the day
-                    # cannot be rebuilt exactly from it
-                    covered = set()
-                    for hrec in hours.values():
-                        covered |= set(((hrec or {}).get("models") or {}).keys())
+
+                    covered = set(T.keys())
                     if set(dmodels.keys()) != covered:
                         _skip(uid, day, "ambiguous")
                         continue
-                    # day totals and their per-model sums must agree with each
-                    # other (both received every record); otherwise the excess
-                    # shape is not the pure-doubling pattern this repair targets
-                    msum_tok = {k: sum(((mm or {}).get("tokens") or {}).get(k, 0.0) or 0.0
-                                       for mm in dmodels.values()) for k in TOK_FIELDS}
-                    msum_cost = sum(float((mm or {}).get("cost_usd") or 0.0)
-                                    for mm in dmodels.values())
-                    dtok = drec.get("tokens") or {}
-                    dcost = float(drec.get("cost_usd") or 0.0)
-                    if not (all(_close(float(dtok.get(k) or 0.0), msum_tok[k])
-                                for k in TOK_FIELDS)
-                            and _close(dcost, msum_cost)):
+
+                    # per-model anchor vs day bucket: T <= mm everywhere is
+                    # required (removal-only); any excess flags the day as
+                    # doubled (topups never reached hm)
+                    excess = False
+                    violation = False
+                    for m, mm in dmodels.items():
+                        mm = mm or {}
+                        for k in TOK_FIELDS:
+                            mv = float((mm.get("tokens") or {}).get(k, 0.0) or 0.0)
+                            tv = T[m][k]
+                            if tv > mv + max(1e-9, 1e-6 * mv):
+                                violation = True
+                            elif not _close(tv, mv):
+                                excess = True
+                        mc = float(mm.get("cost_usd") or 0.0)
+                        tc = T[m]["cost"]
+                        if tc > mc + max(1e-9, 1e-6 * mc):
+                            violation = True
+                        elif not _close(tc, mc):
+                            excess = True
+                    if violation:
                         _skip(uid, day, "ambiguous")
                         continue
-                    # --- repair: rebuild from the hour per-model sums -------
-                    # true usage = the hour per-model sums (count_request=True
-                    # records only). The removed amount is counted ONCE, at
-                    # the day level (the hour/day-model excesses are the same
-                    # double-count viewed at different aggregation levels).
-                    true_model = {}  # m -> {"tok": {...}, "cost": float}
-                    true_tok = {k: 0.0 for k in TOK_FIELDS}
-                    true_cost = 0.0
-                    for hrec in hours.values():
-                        for m, hm in ((hrec or {}).get("models") or {}).items():
-                            ent = true_model.setdefault(
-                                m, {"tok": {k: 0.0 for k in TOK_FIELDS}, "cost": 0.0})
-                            for k in TOK_FIELDS:
-                                v = ((hm or {}).get("tokens") or {}).get(k, 0.0) or 0.0
-                                ent["tok"][k] += v
-                                true_tok[k] += v
-                            c = float((hm or {}).get("cost_usd") or 0.0)
-                            ent["cost"] += c
-                            true_cost += c
-                    removed_tok = {k: max(0.0, float(dtok.get(k, 0.0) or 0.0) - true_tok[k])
-                                   for k in TOK_FIELDS}
-                    removed_cost = max(0.0, dcost - true_cost)
-                    if not dry_run:
-                        for hk in doubled_hours:
-                            hrec = hours[hk]
-                            hmods = hrec.get("models") or {}
-                            for k in TOK_FIELDS:
-                                hrec.setdefault("tokens", {})[k] = sum(
-                                    ((hm or {}).get("tokens") or {}).get(k, 0.0) or 0.0
+
+                    if not excess:
+                        # no topup excess: the day totals are whatever they
+                        # are; fractional hm marks a backfilled day
+                        if frac:
+                            if estimate_backfill and _estimate_day(
+                                    drec, hours, dmodels, report):
+                                report["days_estimated"] += 1
+                            else:
+                                report["days_backfill_untouched"] += 1
+                        else:
+                            report["days_clean"] += 1
+                        continue
+                    if frac:
+                        # backfill-contaminated anchor with an excess on top:
+                        # not reconstructable
+                        _skip(uid, day, "ambiguous")
+                        continue
+                    # removal-only at hour level too: an hour below its
+                    # per-model sum contradicts the topup pattern
+                    hour_bad = False
+                    for hk, hrec in hours.items():
+                        hrec = hrec or {}
+                        hmods = hrec.get("models") or {}
+                        shm = {k: sum(float(((hm or {}).get("tokens") or {})
+                                            .get(k, 0.0) or 0.0)
+                                      for hm in hmods.values())
+                               for k in TOK_FIELDS}
+                        scost = sum(float((hm or {}).get("cost_usd") or 0.0)
                                     for hm in hmods.values())
+                        for k in TOK_FIELDS:
+                            if float((hrec.get("tokens") or {}).get(k, 0.0) or 0.0) \
+                                    < shm[k] - max(1e-9, 1e-6 * shm[k]):
+                                hour_bad = True
+                        if float(hrec.get("cost_usd") or 0.0) < scost - max(1e-9, 1e-6 * scost):
+                            hour_bad = True
+                    if hour_bad:
+                        _skip(uid, day, "ambiguous")
+                        continue
+
+                    # --- ANCHORED repair: rebuild from the hour per-model sums
+                    removed_tok = {k: 0.0 for k in TOK_FIELDS}
+                    removed_cost = 0.0
+                    if not dry_run:
+                        for hk, hrec in hours.items():
+                            hrec = hrec or {}
+                            hmods = hrec.get("models") or {}
+                            ht = hrec.setdefault("tokens", {})
+                            for k in TOK_FIELDS:
+                                ht[k] = sum(float(((hm or {}).get("tokens") or {})
+                                                  .get(k, 0.0) or 0.0)
+                                            for hm in hmods.values())
                             hrec["cost_usd"] = round(sum(
                                 float((hm or {}).get("cost_usd") or 0.0)
                                 for hm in hmods.values()), 8)
-                        for m, mm in dmodels.items():
-                            mm = mm or {}
-                            ent = true_model[m]
-                            old_cost = float(mm.get("cost_usd") or 0.0)
-                            ratio = (ent["cost"] / old_cost) if old_cost > 0 else 1.0
+                    new_day_tok = {k: 0.0 for k in TOK_FIELDS}
+                    new_day_cost = 0.0
+                    for m, mm in dmodels.items():
+                        mm = mm or {}
+                        for k in TOK_FIELDS:
+                            removed_tok[k] += float((mm.get("tokens") or {})
+                                                    .get(k, 0.0) or 0.0) - T[m][k]
+                            new_day_tok[k] += T[m][k]
+                        old_cost = float(mm.get("cost_usd") or 0.0)
+                        removed_cost += old_cost - T[m]["cost"]
+                        new_day_cost += T[m]["cost"]
+                        if not dry_run:
+                            ratio = (T[m]["cost"] / old_cost) if old_cost > 0 else 1.0
                             mt = mm.setdefault("tokens", {})
                             for k in TOK_FIELDS:
-                                mt[k] = ent["tok"][k]
-                            mm["cost_usd"] = round(ent["cost"], 8)
+                                mt[k] = T[m][k]
+                            mm["cost_usd"] = round(T[m]["cost"], 8)
                             mm["cost_saved_usd"] = round(
                                 float(mm.get("cost_saved_usd") or 0.0) * ratio, 8)
+                    if not dry_run:
                         old_day_cost = float(drec.get("cost_usd") or 0.0)
-                        ratio_d = (true_cost / old_day_cost) if old_day_cost > 0 else 1.0
+                        ratio_d = (new_day_cost / old_day_cost) if old_day_cost > 0 else 1.0
                         dt = drec.setdefault("tokens", {})
                         for k in TOK_FIELDS:
-                            dt[k] = true_tok[k]
-                        drec["cost_usd"] = round(true_cost, 8)
+                            dt[k] = new_day_tok[k]
+                        drec["cost_usd"] = round(new_day_cost, 8)
                         drec["cost_saved_usd"] = round(
                             float(drec.get("cost_saved_usd") or 0.0) * ratio_d, 8)
                     for k in TOK_FIELDS:
                         report["tokens_removed"][k] = round(
-                            report["tokens_removed"][k] + removed_tok[k], 8)
+                            report["tokens_removed"][k] + max(0.0, removed_tok[k]), 8)
                     report["cost_removed_usd"] = round(
-                        report["cost_removed_usd"] + removed_cost, 8)
+                        report["cost_removed_usd"] + max(0.0, removed_cost), 8)
                     report["days_repaired"] += 1
-            if not dry_run and report["days_repaired"]:
+            if not dry_run and (report["days_repaired"] or report["days_estimated"]):
                 _atomic_write(ledger_path, led)
         finally:
             fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
     return report
+
+
+def _estimate_day(drec: dict, hours: dict, dmodels: dict, report: dict) -> None:
+    """Backfill-era heuristic: deflate by the per-model channel share factor
+    (a+w)/(a+2w) -- 'halve the webui share', api-only buckets stay untouched.
+    Day/hour totals are rebuilt from the scaled per-model buckets so the
+    buckets stay mutually consistent. Estimates accumulate under
+    Estimate-mode entry point. Returns True when the day was actually
+    deflated (any channel-attributed webui share), False when every bucket
+    factor was 1.0 (pure-api / unattributed -- nothing to estimate)."""
+    changed = False
+    new_day_tok = {k: 0.0 for k in TOK_FIELDS}
+    new_day_cost = 0.0
+    for m, mm in dmodels.items():
+        mm = mm or {}
+        f = _channel_factor(mm)
+        mt = mm.setdefault("tokens", {})
+        for k in TOK_FIELDS:
+            v = float(mt.get(k, 0.0) or 0.0)
+            if not _close(f, 1.0):
+                report["est_tokens_removed"][k] = round(
+                    report["est_tokens_removed"][k] + v * (1.0 - f), 8)
+                mt[k] = v * f
+                changed = True
+            new_day_tok[k] += mt[k]
+        c = float(mm.get("cost_usd") or 0.0)
+        if not _close(f, 1.0):
+            report["est_cost_removed_usd"] = round(
+                report["est_cost_removed_usd"] + c * (1.0 - f), 8)
+            mm["cost_usd"] = round(c * f, 8)
+            mm["cost_saved_usd"] = round(float(mm.get("cost_saved_usd") or 0.0) * f, 8)
+        new_day_cost += mm["cost_usd"]
+        for hrec in hours.values():
+            hm = (((hrec or {}).get("models") or {}).get(m))
+            if not hm:
+                continue
+            hmt = hm.get("tokens") or {}
+            for k in TOK_FIELDS:
+                if k in hmt:
+                    hmt[k] = float(hmt.get(k) or 0.0) * f
+            if "cost_usd" in hm:
+                hm["cost_usd"] = round(float(hm.get("cost_usd") or 0.0) * f, 8)
+    if not changed:
+        return
+    # day totals and hour totals rebuilt from the scaled per-model buckets
+    old_day_cost = float(drec.get("cost_usd") or 0.0)
+    ratio_d = (new_day_cost / old_day_cost) if old_day_cost > 0 else 1.0
+    dt = drec.setdefault("tokens", {})
+    for k in TOK_FIELDS:
+        dt[k] = new_day_tok[k]
+    drec["cost_usd"] = round(new_day_cost, 8)
+    drec["cost_saved_usd"] = round(
+        float(drec.get("cost_saved_usd") or 0.0) * ratio_d, 8)
+    for hrec in hours.values():
+        hrec = hrec or {}
+        hmods = hrec.get("models") or {}
+        if not hmods:
+            continue
+        ht = hrec.setdefault("tokens", {})
+        for k in TOK_FIELDS:
+            ht[k] = sum(float(((hm or {}).get("tokens") or {}).get(k, 0.0) or 0.0)
+                        for hm in hmods.values())
+        hrec["cost_usd"] = round(sum(float((hm or {}).get("cost_usd") or 0.0)
+                                     for hm in hmods.values()), 8)
+    return True
 
 
 def main(argv=None) -> int:
@@ -254,6 +380,10 @@ def main(argv=None) -> int:
                          "or /app/backend/data/quota_keeper/ledger.json)")
     ap.add_argument("--apply", action="store_true",
                     help="write the repair (default: dry run, report only)")
+    ap.add_argument("--estimate-backfill", action="store_true",
+                    help="also deflate backfill-era days by the per-model "
+                         "channel share factor (ESTIMATE: assumes every webui "
+                         "streaming request doubled, no api request did)")
     args = ap.parse_args(argv)
     if not os.path.exists(args.ledger):
         print(f"ledger not found: {args.ledger}", file=sys.stderr)
@@ -261,7 +391,8 @@ def main(argv=None) -> int:
     if args.apply:
         print("WARNING: applying repair. Back up ledger.json first if you "
               "haven't (cp ledger.json ledger.json.bak).", file=sys.stderr)
-    rep = qk_dedup_repair(args.ledger, dry_run=not args.apply)
+    rep = qk_dedup_repair(args.ledger, dry_run=not args.apply,
+                          estimate_backfill=args.estimate_backfill)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
     return 0
 
