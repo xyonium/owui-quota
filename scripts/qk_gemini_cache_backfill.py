@@ -93,7 +93,9 @@ def main():
                 if not DRY:
                     t["cached"], t["input"] = new_cached, new_input
                     mm["cost_usd"] = new_bucket_cost
-                    # roll the delta up to the day bucket and user totals
+                    # day/user totals were already corrected by v2; hour
+                    # buckets are fixed below. Only roll up when they differ
+                    # (i.e. this run changed the day-model bucket).
                     d["cost_usd"] = (d.get("cost_usd", 0) or 0) + delta
                     dt = d.get("tokens") or {}
                     dt["cached"] = (dt.get("cached", 0) or 0) + (new_cached - old_c)
@@ -109,6 +111,48 @@ def main():
                 changed_d += 1
                 old_cost_sum += old_bucket_cost
                 new_cost_sum += new_bucket_cost
+
+        # v3: hour buckets (days[day].hours[hour].models[model]) carry their
+        # own tokens/cost and back the 24h view — re-split them too. Delta
+        # rolls into the hour record's own totals only; day/user totals are
+        # already correct from the day-model pass above.
+        changed_h = 0
+        for uid, u in (led.get("users") or {}).items():
+            d = (u.get("days") or {}).get(TODAY)
+            if not d:
+                continue
+            for hh, hrec in ((d.get("hours") or {}).items()):
+                hmodels = (hrec or {}).get("models") or {}
+                for model, spec in MODELS.items():
+                    mm = hmodels.get(model)
+                    if not mm:
+                        continue
+                    rate, price = spec["rate"], spec["price"]
+                    t = mm.get("tokens") or {}
+                    prompt = (t.get("cached", 0) or 0) + (t.get("input", 0) or 0)
+                    if prompt <= 0:
+                        continue
+                    new_cached = round(prompt * rate, 1)
+                    new_input = round(prompt - new_cached, 1)
+                    old_c, old_i = t.get("cached", 0), t.get("input", 0)
+                    if abs(new_cached - old_c) < 1:
+                        continue
+                    old_hc = mm.get("cost_usd", 0) or 0
+                    new_hc = cost({"cached": new_cached, "input": new_input,
+                                   "output": t.get("output", 0)}, price)
+                    delta = new_hc - old_hc
+                    print(f"hour {hh} user {uid[:8]} [{model}]: cached {old_c:.0f}->{new_cached:.0f} "
+                          f"cost ${old_hc:.4f}->${new_hc:.4f}")
+                    if not DRY:
+                        t["cached"], t["input"] = new_cached, new_input
+                        mm["cost_usd"] = new_hc
+                        hrec["cost_usd"] = (hrec.get("cost_usd", 0) or 0) + delta
+                        ht = hrec.get("tokens") or {}
+                        ht["cached"] = (ht.get("cached", 0) or 0) + (new_cached - old_c)
+                        ht["input"] = (ht.get("input", 0) or 0) + (new_input - old_i)
+                        hrec["tokens"] = ht
+                    changed_h += 1
+        print(f"hours: {changed_h} hour-model buckets fixed")
         print(f"\nledger: {changed_d} buckets, cost ${old_cost_sum:.4f} -> ${new_cost_sum:.4f}"
               f" (delta ${new_cost_sum - old_cost_sum:+.4f})")
 
@@ -141,12 +185,12 @@ def main():
         print(f"recent: {n_rec} entries, cost ${rec_old:.4f} -> ${rec_new:.4f}")
 
         if not DRY:
-            # keep the v1 backups (pre-fix originals) intact; v2 backs up separately
-            shutil.copy2(LEDGER, LEDGER + ".bak-cachefix2-20260824")
-            shutil.copy2(RECENT, RECENT + ".bak-cachefix2-20260824")
+            # keep earlier backups intact; each version backs up separately
+            shutil.copy2(LEDGER, LEDGER + ".bak-cachefix3-20260824")
+            shutil.copy2(RECENT, RECENT + ".bak-cachefix3-20260824")
             atomic_write(LEDGER, led)
             atomic_write(RECENT, rec)
-            print("APPLIED (backups: *.bak-cachefix2-20260824)")
+            print("APPLIED (backups: *.bak-cachefix3-20260824)")
         else:
             print("DRY RUN — rerun with --apply to write")
 
