@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.34
+version: 0.5.35
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1555,7 +1555,9 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
     """Reprice ledger buckets that were recorded while a model had no price.
 
     For each (user, day, model) bucket with unpriced_requests > 0 whose model
-    NOW resolves to a price (same override/match chain as the filter, then
+    NOW resolves to a price (model_aliases first — the same resolution the
+    write path (qk_record_usage) and the display paths (/models, /stats)
+    already apply — then the override/match chain as the filter, then
     default_pricing), backfill ONLY the unpriced share of the cost: the full
     re-cost (qk_cost_usd on the bucket's tokens) is scaled by
     unpriced_requests/requests and added to the stored cost. unpriced_requests
@@ -1609,7 +1611,16 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
                 day_delta = 0.0
                 day_saved = 0.0
                 for m, mm in list(models.items()):
-                    if model and m != model:
+                    # v0.5.35: resolve model_aliases BEFORE the price/TOU
+                    # lookup — buckets recorded under an upstream alias name
+                    # (deepseek-flash) must price via the real name
+                    # (deepseek-v4-flash); otherwise their unpriced_requests
+                    # never clear and the display-side alias merge folds the
+                    # stale tag into the target model's row. The ?model=
+                    # filter accepts either the raw or the resolved name (the
+                    # per-model reprice button passes the resolved one).
+                    m_res = qk_resolve_model_alias(cfg, m)
+                    if model and model not in (m, m_res):
                         continue
                     mm = mm or {}
                     un = mm.get("unpriced_requests") or 0
@@ -1623,7 +1634,7 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
                             mm["unpriced_requests"] = 0
                             mm["priced"] = True
                         continue
-                    price, _how = qk_find_pricing(m, table, pconf.get("overrides"))
+                    price, _how = qk_find_pricing(m_res, table, pconf.get("overrides"))
                     if price is None:
                         price = pconf.get("default_pricing")
                     if price is None:
@@ -1645,7 +1656,7 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
                     reqs = mm.get("requests") or 0
                     share = (un / reqs) if reqs > 0 else 1.0
                     share = max(0.0, min(1.0, share))
-                    rate, _tier = qk_tou_rate(cfg, m, now)
+                    rate, _tier = qk_tou_rate(cfg, m_res, now)
                     add_cost = new_base * share * rate
                     if add_cost <= 0:
                         if not dry_run:
@@ -1702,9 +1713,10 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
             if ts < cutoff_ts:
                 continue
             m = str(it.get("model") or "")
-            if model and m != model:
+            m_res = qk_resolve_model_alias(cfg, m)  # same alias fix as the ledger pass
+            if model and model not in (m, m_res):
                 continue
-            price, _how = qk_find_pricing(m, table, pconf.get("overrides"))
+            price, _how = qk_find_pricing(m_res, table, pconf.get("overrides"))
             if price is None:
                 price = pconf.get("default_pricing")
             if price is None:
@@ -1714,7 +1726,7 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
             if base <= 0:
                 it["priced"] = True
                 continue
-            rate, _tier = qk_tou_rate(cfg, m, now)
+            rate, _tier = qk_tou_rate(cfg, m_res, now)
             new_cost = base * rate
             delta = new_cost - float(it.get("cost_usd") or 0.0)
             if not dry_run:

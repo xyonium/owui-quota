@@ -1049,3 +1049,112 @@ def test_reprice_also_backfills_recent(load_admin, monkeypatch):
     assert items[2]["cost_usd"] == 0.0 and items[2]["priced"] is False
     assert rep["recent_items_repriced"] == 1
     assert abs(rep["recent_cost_added_usd"] - 0.11) < 1e-6
+
+
+def test_reprice_resolves_model_aliases(load_admin, monkeypatch):
+    """2026-08-24 bug (deepseek-flash -> deepseek-v4-flash): buckets recorded
+    under an upstream ALIAS name could never reprice — the ledger/recent passes
+    looked up the RAW bucket name in the price table and never resolved config
+    model_aliases, so unpriced_requests stayed set, and the display-side alias
+    merge (/models, /stats) folded the stale tag into the TARGET model's row
+    (the target showed 'unpriced' right after the alias was added). Reprice
+    must price aliased buckets/entries via the resolved real name."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    for fn in ("qk_tou_local_now", "qk_local_now"):
+        monkeypatch.setattr(adm, fn, lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    write_json(Path(adm.QK_LEDGER_PATH),
+               _unpriced_ledger("2026-08-19", model="deepseek-flash"))
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {
+        "deepseek-v4-flash": {"input": 1.0, "output": 2.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH), {
+        "tou": {"enabled": False},
+        "model_aliases": {"deepseek-flash": "deepseek-v4-flash"}})
+    inside = _dt(2026, 8, 19, 10, 0, tzinfo=CST).timestamp()
+    write_json(Path(adm.QK_RECENT_PATH), {"items": [
+        {"ts": inside, "user_id": "u1", "name": "A", "email": "a@x",
+         "model": "deepseek-flash",
+         "tokens": {"cached": 0.0, "input": 100000.0, "output": 5000.0},
+         "cost_usd": 0.0, "tou_tier": "normal", "priced": False, "channel": "api"},
+    ]})
+
+    rep = adm.qk_reprice_ledger(days=30)
+    assert rep["buckets_repriced"] == 1
+    assert abs(rep["cost_added_usd"] - 0.11) < 1e-6
+    led = json.load(open(adm.QK_LEDGER_PATH))
+    mm = led["users"]["u1"]["days"]["2026-08-19"]["models"]["deepseek-flash"]
+    assert abs(mm["cost_usd"] - 0.11) < 1e-6
+    assert mm["unpriced_requests"] == 0 and mm["priced"] is True
+    items = json.load(open(adm.QK_RECENT_PATH))["items"]
+    assert abs(items[0]["cost_usd"] - 0.11) < 1e-6 and items[0]["priced"] is True
+    assert rep["recent_items_repriced"] == 1
+
+
+def test_reprice_alias_without_target_price_keeps_flag(load_admin, monkeypatch):
+    """An alias whose TARGET still has no price anywhere must leave the bucket
+    untouched (no indiscriminate tag clearing)."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    for fn in ("qk_tou_local_now", "qk_local_now"):
+        monkeypatch.setattr(adm, fn, lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    write_json(Path(adm.QK_LEDGER_PATH),
+               _unpriced_ledger("2026-08-19", model="deepseek-flash"))
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {"other": {"input": 1.0, "output": 2.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH), {
+        "tou": {"enabled": False},
+        "model_aliases": {"deepseek-flash": "deepseek-v4-flash"}})
+
+    rep = adm.qk_reprice_ledger(days=30)
+    assert rep["buckets_repriced"] == 0
+    led = json.load(open(adm.QK_LEDGER_PATH))
+    mm = led["users"]["u1"]["days"]["2026-08-19"]["models"]["deepseek-flash"]
+    assert mm["unpriced_requests"] == 2 and mm["cost_usd"] == 0.0
+
+
+def test_reprice_model_filter_matches_resolved_alias(load_admin, monkeypatch):
+    """The per-model reprice button passes the DISPLAY name (alias-resolved,
+    e.g. deepseek-v4-flash); the filter must also catch buckets still recorded
+    under the alias (deepseek-flash), not just exact-name matches."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    for fn in ("qk_tou_local_now", "qk_local_now"):
+        monkeypatch.setattr(adm, fn, lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    led = _unpriced_ledger("2026-08-19", model="deepseek-flash")
+    models = led["users"]["u1"]["days"]["2026-08-19"]["models"]
+    models["glm-5.3"] = _unpriced_ledger("2026-08-19", model="glm-5.3")[
+        "users"]["u1"]["days"]["2026-08-19"]["models"]["glm-5.3"]
+    write_json(Path(adm.QK_LEDGER_PATH), led)
+    price = {"input": 1.0, "output": 2.0}
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {
+        "deepseek-v4-flash": price, "glm-5.3": price}})
+    write_json(Path(adm.QK_CONFIG_PATH), {
+        "tou": {"enabled": False},
+        "model_aliases": {"deepseek-flash": "deepseek-v4-flash"}})
+
+    # filtering by the RESOLVED name reprices the alias-named bucket only
+    rep = adm.qk_reprice_ledger(days=30, model="deepseek-v4-flash")
+    assert rep["buckets_repriced"] == 1
+    out = json.load(open(adm.QK_LEDGER_PATH))
+    models = out["users"]["u1"]["days"]["2026-08-19"]["models"]
+    assert models["deepseek-flash"]["unpriced_requests"] == 0
+    assert models["glm-5.3"]["unpriced_requests"] == 2  # different model: skipped
+    # filtering by the RAW alias name also works
+    rep = adm.qk_reprice_ledger(days=30, model="deepseek-flash")
+    out = json.load(open(adm.QK_LEDGER_PATH))
+    assert out["users"]["u1"]["days"]["2026-08-19"]["models"][
+        "glm-5.3"]["unpriced_requests"] == 2  # still untouched
