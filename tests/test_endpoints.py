@@ -1308,3 +1308,155 @@ def test_rename_model_into_new_name_creates_bucket(load_admin):
     mm = models["gemini-3.8-flash"]
     assert mm["requests"] == 1 and mm["unpriced_requests"] == 1
     assert mm["tokens"]["input"] == 1248.0 and mm["tokens"]["output"] == 1543.0
+
+
+# ---- ledger dedup repair script (scripts/qk_dedup_repair.py) -----------------
+#
+# The pre-0.4.18 topup bug recorded a repeated full-usage event a second time
+# into the day/hour/day-model buckets, doubling tokens+cost for affected
+# responses while request counters stayed correct. The hour per-model buckets
+# (count_request=True only) hold the TRUE usage, so a day is repairable when
+# every hour carries per-model data and each hour's excess over the per-model
+# sum is exactly the per-model sum (pure full-repeat doubling, all fields).
+# Anything else (genuine partial topups, mixed patterns, legacy hours without
+# per-model data) is skipped and reported, never guessed at.
+#
+# The repair is a ONE-OFF maintenance script (scripts/qk_dedup_repair.py),
+# deliberately not shipped inside the admin plugin.
+
+
+def _load_dedup_script():
+    import importlib.util
+    from tests.conftest import REPO
+    spec = importlib.util.spec_from_file_location(
+        "qk_dedup_repair", REPO / "scripts" / "qk_dedup_repair.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _doubled_ledger(day="2026-08-19"):
+    """One user, one day, two api hours (9, 10), model m/x; every bucket above
+    the hour per-model level holds exactly 2x the true usage."""
+    hours = {}
+    for h in ("9", "10"):
+        hours[h] = {
+            "requests": 1, "cost_usd": 0.6,
+            "tokens": {"cached": 0.0, "input": 200.0, "output": 100.0},
+            "channels": {"webui": 0, "api": 1},
+            "models": {"m/x": {"requests": 1, "cost_usd": 0.3,
+                               "tokens": {"cached": 0.0, "input": 100.0, "output": 50.0},
+                               "channels": {"webui": 0, "api": 1}}},
+        }
+    return {"users": {"u1": {"name": "A", "email": "a@x", "days": {day: {
+        "requests": 2, "cost_usd": 1.2,
+        "tokens": {"cached": 0.0, "input": 400.0, "output": 200.0},
+        "channels": {"webui": 0, "api": 2},
+        "tou": {"peak": 0, "offpeak": 0, "normal": 2},
+        "cost_saved_usd": 0.12,
+        "models": {"m/x": {"requests": 2, "cost_usd": 1.2,
+                           "tokens": {"cached": 0.0, "input": 400.0, "output": 200.0},
+                           "channels": {"webui": 0, "api": 2},
+                           "priced": True, "unpriced_requests": 0,
+                           "tou": {"peak": 0, "offpeak": 0, "normal": 2},
+                           "cost_saved_usd": 0.12}},
+        "hours": hours,
+    }}}}}
+
+
+def test_dedup_repair_dry_run_reports_but_writes_nothing(tmp_path):
+    from tests.conftest import write_json
+
+    lp = tmp_path / "ledger.json"
+    write_json(lp, _doubled_ledger())
+    before = lp.read_text()
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=True)
+    assert rep["dry_run"] is True
+    assert rep["days_repaired"] == 1
+    assert rep["tokens_removed"]["input"] == 200.0
+    assert rep["tokens_removed"]["output"] == 100.0
+    assert abs(rep["cost_removed_usd"] - 0.6) < 1e-6
+    assert lp.read_text() == before  # untouched
+
+
+def test_dedup_repair_halves_doubled_buckets(tmp_path):
+    from tests.conftest import write_json
+    import json
+
+    lp = tmp_path / "ledger.json"
+    write_json(lp, _doubled_ledger())
+    script = _load_dedup_script()
+    rep = script.qk_dedup_repair(str(lp), dry_run=False)
+    assert rep["days_repaired"] == 1
+    led = json.load(open(lp))
+    d = led["users"]["u1"]["days"]["2026-08-19"]
+    assert d["tokens"]["input"] == 200.0 and d["tokens"]["output"] == 100.0
+    assert abs(d["cost_usd"] - 0.6) < 1e-6
+    assert abs(d["cost_saved_usd"] - 0.06) < 1e-6
+    assert d["requests"] == 2  # request counters were never doubled
+    assert d["tou"]["normal"] == 2
+    mm = d["models"]["m/x"]
+    assert mm["tokens"]["input"] == 200.0 and mm["tokens"]["output"] == 100.0
+    assert abs(mm["cost_usd"] - 0.6) < 1e-6
+    for h in ("9", "10"):
+        hb = d["hours"][h]
+        assert hb["tokens"]["input"] == 100.0 and hb["tokens"]["output"] == 50.0
+        assert abs(hb["cost_usd"] - 0.3) < 1e-6
+    # idempotent: a second run finds the ledger clean
+    rep2 = script.qk_dedup_repair(str(lp), dry_run=False)
+    assert rep2["days_repaired"] == 0 and rep2["days_clean"] == 1
+
+
+def test_dedup_repair_skips_ambiguous_partial_topup(tmp_path):
+    """A genuine partial topup (Anthropic delta: input matches the per-model
+    sum exactly, output exceeds it by less than 2x) is REAL usage, not a
+    repeat -- the day must be skipped and reported, never 'repaired'."""
+    from tests.conftest import write_json
+
+    lp = tmp_path / "ledger.json"
+    led = _doubled_ledger()
+    d = led["users"]["u1"]["days"]["2026-08-19"]
+    h9 = d["hours"]["9"]
+    h9["tokens"] = {"cached": 0.0, "input": 100.0, "output": 57.0}
+    h9["cost_usd"] = 0.31
+    d["tokens"] = {"cached": 0.0, "input": 300.0, "output": 157.0}
+    write_json(lp, led)
+    before = lp.read_text()
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False)
+    assert rep["days_repaired"] == 0
+    assert rep["days_skipped_ambiguous"] == 1
+    assert rep["skipped"][0]["reason"] == "ambiguous-excess"
+    assert lp.read_text() == before  # untouched
+
+
+def test_dedup_repair_skips_legacy_day_without_hours(tmp_path):
+    from tests.conftest import write_json
+
+    lp = tmp_path / "ledger.json"
+    led = _doubled_ledger()
+    del led["users"]["u1"]["days"]["2026-08-19"]["hours"]
+    write_json(lp, led)
+    before = lp.read_text()
+    rep = _load_dedup_script().qk_dedup_repair(str(lp), dry_run=False)
+    assert rep["days_repaired"] == 0
+    assert rep["days_skipped_legacy"] == 1
+    assert rep["skipped"][0]["reason"] == "legacy-hours"
+    assert lp.read_text() == before
+
+
+def test_dedup_repair_cli_defaults_to_dry_run(tmp_path, capsys):
+    """No --apply flag -> report only, file untouched; nonzero exit + stderr
+    when the ledger path does not exist."""
+    from tests.conftest import write_json
+
+    lp = tmp_path / "ledger.json"
+    write_json(lp, _doubled_ledger())
+    before = lp.read_text()
+    script = _load_dedup_script()
+    assert script.main(["--ledger", str(lp)]) == 0
+    assert lp.read_text() == before
+    out = capsys.readouterr().out
+    import json
+    rep = json.loads(out[out.index("{"):])
+    assert rep["dry_run"] is True and rep["days_repaired"] == 1
+    assert script.main(["--ledger", str(tmp_path / "nope.json")]) == 2
