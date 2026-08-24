@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.35
+version: 0.5.36
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1743,6 +1743,80 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
     return report
 
 
+def _qk_merge_bucket(dst: dict, src: dict) -> None:
+    """Sum-merge model bucket src into dst. Handles the day-level shape
+    (requests/cost_usd/tokens/tou/channels/unpriced_requests/cost_saved_usd)
+    and the hour-level subset (no tou/unpriced/priced) without inventing new
+    keys on the latter."""
+    day_shaped = "unpriced_requests" in src or "unpriced_requests" in dst
+    dst["requests"] = (dst.get("requests") or 0) + (src.get("requests") or 0)
+    dst["cost_usd"] = round(float(dst.get("cost_usd") or 0.0)
+                            + float(src.get("cost_usd") or 0.0), 8)
+    dt = dst.setdefault("tokens", {})
+    st = src.get("tokens") or {}
+    for k in ("cached", "input", "output"):
+        dt[k] = (dt.get(k) or 0.0) + (st.get(k) or 0.0)
+    for grp in ("tou", "channels"):
+        if grp in src or grp in dst:
+            dg = dst.setdefault(grp, {})
+            for k, v in (src.get(grp) or {}).items():
+                dg[k] = (dg.get(k) or 0) + (v or 0)
+    if day_shaped:
+        dst["unpriced_requests"] = (dst.get("unpriced_requests") or 0) \
+            + (src.get("unpriced_requests") or 0)
+        dst["cost_saved_usd"] = round(float(dst.get("cost_saved_usd") or 0.0)
+                                      + float(src.get("cost_saved_usd") or 0.0), 8)
+        # derived flag, same convention as qk_record_usage
+        dst["priced"] = dst.get("unpriced_requests", 0) == 0
+
+
+def qk_rename_model(src: str, dst: str, dry_run: bool = False):
+    """Rename/merge a model across ledger.json + recent.json (admin repair).
+
+    Buckets are day×model aggregates written under whatever name was known at
+    record time — an upstream alias, or "unknown" when the response carried no
+    model (2026-08-24 passthrough incident). model_aliases only folds those
+    names at DISPLAY time and reprice (v0.5.35) prices them; the stored rows
+    keep the stale name forever. This merges the source bucket INTO the
+    destination bucket (summing requests/tokens/cost/tou/channels/
+    unpriced_requests) for every user/day and every hour sub-bucket, and
+    renames matching recent.json entries. Day/user/hour TOTALS are
+    model-agnostic and untouched. Costs are NOT recomputed here — run reprice
+    afterwards to backfill any unpriced share at the destination's price.
+
+    Returns a report dict; dry_run=True counts without writing.
+    """
+    report = {"from": src, "to": dst, "buckets_merged": 0,
+              "hour_buckets_merged": 0, "recent_renamed": 0, "dry_run": dry_run}
+    with qk_lock():
+        led = qk_load_json(QK_LEDGER_PATH, {"users": {}})
+        for u in (led.get("users") or {}).values():
+            for drec in ((u or {}).get("days") or {}).values():
+                drec = drec or {}
+                models = drec.get("models") or {}
+                if src in models:
+                    report["buckets_merged"] += 1
+                    if not dry_run:
+                        _qk_merge_bucket(models.setdefault(dst, {}), models.pop(src))
+                for hrec in (drec.get("hours") or {}).values():
+                    hmodels = (hrec or {}).get("models") or {}
+                    if src in hmodels:
+                        report["hour_buckets_merged"] += 1
+                        if not dry_run:
+                            _qk_merge_bucket(hmodels.setdefault(dst, {}), hmodels.pop(src))
+        rec = qk_load_json(QK_RECENT_PATH, {"items": []})
+        for it in rec.get("items") or []:
+            if isinstance(it, dict) and it.get("model") == src:
+                report["recent_renamed"] += 1
+                if not dry_run:
+                    it["model"] = dst
+        if not dry_run and (report["buckets_merged"] or report["recent_renamed"]):
+            qk_atomic_write(QK_LEDGER_PATH, led)
+            if report["recent_renamed"]:
+                qk_atomic_write(QK_RECENT_PATH, rec)
+    return report
+
+
 # ==== Open WebUI integration ====
 
 
@@ -2686,7 +2760,7 @@ function renderModels(){
     return `<tr>
      <td>${esc(m.model)}
        ${m.unpriced_requests>0?`<span class="tag unpriced">unpriced</span>${STATE.isAdmin!==false?`<button class="small" onclick="reprice('${esc(m.model)}')">reprice</button>`:''}`:''}
-       ${STATE.isAdmin!==false?`<button class="small" data-mi="${i}" onclick="matchModel(this)">match</button><span class="match-out"></span>`:''}</td>
+       ${STATE.isAdmin!==false?`<button class="small" data-mi="${i}" onclick="matchModel(this)">match</button><span class="match-out"></span><button class="small" onclick="renameModel('${esc(m.model)}')">rename</button>`:''}</td>
      <td class="num">${fmt(m.requests,0)}</td>
      <td class="num">${fmt(m.users,0)}</td>
      <td class="num">${fmt(t.cached,0)}</td>
@@ -2761,6 +2835,22 @@ async function reprice(model){
     await loadStats();  // refresh tables so the unpriced tag disappears
     if(STATE.recent)await loadRecent();  // re-fetch the feed: reprice rewrote recent.json server-side
   }catch(e){out.textContent=' failed: '+e.message;toast('Reprice failed: '+e.message)}
+}
+
+// ---------- rename/merge model (repair stale alias / "unknown" rows) ----------
+async function renameModel(src){
+  const dst=(prompt(`Rename/merge ALL stored rows named "${src}" into which model?\n\nEnter the real model name (e.g. gemini-3.7-flash):`,'')||'').trim();
+  if(!dst||dst===src)return;
+  if(!confirm(`Merge every ledger bucket and recent-activity entry named "${src}" into "${dst}"?\n\nRequests/tokens/cost are summed into "${dst}" (all history, every user); "${src}" disappears from the tables. If the merged rows were unpriced, you will be asked to reprice "${dst}" next to backfill their cost.`))return;
+  try{
+    const r=await api('/models/rename?from='+encodeURIComponent(src)+'&to='+encodeURIComponent(dst),{method:'POST'});
+    if(r.error){toast('Rename failed: '+r.error);return}
+    toast(`Renamed ${src} → ${dst}: ${r.buckets_merged} day buckets, ${r.hour_buckets_merged} hour buckets, ${r.recent_renamed} recent entries`);
+    if(r.buckets_merged>0)await reprice(dst);  // backfill any unpriced share at the target's price
+    await loadStats();
+    if(STATE.recent)await loadRecent();
+    STATE.pricePool=await api('/models');renderPricePool();  // the pool reads /models too
+  }catch(e){toast('Rename failed: '+e.message)}
 }
 
 // ---------- recent activity (manual refresh only) ----------
@@ -3536,6 +3626,26 @@ async def api_reprice(request: Request):
     dry = q.get("dry") == "1"
     try:
         result = await asyncio.to_thread(qk_reprice_ledger, days, model, dry)
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@qk_router.post("/models/rename", dependencies=[Depends(_require_admin)])
+async def api_model_rename(request: Request):
+    """Merge all ledger buckets + recent entries named `from` into `to`
+    (repair stale upstream-alias / "unknown" rows). Run reprice afterwards to
+    backfill cost for any unpriced share at the destination's price."""
+    q = request.query_params
+    src = (q.get("from") or "").strip()
+    dst = (q.get("to") or "").strip()
+    dry = q.get("dry") == "1"
+    if not src or not dst:
+        return JSONResponse({"error": "need from= and to="}, status_code=400)
+    if src == dst:
+        return JSONResponse({"error": "from and to are the same"}, status_code=400)
+    try:
+        result = await asyncio.to_thread(qk_rename_model, src, dst, dry)
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)

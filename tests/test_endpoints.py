@@ -1158,3 +1158,153 @@ def test_reprice_model_filter_matches_resolved_alias(load_admin, monkeypatch):
     out = json.load(open(adm.QK_LEDGER_PATH))
     assert out["users"]["u1"]["days"]["2026-08-19"]["models"][
         "glm-5.3"]["unpriced_requests"] == 2  # still untouched
+
+
+# ---- rename/merge model (admin data repair, v0.5.36) --------------------------
+
+
+def _rename_ledger(day):
+    """u1 used 'unknown' once (the 2026-08-24 passthrough incident shape:
+    unpriced, 1248 in / 1543 out) plus two priced gemini-3.7-flash requests."""
+    def bm(req, un, cost, inp, out):
+        return {"requests": req, "cost_usd": cost,
+                "tokens": {"cached": 0.0, "input": inp, "output": out},
+                "priced": un == 0, "unpriced_requests": un,
+                "tou": {"peak": 0, "offpeak": 0, "normal": req},
+                "cost_saved_usd": 0.0, "channels": {"webui": 0, "api": req}}
+    def bh(req, cost, inp, out):
+        return {"requests": req, "cost_usd": cost,
+                "tokens": {"cached": 0.0, "input": inp, "output": out},
+                "channels": {"webui": 0, "api": req}}
+    dayrec = {
+        "requests": 3, "cost_usd": 0.03,
+        "tokens": {"cached": 0.0, "input": 21248.0, "output": 2543.0},
+        "tou": {"peak": 0, "offpeak": 0, "normal": 3}, "cost_saved_usd": 0.0,
+        "channels": {"webui": 0, "api": 3},
+        "models": {"unknown": bm(1, 1, 0.0, 1248.0, 1543.0),
+                   "gemini-3.7-flash": bm(2, 0, 0.03, 20000.0, 1000.0)},
+        "hours": {"10": {"requests": 3, "cost_usd": 0.03,
+                         "tokens": {"cached": 0.0, "input": 21248.0, "output": 2543.0},
+                         "channels": {"webui": 0, "api": 3},
+                         "models": {"unknown": bh(1, 0.0, 1248.0, 1543.0),
+                                    "gemini-3.7-flash": bh(2, 0.03, 20000.0, 1000.0)}}},
+    }
+    return {"users": {"u1": {"name": "A", "email": "a@x", "days": {day: dayrec}}}}
+
+
+def test_rename_model_merges_buckets_and_recent(load_admin, monkeypatch):
+    """The 10:36 'unknown' repair flow: merge the unknown bucket into the real
+    model (day + hour sub-buckets + recent entry), day totals untouched, then
+    reprice backfills the cost at the target's price and clears the tag."""
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    CST = _tz(_td(hours=8))
+    adm = load_admin()
+    for fn in ("qk_tou_local_now", "qk_local_now"):
+        monkeypatch.setattr(adm, fn, lambda cfg: _dt(2026, 8, 20, 12, 0, tzinfo=CST))
+    write_json(Path(adm.QK_LEDGER_PATH), _rename_ledger("2026-08-19"))
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {
+        "gemini-3.7-flash": {"input": 1.0, "output": 2.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH), {"tou": {"enabled": False}})
+    inside = _dt(2026, 8, 19, 10, 36, tzinfo=CST).timestamp()
+    write_json(Path(adm.QK_RECENT_PATH), {"items": [
+        {"ts": inside, "user_id": "u1", "name": "A", "email": "a@x", "model": "unknown",
+         "tokens": {"cached": 0.0, "input": 1248.0, "output": 1543.0},
+         "cost_usd": 0.0, "tou_tier": "normal", "priced": False, "channel": "api"},
+        {"ts": inside, "user_id": "u1", "name": "A", "email": "a@x", "model": "glm-5.3",
+         "tokens": {"cached": 0.0, "input": 5.0, "output": 5.0},
+         "cost_usd": 0.001, "tou_tier": "normal", "priced": True, "channel": "webui"},
+    ]})
+
+    rep = adm.qk_rename_model("unknown", "gemini-3.7-flash")
+    assert rep["buckets_merged"] == 1 and rep["hour_buckets_merged"] == 1
+    assert rep["recent_renamed"] == 1
+
+    led = json.load(open(adm.QK_LEDGER_PATH))
+    d = led["users"]["u1"]["days"]["2026-08-19"]
+    assert "unknown" not in d["models"]
+    mm = d["models"]["gemini-3.7-flash"]
+    assert mm["requests"] == 3 and mm["unpriced_requests"] == 1
+    assert mm["priced"] is False  # derived flag: still has an unpriced share
+    assert abs(mm["cost_usd"] - 0.03) < 1e-9
+    assert mm["tokens"]["input"] == 21248.0 and mm["tokens"]["output"] == 2543.0
+    assert mm["channels"] == {"webui": 0, "api": 3}
+    assert mm["tou"] == {"peak": 0, "offpeak": 0, "normal": 3}
+    # hour sub-bucket merged; day/hour totals untouched (model-agnostic)
+    hm = d["hours"]["10"]["models"]
+    assert "unknown" not in hm
+    assert hm["gemini-3.7-flash"]["requests"] == 3
+    assert hm["gemini-3.7-flash"]["tokens"]["input"] == 21248.0
+    assert d["requests"] == 3 and abs(d["cost_usd"] - 0.03) < 1e-9
+    # hour bucket did not invent day-only keys
+    assert "unpriced_requests" not in hm["gemini-3.7-flash"]
+    rec = json.load(open(adm.QK_RECENT_PATH))["items"]
+    assert rec[0]["model"] == "gemini-3.7-flash" and rec[0]["priced"] is False
+    assert rec[1]["model"] == "glm-5.3"  # unrelated entry untouched
+
+    # step 2 of the repair: reprice backfills the unpriced share and clears
+    # the tag (unpriced request's tokens: 1248 in / 1543 out)
+    rep = adm.qk_reprice_ledger(days=30, model="gemini-3.7-flash")
+    assert rep["buckets_repriced"] == 1
+    led = json.load(open(adm.QK_LEDGER_PATH))
+    mm = led["users"]["u1"]["days"]["2026-08-19"]["models"]["gemini-3.7-flash"]
+    # bucket cost = priced share ($0.03) + unpriced share: full re-cost of the
+    # 3-request aggregate at target price, scaled 1/3
+    full = 21248.0 * 1.0 / 1e6 + 2543.0 * 2.0 / 1e6
+    assert abs(mm["cost_usd"] - (0.03 + full / 3)) < 1e-6
+    assert mm["unpriced_requests"] == 0 and mm["priced"] is True
+    rec = json.load(open(adm.QK_RECENT_PATH))["items"]
+    assert rec[0]["priced"] is True
+    assert abs(rec[0]["cost_usd"] - (1248.0 / 1e6 + 1543.0 * 2.0 / 1e6)) < 1e-8
+
+
+def test_rename_model_dry_run_writes_nothing(load_admin, monkeypatch):
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    adm = load_admin()
+    write_json(Path(adm.QK_LEDGER_PATH), _rename_ledger("2026-08-19"))
+    write_json(Path(adm.QK_RECENT_PATH), {"items": [
+        {"ts": 1.0, "user_id": "u1", "model": "unknown", "priced": False,
+         "tokens": {"cached": 0.0, "input": 1.0, "output": 1.0}, "cost_usd": 0.0},
+    ]})
+    before_led = Path(adm.QK_LEDGER_PATH).read_text()
+    before_rec = Path(adm.QK_RECENT_PATH).read_text()
+    rep = adm.qk_rename_model("unknown", "gemini-3.7-flash", dry_run=True)
+    assert rep["buckets_merged"] == 1 and rep["recent_renamed"] == 1
+    assert Path(adm.QK_LEDGER_PATH).read_text() == before_led
+    assert Path(adm.QK_RECENT_PATH).read_text() == before_rec
+
+
+def test_rename_model_missing_source_is_noop(load_admin):
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    adm = load_admin()
+    write_json(Path(adm.QK_LEDGER_PATH), _rename_ledger("2026-08-19"))
+    before = Path(adm.QK_LEDGER_PATH).read_text()
+    rep = adm.qk_rename_model("no/such-model", "gemini-3.7-flash")
+    assert rep["buckets_merged"] == 0 and rep["recent_renamed"] == 0
+    assert Path(adm.QK_LEDGER_PATH).read_text() == before  # untouched
+    assert not Path(adm.QK_RECENT_PATH).exists()  # nothing to write
+
+
+def test_rename_model_into_new_name_creates_bucket(load_admin):
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    adm = load_admin()
+    write_json(Path(adm.QK_LEDGER_PATH), _rename_ledger("2026-08-19"))
+    rep = adm.qk_rename_model("unknown", "gemini-3.8-flash")
+    assert rep["buckets_merged"] == 1
+    led = json.load(open(adm.QK_LEDGER_PATH))
+    models = led["users"]["u1"]["days"]["2026-08-19"]["models"]
+    assert "unknown" not in models
+    mm = models["gemini-3.8-flash"]
+    assert mm["requests"] == 1 and mm["unpriced_requests"] == 1
+    assert mm["tokens"]["input"] == 1248.0 and mm["tokens"]["output"] == 1543.0
