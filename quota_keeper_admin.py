@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.33
+version: 0.5.34
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -1126,11 +1126,12 @@ def qk_ingest_record(req, body: bytes = b"", chunks=None) -> None:
     """Best-effort: resolve user+model, extract usage, write to the ledger.
     Never raises (fail-open — the API response must not be impacted).
 
-    IMPORTANT: the middleware MUST NOT read the request body (reading it in
-    the middleware broke passthrough — the route saw an empty payload and the
-    upstream request fell back to a default model / 499'd). The model name is
-    taken from the RESPONSE instead: anthropic messages and openai
-    chat/responses bodies all echo the requested model."""
+    Model resolution: the RESPONSE is authoritative (anthropic
+    message_start.message.model / openai data.model / responses
+    response.model — it names the executed upstream model); when the response
+    carries no usable model, fall back to request.state.qk_ingest_model — the
+    requested model stashed by the middleware via a safe cached-body read
+    (v0.5.34); last resort "unknown"."""
     try:
         if getattr(req.state, QK_INGEST_MARK, False):
             return  # already ingested (hot-reload re-mount double registration)
@@ -1167,10 +1168,26 @@ async def qk_passthrough_middleware(request: Request, call_next):
     untouched, and records usage from the response (streaming or buffered)."""
     if request.method != "POST" or request.url.path not in QK_INGEST_PATHS:
         return await call_next(request)
-    # NOTE: do NOT read request.body() here. Reading it in the middleware
-    # consumed the payload for the passthrough route (the forwarded model
-    # fell back to a default and requests 499'd). The model is extracted from
-    # the response instead (qk_ingest_record / scan_sse).
+    # Stash the REQUESTED model as a fallback for response-side extraction:
+    # some upstreams emit no usable model in the response at all (e.g.
+    # antigravity-manager writes "model": "" into message_start when the first
+    # upstream event lacks modelVersion, and no later Anthropic event repeats
+    # it), which used to land as "unknown" unpriced rows (2026-08-24 incident).
+    # request.body() is SAFE here on the pinned starlette (1.x, OWUI 0.11 /
+    # fastapi 0.136): dispatch receives a _CachedRequest whose wrapped_receive
+    # REPLAYS the cached bytes to the downstream route. v0.5.4's empty-payload
+    # 499 came from stream()-style reads on the old starlette (downstream gets
+    # an empty body after .stream()) — never use request.stream() here.
+    try:
+        req_model = qk_ingest_body_model(await request.body())
+        if req_model.startswith("prx."):
+            # provider prefix (cli-proxy-api prefix_id) — same strip as the
+            # filter's stream()/outlet() fallbacks
+            req_model = req_model[4:]
+        if req_model:
+            request.state.qk_ingest_model = req_model
+    except Exception:
+        pass  # fail-open: response-side extraction still applies
     response = await call_next(request)
     try:
         is_sse = "text/event-stream" in (response.headers.get("content-type") or "")

@@ -391,6 +391,67 @@ def test_middleware_does_not_consume_request_body(load_admin, monkeypatch):
     assert seen["model"] == "prx.gemini-flash"
 
 
+def test_middleware_empty_stream_model_falls_back_to_request_model(load_admin, monkeypatch):
+    """Real-world 2026-08-24 incident: antigravity-manager emits message_start
+    with "model": "" when the first upstream event lacks modelVersion, and no
+    later Anthropic event repeats the model — the response scan finds nothing
+    and the row lands as "unknown" (unpriced, $0). The middleware must fall
+    back to the REQUEST body's model (provider prefix prx. stripped, same as
+    the filter's stream()/outlet())."""
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    sse = (
+        'event: message_start\n'
+        'data: {"type":"message_start","message":{"id":"msg_unknown","type":"message",'
+        '"role":"assistant","content":[],"model":"","stop_reason":null,"stop_sequence":null}}\n\n'
+        'event: content_block_delta\n'
+        'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}\n\n'
+        'event: message_delta\n'
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},'
+        '"usage":{"input_tokens":1248,"output_tokens":1543}}\n\n'
+        'event: message_stop\n'
+        'data: {"type":"message_stop"}\n\n'
+    ).encode()
+    c = _mk_app(adm, "/api/v1/messages", resp_body=sse, stream=True)
+    resp = c.post("/api/v1/messages",
+                  json={"model": "prx.gemini-3.7-flash-high",
+                        "messages": [{"role": "user", "content": "hi"}], "stream": True})
+    assert resp.status_code == 200
+    led = _led(adm)
+    d = list((led["users"].get("u1") or {}).get("days", {}).values())
+    assert d and d[0]["requests"] == 1
+    assert set(d[0]["models"]) == {"gemini-3.7-flash-high"}, d[0]["models"].keys()
+    assert d[0]["tokens"]["input"] == 1248 and d[0]["tokens"]["output"] == 1543
+    rec = _rec(adm)
+    assert rec["items"][0]["model"] == "gemini-3.7-flash-high"
+
+
+def test_middleware_stream_response_model_still_wins(load_admin, monkeypatch):
+    """When the response DOES echo a model it stays authoritative (it names the
+    actually-executed upstream model); the request body is fallback-only."""
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    c = _mk_app(adm, "/api/v1/messages", resp_body=ANTHROPIC_SSE, stream=True)
+    resp = c.post("/api/v1/messages", json={"model": "prx.gemini-3.7-flash-high"})
+    assert resp.status_code == 200
+    rec = _rec(adm)
+    assert rec["items"][0]["model"] == "claude-x"
+
+
+def test_middleware_nonstream_empty_model_falls_back_to_request(load_admin, monkeypatch):
+    """Same fallback on the buffered (non-SSE) path: response model "" ->
+    request body model (prx.-stripped)."""
+    _stub_owui_auth(monkeypatch)
+    adm = load_admin()
+    body = json.dumps({"type": "message", "model": "",
+                       "usage": {"input_tokens": 11, "output_tokens": 7}}).encode()
+    c = _mk_app(adm, "/api/v1/messages", resp_body=body)
+    resp = c.post("/api/v1/messages", json={"model": "prx.gemini-3.7-flash-high"})
+    assert resp.status_code == 200
+    rec = _rec(adm)
+    assert rec["items"][0]["model"] == "gemini-3.7-flash-high"
+
+
 def test_extract_anthropic_full_usage_with_cache_write(load_admin):
     """/api/v1/messages (Anthropic protocol) response carries cache details:
     cache_read_input_tokens -> cached, cache_creation_input_tokens ->
