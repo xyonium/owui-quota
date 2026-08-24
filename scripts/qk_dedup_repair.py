@@ -23,12 +23,17 @@ Days with any other excess shape (genuine Anthropic partial-usage topups whose
 deltas are real usage, mixed patterns, legacy hours without per-model data)
 are SKIPPED and reported -- never guessed at.
 
-Usage (run on the server, Open WebUI stopped or quiet is safest; the script
-takes the same fcntl lock the plugins use):
+Usage (the plugins may stay online; the script locks the sibling `.lock`
+file -- the same fcntl lock the plugins take around every ledger write, so
+repairs are mutually exclusive with live metering):
 
     python3 scripts/qk_dedup_repair.py                 # dry run, report only
     python3 scripts/qk_dedup_repair.py --apply         # write the repair
     python3 scripts/qk_dedup_repair.py --ledger /app/backend/data/quota_keeper/ledger.json --apply
+
+IMPORTANT: update the two Functions in Open WebUI to >= 0.5.37 / 0.4.18
+FIRST -- an old Filter keeps double-recording new requests while you repair,
+so the dashboard drifts back to 2x within minutes.
 
 Back up ledger.json before --apply (cp ledger.json ledger.json.bak).
 """
@@ -95,10 +100,16 @@ def qk_dedup_repair(ledger_path: str, dry_run: bool = True) -> dict:
                  "reason": "legacy-hours" if reason == "legacy"
                  else "ambiguous-excess"})
 
-    with open(ledger_path, "r+", encoding="utf-8") as lf:
+    # The plugins serialize ALL ledger writes with an fcntl lock on the
+    # sibling `.lock` file (not on the ledger itself) -- take the same lock
+    # so a live Open WebUI cannot read-modify-write across our repair.
+    lock_path = os.path.join(os.path.dirname(os.path.abspath(ledger_path)),
+                             ".lock")
+    with open(lock_path, "a+") as lf:
         fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
         try:
-            led = json.load(lf)
+            with open(ledger_path, "r", encoding="utf-8") as f:
+                led = json.load(f)
             users = led.get("users") or {}
             for uid, u in users.items():
                 report["users_scanned"] += 1
