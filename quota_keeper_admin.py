@@ -3447,8 +3447,30 @@ async def api_save_config(request: Request):
         if not isinstance(cur, dict):
             log.warning("quota-keeper config.json was not an object; starting from defaults")
             cur = {}
+        # whole-map keys: the admin UI always edits/saves these as a full map,
+        # so a key present in the body REPLACES the stored map (pop-then-merge)
+        # instead of deep-merging into it -- otherwise deletions can never be
+        # saved (the deep merge is add/overwrite-only). Absent key = untouched.
+        for k in ("model_aliases", "group_quotas", "user_quotas"):
+            if k in body:
+                cur.pop(k, None)
+        _pri = body.get("pricing")
+        if isinstance(_pri, dict) and "overrides" in _pri and isinstance(cur.get("pricing"), dict):
+            cur["pricing"].pop("overrides", None)
+        _tou = body.get("tou")
+        if isinstance(_tou, dict) and isinstance(cur.get("tou"), dict):
+            for k in ("providers", "models"):
+                if k in _tou:
+                    cur["tou"].pop(k, None)
         qk_deep_merge(cur, body)
         cfg = qk_merge_config(cur)
+        # strip empty override specs (None tombstones retired by replace, and
+        # {} rows) so /models never reports a bare {} as a manual override
+        _ov = (cfg.get("pricing") or {}).get("overrides")
+        if isinstance(_ov, dict):
+            cfg["pricing"]["overrides"] = {
+                k: v for k, v in _ov.items() if isinstance(v, dict) and v
+            }
         qk_atomic_write(QK_CONFIG_PATH, cfg)
     return JSONResponse({"ok": True})
 
@@ -3751,7 +3773,9 @@ async def api_models(request: Request, user=Depends(_require_user)):
         spec = None
         ml = m.strip().lower()
         for k, v in ov.items():
-            if str(k).strip().lower() == ml and v is not None:
+            # an empty {} / null spec is not an override (it resolves to no
+            # price) -- report None so the editor row is not flagged manual
+            if str(k).strip().lower() == ml and isinstance(v, dict) and v:
                 spec = v
                 break
         u = used.get(m) or {}

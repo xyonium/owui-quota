@@ -68,6 +68,53 @@ def test_list_config_on_disk_recovers(admin_client):
     assert r.json()["schedule"]["timezone"] == "UTC"
 
 
+# ---- whole-map replace-on-save (issue #2: aliases could not be deleted) ----
+
+
+def test_model_aliases_replace_semantics(admin_client):
+    # body 含 model_aliases 时整体替换：缺席的旧 key 被删除，不再是深合并残留。
+    c, adm = _app(admin_client)
+    adm.qk_atomic_write(adm.QK_CONFIG_PATH, {"model_aliases": {"a": "real-a", "b": "real-b"}})
+    r = c.post("/api/v1/quota-keeper/config", json={"model_aliases": {"b": "real-b", "c": "real-c"}})
+    assert r.status_code == 200
+    cfg = adm.qk_load_json(adm.QK_CONFIG_PATH, {})
+    assert cfg["model_aliases"] == {"b": "real-b", "c": "real-c"}  # "a" 被删
+
+
+def test_model_aliases_clear_all(admin_client):
+    # 清空 textarea → 前端发 {} → 现在应清空全部映射（此前是深合并 no-op，旧映射全残留）。
+    c, adm = _app(admin_client)
+    adm.qk_atomic_write(adm.QK_CONFIG_PATH, {"model_aliases": {"a": "real-a"}})
+    r = c.post("/api/v1/quota-keeper/config", json={"model_aliases": {}})
+    assert r.status_code == 200
+    assert adm.qk_load_json(adm.QK_CONFIG_PATH, {}).get("model_aliases") == {}
+
+
+def test_model_aliases_absent_untouched(admin_client):
+    # 省略该 key = 不动（保留既有映射），保证普通保存不清空。
+    c, adm = _app(admin_client)
+    adm.qk_atomic_write(adm.QK_CONFIG_PATH, {"model_aliases": {"a": "real-a"}})
+    r = c.post("/api/v1/quota-keeper/config", json={"credits_per_usd": 2000})
+    assert r.status_code == 200
+    assert adm.qk_load_json(adm.QK_CONFIG_PATH, {}).get("model_aliases") == {"a": "real-a"}
+
+
+def test_overrides_empty_spec_stripped(admin_client):
+    # replace 语义下 null 墓碑与 {} 空 spec 都在落盘前剥离，避免 /models 把 {} 误判成 manual。
+    c, adm = _app(admin_client)
+    adm.qk_atomic_write(
+        adm.QK_CONFIG_PATH,
+        {"pricing": {"overrides": {"m1": {"alias": "x"}, "m2": {"input": 1}}}},
+    )
+    r = c.post(
+        "/api/v1/quota-keeper/config",
+        json={"pricing": {"overrides": {"m1": None, "m2": {}}}},
+    )
+    assert r.status_code == 200
+    ov = adm.qk_load_json(adm.QK_CONFIG_PATH, {})["pricing"]["overrides"]
+    assert ov == {}
+
+
 def test_get_config_recovers_from_list_config(admin_client):
     # Fix: GET /config used to 500 when the on-disk config.json parses to a
     # non-dict (qk_merge_config called .items() on it). It must merge from an
@@ -245,6 +292,47 @@ def test_models_endpoint_aggregates_used_and_available(admin_client, monkeypatch
     # /api/models entries with no usage are NOT listed (the editor only shows
     # models that actually appear in usage records)
     assert "prx.free" not in items
+
+
+def test_empty_override_spec_is_not_a_manual_override(admin_client, monkeypatch):
+    # An empty/null override spec is not a real override: /models must not
+    # report it as one (it resolves to no price). Pin the read side so a
+    # pre-existing {} in config.json can't fake a "matched" editor row.
+    import sys
+    import types as _t
+    from pathlib import Path
+    from tests.conftest import write_json
+
+    c, adm = _app(admin_client)
+    write_json(Path(adm.QK_LEDGER_PATH), {"users": {"u1": {"days": {
+        "2026-08-18": {"models": {"m-bare": {"requests": 3, "unpriced_requests": 3,
+                                             "cost_usd": 0.0}}}
+    }}}})
+    write_json(Path(adm.QK_PRICING_PATH), {"table": {"other": {"input": 1.0, "output": 2.0}}})
+    write_json(Path(adm.QK_CONFIG_PATH),
+               {"pricing": {"overrides": {"m-bare": {}, "m-none": None}}})
+
+    ow = _t.ModuleType("open_webui")
+    models_mod = _t.ModuleType("open_webui.models")
+    mmm = _t.ModuleType("open_webui.models.models")
+
+    class Models:
+        @staticmethod
+        async def get_all_models(*a, **kw):
+            return []
+
+    mmm.Models = Models
+    ow.models = models_mod
+    models_mod.models = mmm
+    monkeypatch.setitem(sys.modules, "open_webui", ow)
+    monkeypatch.setitem(sys.modules, "open_webui.models", models_mod)
+    monkeypatch.setitem(sys.modules, "open_webui.models.models", mmm)
+
+    r = c.get("/api/v1/quota-keeper/models")
+    assert r.status_code == 200
+    items = {it["model"]: it for it in r.json()["items"]}
+    assert items["m-bare"]["override"] is None
+    assert items["m-bare"]["matched"] is False
 
 
 # ---- multi-source pricing (v0.3.4) --------------------------------------------
