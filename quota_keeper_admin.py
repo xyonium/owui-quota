@@ -1865,7 +1865,12 @@ def qk_rename_model(src: str, dst: str, dry_run: bool = False):
                 report["recent_renamed"] += 1
                 if not dry_run:
                     it["model"] = dst
-        if not dry_run and (report["buckets_merged"] or report["recent_renamed"]):
+        # hour_buckets_merged MUST be part of the gate: the 24h view reads hour
+        # buckets while 7d/30d read day buckets, so a rename that only matches
+        # hour sub-buckets was counted but never written (silently discarded
+        # while the API still reported a successful merge).
+        if not dry_run and (report["buckets_merged"] or report["hour_buckets_merged"]
+                            or report["recent_renamed"]):
             qk_atomic_write(QK_LEDGER_PATH, led)
             if report["recent_renamed"]:
                 qk_atomic_write(QK_RECENT_PATH, rec)
@@ -2291,7 +2296,7 @@ tr.pe-cleared td{opacity:.45}
   </div>
   <label>Fallback pricing per 1M tokens when no match (JSON, optional)</label>
   <input id="default_pricing" placeholder='{"input":1,"cached":0.1,"output":2}'/>
-  <label>Model aliases (upstream alias → real model name, JSON; e.g. {"prx.gemini-flash":"gemini-3.7-flash"} — merges the alias into the real model's stats/pricing)</label>
+  <label>Model aliases (upstream alias → real model name, JSON; e.g. {"prx.gemini-flash":"gemini-3.7-flash"} — merges the alias into the real model's stats/pricing. This is a naming map for stats: it does <b>not</b> set prices (use the Pricing editor's direct prices / alias for that). Saving writes the whole map — empty an entry and save to delete it.)</label>
   <textarea id="model_aliases" rows="2" placeholder='{"prx.gemini-flash":"gemini-3.7-flash"}'></textarea>
   <div class="row" style="margin-top:10px">
    <input id="matchTest" placeholder="Type a model id to test matching, e.g. openai/gpt-4o-mini"/>
@@ -2896,7 +2901,7 @@ async function reprice(model){
 async function renameModel(src){
   const dst=(prompt(`Rename/merge ALL stored rows named "${src}" into which model?\n\nEnter the real model name (e.g. gemini-3.7-flash):`,'')||'').trim();
   if(!dst||dst===src)return;
-  if(!confirm(`Merge every ledger bucket and recent-activity entry named "${src}" into "${dst}"?\n\nRequests/tokens/cost are summed into "${dst}" (all history, every user); "${src}" disappears from the tables. If the merged rows were unpriced, you will be asked to reprice "${dst}" next to backfill their cost.`))return;
+  if(!confirm(`This is a REPAIR tool (not a pricing setting). Merge every ledger bucket and recent-activity entry named "${src}" into "${dst}"?\n\nRequests/tokens/cost are summed into "${dst}" (all history, every user); "${src}" disappears from the tables. If the merged rows were unpriced, you will be asked to reprice "${dst}" next to backfill their cost.`))return;
   try{
     const r=await api('/models/rename?from='+encodeURIComponent(src)+'&to='+encodeURIComponent(dst),{method:'POST'});
     if(r.error){toast('Rename failed: '+r.error);return}

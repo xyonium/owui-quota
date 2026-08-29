@@ -1293,6 +1293,54 @@ def test_rename_model_missing_source_is_noop(load_admin):
     assert not Path(adm.QK_RECENT_PATH).exists()  # nothing to write
 
 
+def test_rename_hour_only_bucket_is_persisted(load_admin):
+    """Fix: a rename matching ONLY hour sub-buckets must still be written.
+
+    The write gate used to check buckets_merged/recent_renamed but not
+    hour_buckets_merged, so the merge was counted in the report and then
+    silently discarded -- the 24h view (hour buckets) kept the stale name while
+    7d/30d (day buckets) looked fine.
+    """
+    from pathlib import Path
+    from tests.conftest import write_json
+    import json
+
+    hour = {
+        "requests": 1, "cost_usd": 0.0,
+        "tokens": {"cached": 0.0, "input": 10.0, "output": 5.0},
+        "models": {"unknown": {"requests": 1, "cost_usd": 0.0,
+                               "tokens": {"cached": 0.0, "input": 10.0, "output": 5.0}}},
+    }
+    day = {
+        "requests": 1, "cost_usd": 0.0,
+        "tokens": {"cached": 0.0, "input": 10.0, "output": 5.0},
+        "models": {"gemini-3.7-flash": {
+            "requests": 1, "cost_usd": 0.0,
+            "tokens": {"cached": 0.0, "input": 10.0, "output": 5.0},
+            "unpriced_requests": 0, "priced": True}},
+        "hours": {"10": hour},
+    }
+    adm = load_admin()
+    write_json(Path(adm.QK_LEDGER_PATH),
+               {"users": {"u1": {"name": "A", "email": "a@x", "days": {"2026-08-19": day}}}})
+    write_json(Path(adm.QK_RECENT_PATH), {"items": []})
+
+    rep = adm.qk_rename_model("unknown", "gemini-3.7-flash")
+    # detected and counted...
+    assert rep["hour_buckets_merged"] == 1
+    assert rep["buckets_merged"] == 0 and rep["recent_renamed"] == 0
+    # ...and therefore persisted
+    led = json.loads(Path(adm.QK_LEDGER_PATH).read_text())
+    hm = led["users"]["u1"]["days"]["2026-08-19"]["hours"]["10"]["models"]
+    assert "unknown" not in hm, "hour-only merge was discarded (not written)"
+    assert hm["gemini-3.7-flash"]["requests"] == 1
+    assert hm["gemini-3.7-flash"]["tokens"]["input"] == 10.0
+    # the day-model bucket never had 'unknown', so it gains no key
+    dm = led["users"]["u1"]["days"]["2026-08-19"]["models"]
+    assert set(dm) == {"gemini-3.7-flash"}
+    assert dm["gemini-3.7-flash"]["requests"] == 1
+
+
 def test_rename_model_into_new_name_creates_bucket(load_admin):
     from pathlib import Path
     from tests.conftest import write_json
