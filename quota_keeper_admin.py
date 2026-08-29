@@ -3098,8 +3098,12 @@ function peEff(o){
   // fall back per field: stored override first, then the resolved upstream
   // price (sparse edits must not null out fields the user left untouched)
   const fb=f=>c.prices[f]??b.prices[f]??((o.price||{})[f]??null);
+  // alias: an explicitly emptied input ('' once `cur` exists) means "delete
+  // the alias" -- do NOT fall back to the stored one, or the user could never
+  // clear it (issue #2). Same for an explicitly cleared multiplier.
   return {prices:{input:fb('input'),cached:fb('cached'),cache_write:fb('cache_write'),output:fb('output')},
-          alias:c.alias!==''?c.alias:b.alias,mult:(c.mult!==''&&c.mult!==null)?c.mult:b.mult};
+          alias:(c.alias!==undefined&&c.alias!==null)?c.alias:b.alias,
+          mult:(c.mult!==undefined&&c.mult!==null&&c.mult!=='')?c.mult:b.mult};
 }
 function peRowHtml(k,o){
   const eff=peEff(o);
@@ -3134,7 +3138,7 @@ function peRowHtml(k,o){
      <br/><span class="small muted">used · ${fmt(o.requests,0)} reqs</span></td>
    <td class="small">${howTxt}</td>
    ${['input','cached','cache_write','output'].map(f=>`<td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="${f}" value="${esc(numVal(f))}" ${dis} oninput="peEdit(this)"/></td>`).join('')}
-   <td><input class="pe-alias" type="text" placeholder="e.g. kimi-k3" data-pk="${esc(k)}" data-f="alias" value="${esc(cur.alias||'')}" ${adis} oninput="peEdit(this)"/></td>
+   <td><input class="pe-alias" type="text" placeholder="alias key; empty + save = delete" data-pk="${esc(k)}" data-f="alias" value="${esc(cur.alias||'')}" ${adis} oninput="peEdit(this)"/></td>
    <td><input class="pe-mult" type="number" step="0.05" min="0" placeholder="1" data-pk="${esc(k)}" data-f="mult" value="${esc(cur.mult===''||cur.mult===null?'':cur.mult)}" ${adis} oninput="peEdit(this)"/></td>
    <td>${o.manual&&!o.cleared?`<button class="small" onclick="peClear('${esc(k)}')">clear</button>`:''}${o.cleared?`<button class="small" onclick="peUndo('${esc(k)}')">undo</button>`:''}</td>
   </tr>`;
@@ -3172,34 +3176,60 @@ function peClear(k){const o=STATE.pe.orig[k];if(!o)return;o.cleared=true;renderP
 function peUndo(k){const o=STATE.pe.orig[k];if(!o)return;o.cleared=false;renderPricingRows()}
 function collectOverrides(){
   // DOM-independent: iterate STATE.pe.orig (every used/configured model).
-  // Emission rules:
-  //  - cleared manual row          -> emit null (deep-merge tombstone)
-  //  - alias set                   -> {alias, multiplier?} (multiplier omitted
+  // Emission rules (replace-on-save: POST /config replaces pricing.overrides
+  // wholesale, so an ABSENT key now deletes the stored override):
+  //  - cleared row                  -> omit the key (deletes the override)
+  //  - alias set                    -> {alias, multiplier?} (multiplier omitted
   //    when blank -> backend treats it as 1)
-  //  - edited rows with any price  -> {prices:{...}} (cur is only populated
+  //  - edited rows with any price   -> {prices:{...}} (cur is only populated
   //    by peEdit, so an untouched upstream row never emits -- the previous
   //    "changed vs upstream" float-equality check re-emitted every
   //    upstream-priced row as an override and wiped the row's alias on any
   //    later save)
-  //  - unedited rows               -> never emitted (existing overrides are
-  //    preserved because the POST deep-merges into the stored config)
+  //  - edited row, alias cleared, no price/multiplier -> omit the key: this is
+  //    how a stored alias is deleted (it used to fall back to the stored alias
+  //    and re-emit itself, issue #2)
+  //  - untouched row WITH an override on disk -> emit its stored spec verbatim
+  //    (replace semantics would otherwise delete an override the user never
+  //    looked at; the old deep merge kept it for free)
+  //  - untouched row without an override -> omit
   const ov={};
   Object.entries(STATE.pe.orig).forEach(([k,o])=>{
-    if(o.cleared){ov[k]=null;return}
+    if(o.cleared)return;
     const eff=peEff(o);
     if(!eff)return;
-    const hasMult=eff.mult!==''&&eff.mult!==null&&!isNaN(eff.mult);
+    const hasMult=eff.mult!==''&&eff.mult!==null&&eff.mult!==undefined&&!isNaN(eff.mult);
+    // peEff already applies an explicitly emptied alias (cur.alias='' => '')
     if(eff.alias){
       const out={alias:eff.alias};
       if(hasMult)out.multiplier=Number(eff.mult);
       ov[k]=out;
       return;
     }
-    if(!o.cur)return; // untouched rows never emit (deep-merge preserves stored overrides)
+    if(!o.cur){
+      // untouched row: re-emit the stored override so replace-on-save keeps it
+      if(!o.manual)return;
+      const b=o.base;
+      if(b.alias){
+        const out={alias:b.alias};
+        if(b.mult!==''&&b.mult!==null&&b.mult!==undefined)out.multiplier=Number(b.mult);
+        ov[k]=out;
+        return;
+      }
+      const p={};
+      ['input','cached','cache_write','output'].forEach(f=>{
+        if(b.prices[f]!==null&&b.prices[f]!==undefined)p[f]=b.prices[f];
+      });
+      if(!Object.keys(p).length)return;
+      const out={prices:p};
+      if(b.mult!==''&&b.mult!==null&&b.mult!==undefined)out.multiplier=Number(b.mult);
+      ov[k]=out;
+      return;
+    }
     // judge by the user's ACTUAL edits (o.cur), not peEff's upstream-backfilled
     // prices: a multiplier-only row has all cur.prices null, and backfilling the
     // upstream price into eff.prices would wrongly freeze it into a manual override
-    const cp=(o.cur&&o.cur.prices)||{};
+    const cp=o.cur.prices||{};
     const userSetPrice=Object.values(cp).some(v=>v!==null&&v!==undefined);
     if(userSetPrice){
       // manual prices (optionally discounted by a multiplier for quick sales)
