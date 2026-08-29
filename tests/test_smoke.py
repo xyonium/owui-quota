@@ -36,3 +36,17 @@ def test_scrollable_tables_have_sticky_headers():
     assert "top:0" in rule
     assert "background:var(--card)" in rule  # opaque: covers rows scrolling under
     assert "z-index" in rule
+
+
+def test_alias_concept_hints_present():
+    """The issue #2/#3 clarifications must live in the page, not only the README.
+
+    Both misunderstandings came from the UI: the naming map was taken for a
+    pricing setting, and the ledger-merge button for a pricing config. Pin the
+    hints so a future edit can't drop them silently.
+    """
+    page = _page_source()
+    # model_aliases label: a naming map for stats -- it does NOT set prices
+    assert "not</b> set prices" in page
+    # rename/merge: a repair tool for historical ledger buckets
+    assert "REPAIR tool" in page
