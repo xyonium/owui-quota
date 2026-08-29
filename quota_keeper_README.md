@@ -54,8 +54,18 @@
 
 - 管理台「Pricing editor」列出的是**实际在用量中出现的模型**（usage 返回的真实上游 id；不含 OWUI 模型库里的冗余/陈旧条目），不是 2.5k 行的上游全表：每行显示解析出的价格、命中方式（`exact` 只显示方法；模糊匹配显示 `suffix/segment/contains: 实际命中的上游 key`；alias 显示 `alias → 目标 ×系数`）与 matched ✓ / no match 徽标，未匹配的行排在最前。
 - 每行两种修法：**直接填价**（input/cached/cache_write/output 每 1M），或**别名 + 系数**——`kimi-k3-256k → alias: kimi-k3 × 0.5` 即按 kimi-k3 价格打 5 折（别名可链式嵌套，防环，最多 8 跳；系数不写 = 1）。
-- 覆盖值三种形态（`pricing.overrides`）：`{"prices": {...}}` 直接定价；`{"alias": "key", "multiplier": m}` 别名；裸价格 dict 为旧格式仍兼容。`null` = 清除该行覆盖（编辑器行尾 clear 按钮）。
+- 覆盖值三种形态（`pricing.overrides`）：`{"prices": {...}}` 直接定价；`{"alias": "key", "multiplier": m}` 别名；裸价格 dict 为旧格式仍兼容。删除某行覆盖：行尾 **clear** 按钮，或把 alias 框清空后保存（整体替换语义，见下）。
 - 覆盖优先级最高，且**永不被上游刷新覆盖**；来自 overrides 的行带「manual」徽标。用量表与 Test match 框显示实际命中的目标（`how` 字段）。
+
+## 概念澄清（issue #2 / #3 常见误解）
+
+- **两处 alias 是两码事**：
+  - `Model aliases`（Pricing source 顶部，`model_aliases`）是**改名归统计**——把上游回显的别名（如 `prx.gemini-flash`）并入真实模型名下记账与统计。**它不参与定价**：自建模型不在上游价格表时，在这里填 alias 也不会产生匹配；请改用 Pricing editor 的**直接填价**。
+  - Pricing editor 行内的 **alias** 是**借用上游价格表中某个已有 key 的价格**——`k3-256k → alias: kimi-k3 × 0.5` 即按 kimi-k3 的价格打 5 折。**只影响计价，不改变统计归属**（用量仍记在 k3-256k 自己名下），且 alias 目标必须真实存在于上游价格表（用 Test match 验证）。
+- **Rename/merge（模型表行尾）是修复工具，不是定价配置**：把某个名字（陈旧 alias、`unknown`）在 ledger 与 recent 里的**全部历史桶**合并到目标模型名下（请求/tokens/cost 求和，含所有用户、全部历史），用于纠正历史记账错误；合并后若原行未定价会提示 reprice 回填成本。删除/修改 `model_aliases` 造成的条目分裂，可用它重新合并。
+- **Filter 是全局计量器，per-model 开关管不住它**：Filter 注入在 API 底层入口做计量，不按模型启停；Open WebUI 的 passthrough 直连模式不走标准 Filter 的 inlet/outlet，同样会被计量（设计如此，并非 per-model 设置失效）。后台任务（标题/标签生成）也从不被拦截，但仍会计量。
+- **配置保存语义（v0.5.39 起）**：`model_aliases`、user/group 配额表、`pricing.overrides`、TOU 的 providers/models 均为**整体替换**——界面保存即按当前所见全量写入，清空某条映射再保存就是删除。直接调 `POST /config` 同理：这些键**出现即替换，省略则不动**；其余键仍是深合并。
+- **改/删映射不会破坏历史统计**：历史用量只写一份（落在解析后的模型名下），解析函数幂等；删除或改名最坏是条目分裂（历史在旧名、新增在新名，**不重复计数**），可用 Rename 合并恢复。改/删 override 不改变已落盘的成本（价格在记录时已换算成 USD）。
 
 ## 管理台（admin 视角 /quota）
 
