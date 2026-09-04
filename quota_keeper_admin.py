@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.39
+version: 0.5.40
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3227,7 +3227,13 @@ function collectOverrides(){
       ['input','cached','cache_write','output'].forEach(f=>{
         if(b.prices[f]!==null&&b.prices[f]!==undefined)p[f]=b.prices[f];
       });
-      if(!Object.keys(p).length)return;
+      if(!Object.keys(p).length){
+        // multiplier-only stored override: no price fields to re-emit, but the
+        // multiplier itself must still be re-emitted -- replace-on-save deletes
+        // any key omitted here, so the next unrelated save used to wipe it
+        if(b.mult!==''&&b.mult!==null&&b.mult!==undefined)ov[k]={multiplier:Number(b.mult)};
+        return;
+      }
       const out={prices:p};
       if(b.mult!==''&&b.mult!==null&&b.mult!==undefined)out.multiplier=Number(b.mult);
       ov[k]=out;

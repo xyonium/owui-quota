@@ -370,3 +370,66 @@ def test_cleared_alias_can_become_prices_or_be_deleted():
 '''
     out = _run_jsdom(driver)
     assert "OK overrides=" in out
+
+
+def test_multiplier_only_override_survives_unrelated_save():
+    """A stored multiplier-only override was deleted by the next unrelated save.
+
+    Repro: save {multiplier: 0.5} on a model (no alias, no prices) -- persists
+    and renders fine after refresh. Then set an alias on any OTHER model and
+    save: the multiplier is gone after the next refresh.
+
+    Root cause: collectOverrides' untouched-row re-emit branch (which exists
+    precisely because POST /config REPLACES pricing.overrides wholesale)
+    re-emitted the stored alias shape and the stored prices shape, but not the
+    stored multiplier-only shape: with all base.prices null it hit
+    `if(!Object.keys(p).length)return;` and omitted the key.
+    """
+    driver = r'''
+(async () => {
+  try {
+    await new Promise(r => setTimeout(r, 40)); // let init() + loadAdmin() finish
+    $('secPricingEditor').open = true;
+    $('secPricingEditor').dispatchEvent(new window.Event('toggle'));
+    await new Promise(r => setTimeout(r, 40));
+    // post-save + refresh state: /models reports a STORED multiplier-only
+    // override on model-mult (what the editor sees after the first save)
+    window.FAKE.models.items = [
+      {model:'zebra/model-mult', used:true, available:true, requests:2,
+       unpriced_requests:0, cost_usd:0.0, matched:true, how:'exact:zebra/model-mult',
+       price:{input:1.0,output:2.0}, override:{multiplier:0.5}},
+      {model:'zebra/model-other', used:true, available:true, requests:1,
+       unpriced_requests:0, cost_usd:0.0, matched:true, how:'exact:zebra/model-other',
+       price:{input:1.0,output:2.0}, override:null}
+    ];
+    STATE.pe.data = window.FAKE.models;
+    rebuildPeOrig();
+    $('peSearch').value = '';
+    peSearch();
+    // the stored multiplier is rendered in the row (the user's "还在" check)
+    const inputs = [...document.querySelectorAll('input[data-pk]')];
+    if (!inputs.length) throw new Error('no editor rows rendered');
+    const mInp = inputs.find(i => i.dataset.pk === 'zebra/model-mult' && i.dataset.f === 'mult');
+    if (!mInp || String(mInp.value) !== '0.5')
+      throw new Error('stored multiplier not rendered: ' + JSON.stringify(mInp && mInp.value));
+    // the user's second action: set an alias on the OTHER row, then save
+    const oInp = inputs.find(i => i.dataset.pk === 'zebra/model-other' && i.dataset.f === 'alias');
+    oInp.value = 'kimi-k3';
+    peEdit(oInp);
+    saveConfig();
+    await new Promise(r2 => setTimeout(r2, 60));
+    const ov = (window.FAKE.posted.pricing || {}).overrides || {};
+    if (!(ov['zebra/model-other'] && ov['zebra/model-other'].alias === 'kimi-k3'))
+      throw new Error('alias not emitted: ' + JSON.stringify(ov));
+    const m = ov['zebra/model-mult'];
+    if (!(m && m.multiplier === 0.5 && m.prices === undefined && m.alias === undefined))
+      throw new Error('stored multiplier-only override dropped on unrelated save: ' + JSON.stringify(ov));
+    window.__result = 'OK overrides=' + JSON.stringify(ov);
+    return;
+  } catch (e) {
+    window.__result = 'FAIL ' + (e && e.stack || e);
+  }
+})();
+'''
+    out = _run_jsdom(driver)
+    assert "OK overrides=" in out
