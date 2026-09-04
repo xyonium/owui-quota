@@ -537,6 +537,68 @@ def test_stream_end_outlet_full_usage_topup_not_double_counted(qk):
     assert len(rec["items"]) == 1  # the zero-delta topup is not a new response
 
 
+def test_api_stream_end_outlet_without_message_id_not_double_recorded(qk):
+    """Regression (2026-09-04 live incident): API clients send no chat_id and no
+    message id, so __metadata__.message_id is None and stream() can never mark
+    _seen_msgids. OWUI 0.11.1 still runs outlet_filter_handler inline at stream
+    end ("For temp/API chats, messages are built from form_data plus
+    ctx['assistant_message']"), with a FRESHLY generated body id
+    (output_id('msg')) and body.model = the OWUI model id (prx.deepseek-flash).
+    The v0.4.9 msgid dedup can never fire here: the echo must be matched to the
+    stream() record by content (same user, token totals not exceeding what was
+    recorded, within a short window) and merged as a zero-delta topup instead
+    of double-recorded under the prx-stripped alias."""
+    f = qk.Filter()
+    import asyncio
+    # API shape: no chat_id, NO message_id in metadata (main.py pops form_data
+    # 'id' into message_ids; API clients don't send one -> None)
+    md = {"session_id": None, "user_id": "u1"}
+    usage = {"prompt_tokens": 356, "completion_tokens": 1,
+             "prompt_tokens_details": {"cached_tokens": 0}}
+    # stream(): the OpenAI chunk echoes the REAL upstream model name
+    asyncio.run(f.stream({"id": "30ec0a31-f97e", "model": "deepseek-v4-flash",
+                          "usage": dict(usage)},
+                         __user__=_user(), __metadata__=md))
+    # stream-end outlet echo: fresh msg id, OWUI model id as body.model
+    body = {"model": "prx.deepseek-flash", "id": "msg-9f8e7d6c5b4a",
+            "messages": [{"role": "user", "content": "hi"},
+                         {"id": "msg-9f8e7d6c5b4a", "role": "assistant", "content": "1",
+                          "usage": dict(usage)}],
+            "chat_id": "", "session_id": None}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1                        # not 2
+    assert d["tokens"]["input"] == 356 and d["tokens"]["output"] == 1
+    assert set(d["models"]) == {"deepseek-v4-flash"}  # no deepseek-flash phantom
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {})
+    assert len(rec["items"]) == 1
+    assert rec["items"][0]["model"] == "deepseek-v4-flash"
+
+
+def test_nonstream_api_outlet_still_records_without_stream_match(qk):
+    """Guard the other side of the content-match dedup: a NON-streaming API
+    request never runs stream(), so the outlet echo-match finds nothing and
+    the request must still be recorded exactly once (under the prx-stripped
+    model id fallback)."""
+    f = qk.Filter()
+    import asyncio
+    md = {"session_id": None, "user_id": "u1"}
+    usage = {"prompt_tokens": 100, "completion_tokens": 5}
+    body = {"model": "prx.deepseek-flash", "id": "msg-nonstream",
+            "messages": [{"role": "user", "content": "hi"},
+                         {"id": "msg-nonstream", "role": "assistant", "content": "ok",
+                          "usage": dict(usage)}],
+            "chat_id": "", "session_id": None}
+    asyncio.run(f.outlet(body, __user__=_user(), __metadata__=md))
+    led = qk.qk_load_json(qk.QK_LEDGER_PATH, {})
+    d = list(led["users"]["u1"]["days"].values())[0]
+    assert d["requests"] == 1
+    assert set(d["models"]) == {"deepseek-flash"}
+    rec = qk.qk_load_json(qk.QK_RECENT_PATH, {})
+    assert len(rec["items"]) == 1
+
+
 def test_stream_duplicate_usage_chunk_same_rid_not_double_counted(qk):
     """Two usage-bearing stream events sharing the response id (e.g. upstream
     usage chunk + a second forwarded/synthesized one): the repeat is a

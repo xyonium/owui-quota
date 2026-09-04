@@ -1208,9 +1208,11 @@ def qk_ingest_record(req, body: bytes = b"", chunks=None) -> None:
         if not tok:
             return
         model = str(model or getattr(req.state, "qk_ingest_model", "") or "unknown")
-        # Request ID dedup: the Filter's _seen is per-instance and may not see
-        # this request at all; the passthrough has no stable response id, so
-        # dedup is keyed on (user, model, ts, tokens) with a short TTL window.
+        # No cross-component dedup here: the Filter keeps its own per-instance
+        # state and (for pipeline-visible requests) its own stream/outlet
+        # dedup; the passthrough has no stable response id to correlate with.
+        # Requests visible to BOTH (e.g. 0.11.1 /api/v1/messages convert mode)
+        # rely on the Filter's content-match dedup to stay single-counted.
         cfg = qk_get_config()
         now_local = qk_tou_local_now(cfg)
         qk_record_usage(user, model, tok, count_request=True, now=now_local, channel="api")

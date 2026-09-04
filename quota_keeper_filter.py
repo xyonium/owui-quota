@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Filter
 author: quota-keeper
-version: 0.4.19
+version: 0.4.20
 required_open_webui_version: 0.6.0
 description: Token metering (cached/input/output) + cost quota enforcement. User quota overrides groups; among groups the highest wins. Pricing pulled from upstream (LiteLLM/models.dev formats) with suffix fuzzy matching. Pair with "Quota Keeper - Admin UI" event function for the /quota config page.
 """
@@ -968,6 +968,13 @@ class Filter:
         self._seen = OrderedDict()  # dedup usage by response id
         self._seen_msgids = OrderedDict()  # message ids already recorded via stream()
         self._orphan = OrderedDict()  # usage seen in stream without user info
+        # recent stream() records, newest last: {"ts", "uid", "model", "chan",
+        # "tok_rec"} — the content key for the stream-end outlet echo of API
+        # requests, whose __metadata__ carries no message_id (so the
+        # _seen_msgids dedup can never fire) and whose rebuilt outlet body id
+        # is freshly generated. The only things the echo shares with the
+        # stream events are the user and the exact accumulated token totals.
+        self._stream_rec = []
 
     # -- helpers ------------------------------------------------------------
 
@@ -1030,6 +1037,53 @@ class Filter:
         if isinstance(v, tuple) and len(v) >= 2:
             return v[0], v[1]
         return None, None
+
+    # TTL for the stream-echo content match: the 0.11.1 inline outlet handler
+    # fires a fraction of a second after the last stream event (observed
+    # ~0.2s live); 30s leaves ample headroom for slow post-processing while
+    # keeping the false-positive window (a genuinely separate request by the
+    # same user with field-wise identical/greater token totals) negligible.
+    _STREAM_REC_TTL = 30.0
+
+    def _note_stream_rec(self, uid: str, model: str, chan: str, tok_rec: dict) -> None:
+        """Remember a usage record made by stream(), for outlet echo matching.
+        tok_rec is the SAME cumulative dict the _seen entry mutates, so the
+        match always compares against the latest recorded totals."""
+        if not uid:
+            return
+        now = time.time()
+        self._stream_rec.append(
+            {"ts": now, "uid": uid, "model": model, "chan": chan, "tok_rec": tok_rec}
+        )
+        cutoff = now - self._STREAM_REC_TTL
+        self._stream_rec[:] = [e for e in self._stream_rec if e["ts"] >= cutoff]
+        del self._stream_rec[:-256]
+
+    def _match_stream_echo(self, uid: str, tok: dict):
+        """Newest recent stream() record by this user whose recorded totals
+        are field-wise <= the outlet body's usage — i.e. the body is the
+        stream-end ECHO of an already-recorded streaming response (pure
+        repeat, or a superset when stream() only saw partial usage). Returns
+        the entry or None. A genuinely new request records less than or
+        different totals and never matches."""
+        if not uid or not tok:
+            return None
+        now = time.time()
+        cutoff = now - self._STREAM_REC_TTL
+        fields = ("cached", "input", "output", "cache_write")
+        best = None
+        keep = []
+        for e in self._stream_rec:
+            if e["ts"] < cutoff:
+                continue  # prune expired
+            keep.append(e)
+            if e["uid"] != uid:
+                continue
+            rec = e["tok_rec"]
+            if all((tok.get(k) or 0.0) >= (rec.get(k) or 0.0) for k in fields):
+                best = e  # newest matching entry wins
+        self._stream_rec[:] = keep
+        return best
 
     # -- enforcement ----------------------------------------------------------
 
@@ -1132,8 +1186,15 @@ class Filter:
                 if delta:
                     qk_record_usage(__user__ or {}, smodel or model, delta,
                                     count_request=False, channel=schan or chan)
+                self._note_stream_rec(str((__user__ or {}).get("id") or ""),
+                                      smodel or model, schan or chan, tok_rec)
                 return event
             self._record(__user__ or {}, model, tok, rid, channel=chan)
+            _uid = str((__user__ or {}).get("id") or "")
+            if _uid:
+                ent = self._seen.get(rid)
+                if ent is not None:  # None => orphan-stashed, nothing recorded yet
+                    self._note_stream_rec(_uid, model, chan, ent[2])
             # mark the message id so the stream-end outlet call (0.11) tops up
             # instead of double-recording (its rid is the message id, not rid).
             # The entry shares the recorded-usage dict so the outlet topup
@@ -1207,7 +1268,27 @@ class Filter:
                         qk_record_usage(__user__ or {}, model, delta,
                                         count_request=False, channel=chan)
                 else:
-                    self._record(__user__ or {}, model, tok, rid, channel=chan)
+                    # API clients send no message id (metadata.message_id is
+                    # None, so stream() could not mark _seen_msgids) and the
+                    # 0.11.1 inline outlet handler generates a FRESH body id —
+                    # neither dedup key can ever fire. The stream-end echo is
+                    # instead matched by CONTENT against recent stream()
+                    # records (same user, totals not exceeding what was
+                    # recorded, within _STREAM_REC_TTL): a match is merged as
+                    # a per-field-delta topup under the recorded (real) model
+                    # name; no match means a genuine non-streaming request,
+                    # recorded once as before.
+                    echo = self._match_stream_echo(str((__user__ or {}).get("id") or ""), tok)
+                    if echo is not None:
+                        if echo["model"]:
+                            model = echo["model"]
+                        delta = self._usage_delta(echo["tok_rec"], tok)
+                        if delta:
+                            qk_record_usage(__user__ or {}, model, delta,
+                                            count_request=False,
+                                            channel=echo["chan"] or chan)
+                    else:
+                        self._record(__user__ or {}, model, tok, rid, channel=chan)
             elif rid and (__user__ or {}).get("id") and rid in self._orphan:
                 # adopt usage stashed by stream() when user info was missing
                 # there (independent of estimate_unreported_tokens)
