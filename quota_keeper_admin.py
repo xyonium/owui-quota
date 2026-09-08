@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.40
+version: 0.5.41
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -3036,7 +3036,14 @@ async function saveConfig(){
     STATE.cfg=await api('/config');
     STATE.tou=JSON.parse(JSON.stringify(STATE.cfg.tou||{}));
     renderConfig();renderGroups();renderUsersQ();renderTou();
-    if(STATE.pe.loaded){rebuildPeOrig();renderPricingRows()}
+    if(STATE.pe.loaded){
+      // re-pull /models before rebuilding: STATE.pe.data is the payload from
+      // when the editor was OPENED -- rebuilding from it would revert a
+      // just-saved row to its pre-save override (often none), hiding the edit
+      // and letting the NEXT replace-on-save delete it from disk
+      STATE.pe.data=await api('/models');
+      rebuildPeOrig();renderPricingRows()
+    }
     loadStats();
   }catch(e){toast('Save failed: '+e.message)}
 }
@@ -3046,7 +3053,12 @@ async function refreshPricing(force){
     toast('Pricing '+r.status+' · '+r.models+' models');
     STATE.pricing=await api('/pricing');
     renderMeta();
-    if(STATE.pe.loaded){rebuildPeOrig();renderPricingRows()}
+    if(STATE.pe.loaded){
+      // same staleness as saveConfig: show the NEW upstream match/price, not
+      // the payload fetched when the editor was opened
+      STATE.pe.data=await api('/models');
+      rebuildPeOrig();renderPricingRows()
+    }
   }catch(e){toast('Refresh failed: '+e.message)}
 }
 async function testMatch(){

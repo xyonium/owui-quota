@@ -116,10 +116,23 @@ def _fixture_src() -> str:
         + "  const url = String(path);\n"
         + "  const m = (opts.method || 'GET').toUpperCase();\n"
         + "  const j = v => ({json: () => v, ok: true});\n"
-        + "  if (m === 'POST' && url.endsWith('/config')) { window.FAKE.posted = JSON.parse(opts.body); return Promise.resolve(j({ok:true})); }\n"
+        + "  if (m === 'POST' && url.endsWith('/config')) {\n"
+        + "    window.FAKE.posted = JSON.parse(opts.body);\n"
+        + "    // mirror the real server: config.json is written BEFORE the\n"
+        + "    // response, so the next GET /models reports the saved overrides\n"
+        + "    const ov = (window.FAKE.posted.pricing || {}).overrides;\n"
+        + "    if (ov) {\n"
+        + "      window.FAKE.cfg.pricing.overrides = ov;\n"
+        + "      window.FAKE.models.items.forEach(it => { it.override = ov[it.model] || null; });\n"
+        + "    }\n"
+        + "    return Promise.resolve(j({ok:true}));\n"
+        + "  }\n"
         + "  if (url.endsWith('/me')) return Promise.resolve(j({user:{id:'u1',name:'Admin',email:'a@x',role:'admin'}}));\n"
-        + "  if (url.endsWith('/models')) return Promise.resolve(j(window.FAKE.models));\n"
-        + "  if (url.endsWith('/config')) return Promise.resolve(j(window.FAKE.cfg));\n"
+        + "  // deep copies: over HTTP the client gets a fresh payload, so state\n"
+        + "  // fetched earlier must NOT see later server-side mutations (that\n"
+        + "  // staleness is exactly what saveConfig's editor rebuild must handle)\n"
+        + "  if (url.endsWith('/models')) return Promise.resolve(j(JSON.parse(JSON.stringify(window.FAKE.models))));\n"
+        + "  if (url.endsWith('/config')) return Promise.resolve(j(JSON.parse(JSON.stringify(window.FAKE.cfg))));\n"
         + "  if (url.endsWith('/users')) return Promise.resolve(j([]));\n"
         + "  if (url.endsWith('/groups')) return Promise.resolve(j([]));\n"
         + "  if (url.endsWith('/pricing')) return Promise.resolve(j({url:'http://x',models:3,fetched_at_iso:'2026-08-17T00:00:00+00:00'}));\n"
@@ -433,3 +446,69 @@ def test_multiplier_only_override_survives_unrelated_save():
 '''
     out = _run_jsdom(driver)
     assert "OK overrides=" in out
+
+
+def test_save_refreshes_editor_so_second_save_keeps_first_edit():
+    """Save must leave the editor showing the just-saved overrides.
+
+    Repro: edit a row, Save overrides (no manual refresh) -- the edit
+    vanishes from the display; edit another row, save again -- the FIRST
+    change is deleted from disk.
+
+    Root cause: saveConfig rebuilt the editor from the STALE /models payload
+    fetched when the editor was opened. The just-saved row's state reverted
+    to a plain no-override row (manual=false, cur=null), so the next save's
+    collectOverrides omitted it and the replace-on-save POST deleted it.
+    The fix re-fetches /models after a successful save before rebuilding.
+    """
+    driver = r'''
+(async () => {
+  try {
+    await new Promise(r => setTimeout(r, 40)); // let init() + loadAdmin() finish
+    $('secPricingEditor').open = true;
+    $('secPricingEditor').dispatchEvent(new window.Event('toggle'));
+    await new Promise(r => setTimeout(r, 40));
+    const q = () => [...document.querySelectorAll('input[data-pk]')];
+    // edit aaa (no stored override): multiplier-only, then save
+    const aM = q().find(i => i.dataset.pk === 'zebra/model-aaa' && i.dataset.f === 'mult');
+    if (!aM) throw new Error('aaa mult input not rendered');
+    aM.value = '0.5';
+    peEdit(aM);
+    saveConfig();
+    await new Promise(r2 => setTimeout(r2, 60));
+    const ov1 = (window.FAKE.posted.pricing || {}).overrides || {};
+    if (!(ov1['zebra/model-aaa'] && ov1['zebra/model-aaa'].multiplier === 0.5))
+      throw new Error('first save missing the edit: ' + JSON.stringify(ov1));
+    // after the save the editor must SHOW the just-saved override (auto
+    // refresh), not revert to the pre-save display
+    const st = STATE.pe.orig['zebra/model-aaa'];
+    if (!(st && st.manual === true && st.cur === null && st.base.mult === 0.5))
+      throw new Error('editor state not refreshed after save: ' + JSON.stringify(st));
+    const aM2 = q().find(i => i.dataset.pk === 'zebra/model-aaa' && i.dataset.f === 'mult');
+    if (!aM2 || String(aM2.value) !== '0.5')
+      throw new Error('just-saved multiplier not displayed after save: ' + JSON.stringify(aM2 && aM2.value));
+    // now edit ccc and save again: the first edit must survive
+    const cA = q().find(i => i.dataset.pk === 'zebra/model-ccc' && i.dataset.f === 'alias');
+    if (!cA) throw new Error('ccc alias input not rendered');
+    cA.value = 'kimi-k3';
+    peEdit(cA);
+    saveConfig();
+    await new Promise(r2 => setTimeout(r2, 60));
+    const ov2 = (window.FAKE.posted.pricing || {}).overrides || {};
+    const m = ov2['zebra/model-aaa'];
+    if (!(m && m.multiplier === 0.5))
+      throw new Error('first edit deleted by second save: ' + JSON.stringify(ov2));
+    if (!(ov2['zebra/model-ccc'] && ov2['zebra/model-ccc'].alias === 'kimi-k3'))
+      throw new Error('second edit not saved: ' + JSON.stringify(ov2));
+    // untouched stored override (bbb, prices shape) still re-emitted
+    if (!(ov2['zebra/model-bbb'] && ov2['zebra/model-bbb'].prices && ov2['zebra/model-bbb'].prices.input === 9.0))
+      throw new Error('stored prices override dropped: ' + JSON.stringify(ov2));
+    window.__result = 'OK ov2=' + JSON.stringify(ov2);
+    return;
+  } catch (e) {
+    window.__result = 'FAIL ' + (e && e.stack || e);
+  }
+})();
+'''
+    out = _run_jsdom(driver)
+    assert "OK ov2=" in out
