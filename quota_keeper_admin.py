@@ -1,7 +1,7 @@
 """
 title: Quota Keeper - Admin UI
 author: quota-keeper
-version: 0.5.41
+version: 0.5.42
 required_open_webui_version: 0.10.0
 description: Registers the /quota admin page to configure user/group quotas, pricing sources and time schedules, and refreshes model pricing from an upstream URL on a schedule. Pair with "Quota Keeper - Filter" which meters usage and enforces the quotas.
 """
@@ -2791,10 +2791,11 @@ async function toggleDrill(tr){
   const rows=(data.models||[]).map(m=>{
     const t=m.tokens||{};
     const tin=(t.cached||0)+(t.input||0);  // total input (cached + cache-miss)
-    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(tin,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(m.cost_usd,2)}</td></tr>`;
-  }).join('')||'<tr><td colspan="6" class="empty">No usage in span</td></tr>';
+    const cp=tin?((t.cached||0)/tin*100):0;  // cache rate: QK input excludes cached
+    return `<tr><td>${esc(m.model)}</td><td class="num">${fmt(m.requests,0)}</td><td class="num">${fmt(t.cached,0)}</td><td class="num">${fmt(cp,2)}%</td><td class="num">${fmt(tin,0)}</td><td class="num">${fmt(t.output,0)}</td><td class="num">$${fmt(m.cost_usd,2)}</td></tr>`;
+  }).join('')||'<tr><td colspan="7" class="empty">No usage in span</td></tr>';
   const dr=document.createElement('tr');dr.className='drill';
-  dr.innerHTML=`<td colspan="8"><table style="max-width:760px"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Cached</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th></tr></thead><tbody>${rows}</tbody></table></td>`;
+  dr.innerHTML=`<td colspan="8"><table style="max-width:760px"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Cached</th><th class="num" title="Cached / (cached + input) of this user's tokens on this model">Cache%</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost $</th></tr></thead><tbody>${rows}</tbody></table></td>`;
   tr.after(dr);
 }
 function exportCsv(){

@@ -512,3 +512,43 @@ def test_save_refreshes_editor_so_second_save_keeps_first_edit():
 '''
     out = _run_jsdom(driver)
     assert "OK ov2=" in out
+
+
+def test_user_drilldown_shows_cache_rate_per_model():
+    """The Users-ranking drill-down (click a user row) must show a Cache%
+    column per model: cached / (cached + input) of THAT user's tokens on
+    THAT model (QK's `input` excludes cached -- the 0824 backfill pinned
+    this semantics; getting it wrong reads 45.7% where the truth is 84%).
+    """
+    driver = r'''
+(async () => {
+  try {
+    await new Promise(r => setTimeout(r, 40)); // let init() finish
+    window.FAKE.stats = {
+      kpi:{requests:2,cost_usd:0.01,tokens:{},unpriced_requests:0},
+      series:[], users:[],
+      models:[{model:'zebra/model-aaa', requests:2,
+               tokens:{cached:253,input:147,output:5}, cost_usd:0.01}]
+    };
+    const tr = document.createElement('tr');
+    tr.className = 'clickable'; tr.dataset.uid = 'u1';
+    $('uRank').querySelector('tbody').appendChild(tr);
+    toggleDrill(tr);
+    await new Promise(r2 => setTimeout(r2, 60));
+    const drill = $('uRank').querySelector('tr.drill');
+    if (!drill) throw new Error('drill row not rendered');
+    const html = drill.innerHTML;
+    if (!html.includes('Cache%'))
+      throw new Error('no Cache% column in drill-down: ' + html.slice(0, 300));
+    // 253 / (253 + 147) = 63.25%
+    if (!html.includes('63.25%'))
+      throw new Error('cache rate wrong (want cached/(cached+input)=253/400=63.25%): ' + html.slice(0, 400));
+    window.__result = 'OK drill cache rate rendered';
+    return;
+  } catch (e) {
+    window.__result = 'FAIL ' + (e && e.stack || e);
+  }
+})();
+'''
+    out = _run_jsdom(driver)
+    assert "OK drill cache rate rendered" in out
