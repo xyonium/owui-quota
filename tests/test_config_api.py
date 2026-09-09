@@ -369,7 +369,8 @@ def test_fetch_pricing_merges_sources_first_wins(admin_client, monkeypatch):
     table = {}
     table = adm.qk_fetch_pricing("u1", table=table)
     table = adm.qk_fetch_pricing("u2", table=table)
-    assert table["gpt-x"] == {"input": 1.0, "output": 2.0, "cached": None, "cache_write": None}
+    assert table["gpt-x"] == {"input": 1.0, "output": 2.0, "cached": None, "cache_write": None,
+                              "per_image": None}
     assert table["moonshotai/kimi-k3"]["input"] == 3.0
     assert table["kimi-k3"]["output"] == 15.0  # bare key also registered
     assert table["glm-5.2"]["cached"] == 0.26

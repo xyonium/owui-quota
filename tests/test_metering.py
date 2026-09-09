@@ -435,7 +435,7 @@ def test_period_used_weekly_sums_iso_week(qk, monkeypatch, tmp_path):
 
 def test_price_fields_constant_defined_in_both(qk, load_admin):
     for mod in (qk, load_admin()):
-        assert mod.QK_PRICE_FIELDS == ("input", "cached", "cache_write", "output")
+        assert mod.QK_PRICE_FIELDS == ("input", "cached", "cache_write", "output", "per_image")
 
 
 def test_find_pricing_override_shapes_both(qk, load_admin):

@@ -174,7 +174,11 @@ def qk_deep_merge(base, patch):
 
 _QK_NUM = lambda v: not isinstance(v, bool) and isinstance(v, (int, float))
 
-QK_PRICE_FIELDS = ("input", "cached", "cache_write", "output")
+QK_PRICE_FIELDS = ("input", "cached", "cache_write", "output", "per_image")
+# NOTE: per_image is an ABSOLUTE USD price per generated image (litellm
+# input_cost_per_image, dall-e family), NOT per-1M tokens. qk_cost_usd keeps
+# its own hardcoded per-1M token field list; per_image is applied by
+# qk_image_cost_usd as a fallback when token cost is zero.
 
 
 def qk_validate_config(cfg) -> list:
@@ -423,6 +427,7 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
     raw and date-stripped variants). Returns (price|None, how|None).
     A matched entry whose input+output are both 0 counts as NOT priced
     (returns None): plan-tier/free $0 rows would otherwise meter 0 forever.
+    Exception: an entry with a per_image price (image models) IS priced.
 
     Override value shapes (a None value means "cleared" and is skipped):
       legacy direct:  {"input": x, ..., "multiplier": m?}
@@ -507,8 +512,11 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
         return _table_match(vs)
 
     price, how = resolve(m, 0)
-    if price is not None and ((price.get("input") or 0) + (price.get("output") or 0)) <= 0:
-        return None, None  # zero-priced match = unpriced (do not meter 0 silently)
+    if price is not None and ((price.get("input") or 0) + (price.get("output") or 0)) <= 0 \
+            and not price.get("per_image"):
+        # zero-priced match = unpriced (do not meter 0 silently); a per_image
+        # price alone (dall-e family) still counts as priced
+        return None, None
     return price, how
 
 
@@ -628,6 +636,26 @@ def qk_cost_usd(tok: dict, price) -> float:
     return c
 
 
+def qk_image_cost_usd(images, price) -> float:
+    # per-image cost (verbatim copy in the admin). per_image is an ABSOLUTE
+    # USD price per generated image (litellm input_cost_per_image). Applied
+    # only as a FALLBACK by callers when the token cost is zero: dall-e-family
+    # responses carry no usage object, while gpt-image-1 reports token usage
+    # and must never be double-billed per image on top.
+    if not price or not images:
+        return 0.0
+    p = price.get("per_image")
+    if not isinstance(p, (int, float)) or isinstance(p, bool):
+        return 0.0
+    try:
+        n = float(images)
+    except Exception:
+        return 0.0
+    if n <= 0:
+        return 0.0
+    return n * float(p)
+
+
 # ---------------------------------------------------------------------------
 # Ledger
 # ---------------------------------------------------------------------------
@@ -667,7 +695,7 @@ def qk_resolve_model_alias(cfg: dict, model: str) -> str:
 
 
 def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True,
-                    now: datetime = None, channel: str = "api") -> None:
+                    now: datetime = None, channel: str = "api", images: int = 0) -> None:
     """Record one usage event. count_request=False marks a partial-usage
     topup for an id that already recorded: tokens/cost still accumulate but
     the request counters (day/hours/models) are not incremented again.
@@ -675,7 +703,11 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
     default is the TOU-aware local now. `channel` is "webui" when the request
     came through the web UI (non-empty __metadata__.chat_id), else "api" --
     used by the dashboard's per-user webui/api split for reconciling
-    against Open WebUI's own analytics."""
+    against Open WebUI's own analytics.
+    `images` is the generated-image count for image endpoint requests: when
+    the token cost is zero (dall-e-style responses carry no usage), the cost
+    falls back to images × per_image price. The count is stored on the
+    day×model bucket (and recent.json item) so reprice can backfill later."""
     uid = (user or {}).get("id")
     if not uid:
         return
@@ -690,6 +722,10 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         price = pconf.get("default_pricing")
         priced = price is not None
     base_cost = qk_cost_usd(tok, price)
+    if base_cost <= 0:
+        # image endpoints whose responses carry no billable token usage
+        # (dall-e family) are billed per generated image instead
+        base_cost = qk_image_cost_usd(images, price)
     now_local = now or qk_tou_local_now(cfg)
     day = now_local.strftime("%Y-%m-%d")
     model = str(model or "unknown")[:200]
@@ -786,6 +822,9 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         mm["cost_saved_usd"] = round(mm.get("cost_saved_usd", 0.0) + (base_cost - cost), 8)
         for k in ("cached", "input", "output"):
             mm["tokens"][k] = mm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        if images:
+            # generated-image count, kept for per-image reprice backfill
+            mm["images"] = mm.get("images", 0) + images
         # derived flag kept for UI back-compat until Task 9 (same semantics as
         # the old sticky AND: once an unpriced request occurred, stays false)
         mm["priced"] = mm.get("unpriced_requests", 0) == 0
@@ -798,20 +837,21 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         if count_request:
             rec = qk_load_json(QK_RECENT_PATH, {"items": []})
             items = rec.setdefault("items", [])
-            items.append(
-                {
-                    "ts": time.time(),
-                    "user_id": uid,
-                    "name": u.get("name", ""),
-                    "email": u.get("email", ""),
-                    "model": model,
-                    "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
-                    "cost_usd": cost,
-                    "tou_tier": tier,
-                    "priced": priced,
-                    "channel": channel,
-                }
-            )
+            item = {
+                "ts": time.time(),
+                "user_id": uid,
+                "name": u.get("name", ""),
+                "email": u.get("email", ""),
+                "model": model,
+                "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
+                "cost_usd": cost,
+                "tou_tier": tier,
+                "priced": priced,
+                "channel": channel,
+            }
+            if images:
+                item["images"] = images
+            items.append(item)
             del items[:-200]
             qk_atomic_write(QK_RECENT_PATH, rec)
 

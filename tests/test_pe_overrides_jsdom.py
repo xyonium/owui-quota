@@ -251,7 +251,7 @@ def test_overrides_save_preserves_non_visible_rows():
     const inputs = document.querySelectorAll('input[data-pk]');
     if (!inputs.length) throw new Error('no editor rows rendered');
     const pk = [...inputs].map(i => i.dataset.pk);
-    if (!(pk.length === 6 && pk.every(p => p === 'zebra/model-aaa')))
+    if (!(pk.length === 7 && pk.every(p => p === 'zebra/model-aaa')))
       throw new Error('expected only the visible zebra/model-aaa row, got ' + pk.join(','));
     // edit the visible row through its input. jsdom in outside-only mode does
     // not execute inline attribute handlers (oninput="peEdit(this)"), so the
@@ -266,12 +266,12 @@ def test_overrides_save_preserves_non_visible_rows():
     // it an explicit all-empty cur (simulating the user clearing the fields)
     // -> must NOT be emitted.
     const rc = STATE.pe.orig['zebra/model-ccc'];
-    rc.cur = {prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''};
+    rc.cur = {prices:{input:null,cached:null,cache_write:null,output:null,per_image:null},alias:'',mult:''};
     // alias scenario: give bbb an alias, save, then (fresh load, untouched
     // rows) save again -- the second save must NOT wipe the alias with a
     // direct-prices override (the v0.3.0 bug: upstream-priced rows were
     // re-emitted because undefined !== 1.0 on missing fields)
-    STATE.pe.orig['zebra/model-bbb'].cur = {prices:{input:null,cached:null,cache_write:null,output:null},alias:'kimi-k3',mult:0.5};
+    STATE.pe.orig['zebra/model-bbb'].cur = {prices:{input:null,cached:null,cache_write:null,output:null,per_image:null},alias:'kimi-k3',mult:0.5};
     saveConfig();
     await new Promise(r2 => setTimeout(r2, 60));
     const ov1 = (window.FAKE.posted.pricing || {}).overrides || {};
@@ -295,7 +295,7 @@ def test_overrides_save_preserves_non_visible_rows():
     // v0.5.32: multiplier is independent of alias. Drive collectOverrides()
     // directly (a pure function of STATE.pe.orig) for the three mult shapes.
     // (a) multiplier-only: all cur.prices null, no alias -> emit {multiplier}
-    STATE.pe.orig['zebra/model-ccc'] = {manual:false,cleared:false,base:{prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''},cur:{prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:0.8},how:'exact:zebra/model-ccc',price:{input:1.0,output:2.0},used:true,requests:1,unpriced_requests:0};
+    STATE.pe.orig['zebra/model-ccc'] = {manual:false,cleared:false,base:{prices:{input:null,cached:null,cache_write:null,output:null,per_image:null},alias:'',mult:''},cur:{prices:{input:null,cached:null,cache_write:null,output:null,per_image:null},alias:'',mult:0.8},how:'exact:zebra/model-ccc',price:{input:1.0,output:2.0},used:true,requests:1,unpriced_requests:0};
     // (b) manual prices + multiplier -> emit {prices, multiplier}
     STATE.pe.orig['zebra/model-aaa'].cur = {prices:{input:5.5,cached:null,cache_write:null,output:null},alias:'',mult:0.5};
     const ovMult = collectOverrides();

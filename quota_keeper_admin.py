@@ -174,7 +174,11 @@ def qk_deep_merge(base, patch):
 
 _QK_NUM = lambda v: not isinstance(v, bool) and isinstance(v, (int, float))
 
-QK_PRICE_FIELDS = ("input", "cached", "cache_write", "output")
+QK_PRICE_FIELDS = ("input", "cached", "cache_write", "output", "per_image")
+# NOTE: per_image is an ABSOLUTE USD price per generated image (litellm
+# input_cost_per_image, dall-e family), NOT per-1M tokens. qk_cost_usd keeps
+# its own hardcoded per-1M token field list; per_image is applied by
+# qk_image_cost_usd as a fallback when token cost is zero.
 
 
 def qk_validate_config(cfg) -> list:
@@ -453,14 +457,20 @@ def qk_fetch_pricing(url: str, timeout: int = 30, table: dict = None) -> dict:
                 v = info.get(k)
                 return float(v) * 1e6 if isinstance(v, (int, float)) else None
 
+            def img(k):
+                # per-image prices are ABSOLUTE USD per image, not per-token
+                v = info.get(k)
+                return float(v) if isinstance(v, (int, float)) else None
+
             entry = {
                 "input": tok("input_cost_per_token"),
                 "output": tok("output_cost_per_token"),
                 "cached": tok("cache_read_input_token_cost"),
                 "cache_write": tok("cache_creation_input_token_cost"),
+                "per_image": img("input_cost_per_image"),
             }
-            if (entry["input"] or 0) + (entry["output"] or 0) <= 0:
-                continue  # zero-priced row
+            if (entry["input"] or 0) + (entry["output"] or 0) <= 0 and not entry["per_image"]:
+                continue  # zero-priced row (image-only rows with per_image pass)
             table.setdefault(str(name).strip().lower(), entry)
     else:
         # models.dev style: {provider: {"models": {name: {"cost": per-1M}}}}
@@ -502,6 +512,7 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
     raw and date-stripped variants). Returns (price|None, how|None).
     A matched entry whose input+output are both 0 counts as NOT priced
     (returns None): plan-tier/free $0 rows would otherwise meter 0 forever.
+    Exception: an entry with a per_image price (image models) IS priced.
 
     Override value shapes (a None value means "cleared" and is skipped):
       legacy direct:  {"input": x, ..., "multiplier": m?}
@@ -586,8 +597,11 @@ def qk_find_pricing(model_id: str, table: dict, overrides: Optional[dict] = None
         return _table_match(vs)
 
     price, how = resolve(m, 0)
-    if price is not None and ((price.get("input") or 0) + (price.get("output") or 0)) <= 0:
-        return None, None  # zero-priced match = unpriced (do not meter 0 silently)
+    if price is not None and ((price.get("input") or 0) + (price.get("output") or 0)) <= 0 \
+            and not price.get("per_image"):
+        # zero-priced match = unpriced (do not meter 0 silently); a per_image
+        # price alone (dall-e family) still counts as priced
+        return None, None
     return price, how
 
 
@@ -736,6 +750,26 @@ def qk_cost_usd(tok: dict, price) -> float:
     return c
 
 
+def qk_image_cost_usd(images, price) -> float:
+    # per-image cost (verbatim copy in the filter). per_image is an ABSOLUTE
+    # USD price per generated image (litellm input_cost_per_image). Applied
+    # only as a FALLBACK by callers when the token cost is zero: dall-e-family
+    # responses carry no usage object, while gpt-image-1 reports token usage
+    # and must never be double-billed per image on top.
+    if not price or not images:
+        return 0.0
+    p = price.get("per_image")
+    if not isinstance(p, (int, float)) or isinstance(p, bool):
+        return 0.0
+    try:
+        n = float(images)
+    except Exception:
+        return 0.0
+    if n <= 0:
+        return 0.0
+    return n * float(p)
+
+
 def qk_extract_usage_obj(ev) -> Optional[dict]:
     """Locate the usage object inside a response body / stream event dict.
     Handles the top-level OpenAI shape, Anthropic message_start (usage nested
@@ -875,12 +909,16 @@ def qk_resolve_model_alias(cfg: dict, model: str) -> str:
 
 
 def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = True,
-                    now: datetime = None, channel: str = "api") -> None:
+                    now: datetime = None, channel: str = "api", images: int = 0) -> None:
     """Record one usage event (verbatim copy of the filter's writer — the
     passthrough middleware meters direct API requests here). count_request=False
     marks a partial-usage topup for an id that already recorded: tokens/cost
     still accumulate but the request counters are not incremented again.
-    `channel` is "webui" when the request came through the web UI, else "api"."""
+    `channel` is "webui" when the request came through the web UI, else "api".
+    `images` is the generated-image count for image endpoint requests: when
+    the token cost is zero (dall-e-style responses carry no usage), the cost
+    falls back to images × per_image price. The count is stored on the
+    day×model bucket (and recent.json item) so reprice can backfill later."""
     uid = (user or {}).get("id")
     if not uid:
         return
@@ -895,6 +933,10 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         price = pconf.get("default_pricing")
         priced = price is not None
     base_cost = qk_cost_usd(tok, price)
+    if base_cost <= 0:
+        # image endpoints whose responses carry no billable token usage
+        # (dall-e family) are billed per generated image instead
+        base_cost = qk_image_cost_usd(images, price)
     now_local = now or qk_tou_local_now(cfg)
     day = now_local.strftime("%Y-%m-%d")
     model = str(model or "unknown")[:200]
@@ -989,6 +1031,9 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         mm["cost_saved_usd"] = round(mm.get("cost_saved_usd", 0.0) + (base_cost - cost), 8)
         for k in ("cached", "input", "output"):
             mm["tokens"][k] = mm["tokens"].get(k, 0.0) + (tok.get(k) or 0.0)
+        if images:
+            # generated-image count, kept for per-image reprice backfill
+            mm["images"] = mm.get("images", 0) + images
         # derived flag kept for UI back-compat (same semantics as the old
         # sticky AND: once an unpriced request occurred, stays false)
         mm["priced"] = mm.get("unpriced_requests", 0) == 0
@@ -1001,20 +1046,21 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
         if count_request:
             rec = qk_load_json(QK_RECENT_PATH, {"items": []})
             items = rec.setdefault("items", [])
-            items.append(
-                {
-                    "ts": time.time(),
-                    "user_id": uid,
-                    "name": u.get("name", ""),
-                    "email": u.get("email", ""),
-                    "model": model,
-                    "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
-                    "cost_usd": cost,
-                    "tou_tier": tier,
-                    "priced": priced,
-                    "channel": channel,
-                }
-            )
+            item = {
+                "ts": time.time(),
+                "user_id": uid,
+                "name": u.get("name", ""),
+                "email": u.get("email", ""),
+                "model": model,
+                "tokens": {k: tok.get(k, 0.0) for k in ("cached", "input", "output")},
+                "cost_usd": cost,
+                "tou_tier": tier,
+                "priced": priced,
+                "channel": channel,
+            }
+            if images:
+                item["images"] = images
+            items.append(item)
             del items[:-200]
             qk_atomic_write(QK_RECENT_PATH, rec)
 
@@ -1030,14 +1076,60 @@ def qk_record_usage(user: dict, model: str, tok: dict, count_request: bool = Tru
 # request; Event functions mount during lifespan, before any request, so
 # add_middleware here is legal on the pinned starlette (OWUI 0.11).
 
+QK_IMAGE_INGEST_PATHS = frozenset(
+    {
+        "/openai/images/generations",  # OpenAI Images API proxy
+        "/openai/images/edits",        # OpenAI Images edits proxy (multipart)
+        "/api/v1/images/generations",  # web UI image generation
+        "/api/v1/images/edit",         # web UI image edit
+    }
+)
 QK_INGEST_PATHS = frozenset(
     {
         "/api/v1/messages",   # Anthropic Messages passthrough (litellm mode)
         "/openai/responses",  # OpenAI Responses API passthrough
     }
-)
+) | QK_IMAGE_INGEST_PATHS
 QK_INGEST_MARK = "_quota_keeper_ingested"
 QK_SSE_EVENT_MAX = 1 << 22  # 4 MiB guard against pathological chunks
+
+
+def qk_ingest_image_request_info(body: bytes, content_type: str) -> dict:
+    """Extract {"model": str, "n": int} from an image-endpoint request body.
+    /images/generations posts JSON; /images/edits posts multipart/form-data
+    with `model`/`n` as plain text parts (the image itself is a binary part).
+    n defaults to 1 — both endpoints generate a single image when omitted."""
+    info = {"model": "", "n": 1}
+    if not body:
+        return info
+    ct = content_type or ""
+    if "application/json" in ct:
+        try:
+            obj = json.loads(body)
+        except Exception:
+            return info
+        if isinstance(obj, dict):
+            m = obj.get("model")
+            if m:
+                info["model"] = str(m)
+            try:
+                info["n"] = max(1, min(int(obj.get("n") or 1), 64))
+            except Exception:
+                pass
+        return info
+    if "multipart/form-data" in ct:
+        try:
+            text = body.decode("utf-8", "ignore")
+        except Exception:
+            return info
+        # text parts look like: name="model"\r\n\r\n<value>\r\n--boundary
+        mm = re.search(r'name="model"\r?\n\r?\n([^\r\n]+)', text)
+        if mm:
+            info["model"] = mm.group(1).strip()
+        mn = re.search(r'name="n"\r?\n\r?\n(\d+)', text)
+        if mn:
+            info["n"] = max(1, min(int(mn.group(1)), 64))
+    return info
 
 
 def qk_ingest_parse_body_user(req) -> dict:
@@ -1205,9 +1297,16 @@ def qk_ingest_record(req, body: bytes = b"", chunks=None) -> None:
                 model = str(data.get("model") or "") if isinstance(data, dict) else ""
             except Exception:
                 tok = None
-        if not tok:
-            return
         model = str(model or getattr(req.state, "qk_ingest_model", "") or "unknown")
+        # >0 only when the middleware matched an image path. gpt-image-1
+        # responses DO carry token usage (billed per token via tok); dall-e
+        # style responses carry none — record zero tokens and let
+        # qk_record_usage bill per generated image (n from the request).
+        images_n = int(getattr(req.state, "qk_ingest_images_n", 0) or 0)
+        if not tok:
+            if images_n <= 0:
+                return
+            tok = {"cached": 0.0, "input": 0.0, "output": 0.0, "cache_write": 0.0}
         # No cross-component dedup here: the Filter keeps its own per-instance
         # state and (for pipeline-visible requests) its own stream/outlet
         # dedup; the passthrough has no stable response id to correlate with.
@@ -1215,7 +1314,8 @@ def qk_ingest_record(req, body: bytes = b"", chunks=None) -> None:
         # rely on the Filter's content-match dedup to stay single-counted.
         cfg = qk_get_config()
         now_local = qk_tou_local_now(cfg)
-        qk_record_usage(user, model, tok, count_request=True, now=now_local, channel="api")
+        qk_record_usage(user, model, tok, count_request=True, now=now_local,
+                        channel="api", images=images_n)
     except Exception as e:
         log.warning("quota-keeper passthrough ingest failed: %s", e)
 
@@ -1236,7 +1336,17 @@ async def qk_passthrough_middleware(request: Request, call_next):
     # 499 came from stream()-style reads on the old starlette (downstream gets
     # an empty body after .stream()) — never use request.stream() here.
     try:
-        req_model = qk_ingest_body_model(await request.body())
+        req_body = await request.body()
+        if request.url.path in QK_IMAGE_INGEST_PATHS:
+            # image endpoints: generations posts JSON, edits posts multipart;
+            # both carry model + n in the request (the dall-e-style response
+            # has no usage object, so n is the billable unit there)
+            info = qk_ingest_image_request_info(
+                req_body, request.headers.get("content-type") or "")
+            req_model = info["model"]
+            request.state.qk_ingest_images_n = info["n"]
+        else:
+            req_model = qk_ingest_body_model(req_body)
         if req_model.startswith("prx."):
             # provider prefix (cli-proxy-api prefix_id) — same strip as the
             # filter's stream()/outlet() fallbacks
@@ -1685,7 +1795,8 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
                         continue
                     tok = mm.get("tokens") or {}
                     tot_tok = sum(float(tok.get(k) or 0.0) for k in ("cached", "input", "output"))
-                    if tot_tok <= 0:
+                    imgs = mm.get("images") or 0
+                    if tot_tok <= 0 and not imgs:
                         # nothing to reprice; just clear the stale flag
                         if not dry_run:
                             mm["unpriced_requests"] = 0
@@ -1697,6 +1808,10 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
                     if price is None:
                         continue  # still no price: leave the flag alone
                     new_base = qk_cost_usd(tok, price)
+                    if new_base <= 0:
+                        # dall-e-style image bucket recorded while unpriced:
+                        # backfill from the stored generated-image count
+                        new_base = qk_image_cost_usd(imgs, price)
                     if new_base <= 0:
                         if not dry_run:
                             mm["unpriced_requests"] = 0
@@ -1781,6 +1896,10 @@ def qk_reprice_ledger(days=30, model=None, dry_run=False):
             tok = it.get("tokens") or {}
             base = qk_cost_usd(tok, price)
             if base <= 0:
+                # image request entry (dall-e style): per-image backfill from
+                # the stored generated-image count
+                base = qk_image_cost_usd(it.get("images") or 0, price)
+            if base <= 0:
                 it["priced"] = True
                 continue
             rate, _tier = qk_tou_rate(cfg, m_res, now)
@@ -1823,6 +1942,8 @@ def _qk_merge_bucket(dst: dict, src: dict) -> None:
             + (src.get("unpriced_requests") or 0)
         dst["cost_saved_usd"] = round(float(dst.get("cost_saved_usd") or 0.0)
                                       + float(src.get("cost_saved_usd") or 0.0), 8)
+        if "images" in src or "images" in dst:
+            dst["images"] = (dst.get("images") or 0) + (src.get("images") or 0)
         # derived flag, same convention as qk_record_usage
         dst["priced"] = dst.get("unpriced_requests", 0) == 0
 
@@ -2337,7 +2458,7 @@ tr.pe-cleared td{opacity:.45}
   <table id="peRows">
    <thead><tr>
     <th>Model</th><th>Match</th>
-    <th class="num">input $/1M</th><th class="num">cached $/1M</th><th class="num">cache_write $/1M</th><th class="num">output $/1M</th>
+    <th class="num">input $/1M</th><th class="num">cached $/1M</th><th class="num">cache_write $/1M</th><th class="num">output $/1M</th><th class="num">per_image $/img</th>
     <th>Alias to key</th><th class="num">× mult</th><th></th>
    </tr></thead>
    <tbody></tbody>
@@ -3067,7 +3188,7 @@ async function testMatch(){
   try{
     const r=await api('/pricing/match?model='+encodeURIComponent(m));
     $('matchResult').innerHTML=r.matched
-     ?`✅ matched via <b>${esc(r.how)}</b> → input $${r.price.input}/1M · cached $${r.price.cached??'–'} · cache_write $${r.price.cache_write??'–'} · output $${r.price.output}/1M`
+     ?`✅ matched via <b>${esc(r.how)}</b> → input $${r.price.input}/1M · cached $${r.price.cached??'–'} · cache_write $${r.price.cache_write??'–'} · output $${r.price.output}/1M${r.price.per_image!=null?` · per_image $${r.price.per_image}/img`:''}`
      :`❌ no match (fallback pricing applies if configured)`;
   }catch(e){$('matchResult').textContent='match error: '+e.message}
 }
@@ -3092,14 +3213,14 @@ function rebuildPeOrig(){
   const items=(STATE.pe.data&&STATE.pe.data.items)||[];
   STATE.pe.orig={};
   items.forEach(it=>{
-    let base={prices:{input:null,cached:null,cache_write:null,output:null},alias:'',mult:''};
+    let base={prices:{input:null,cached:null,cache_write:null,output:null,per_image:null},alias:'',mult:''};
     const o=it.override;
     if(o){
       // multiplier is read for EVERY shape (alias / prices / legacy-direct /
       // multiplier-only), not just alias -- v0.5.32
       base.mult=(o.multiplier!==undefined&&o.multiplier!==null)?o.multiplier:'';
       if(o.alias!==undefined&&o.alias!==null){base.alias=o.alias;}
-      else{const p=(o.prices&&typeof o.prices==='object')?o.prices:o;base.prices={input:p.input??null,cached:p.cached??null,cache_write:p.cache_write??null,output:p.output??null};}
+      else{const p=(o.prices&&typeof o.prices==='object')?o.prices:o;base.prices={input:p.input??null,cached:p.cached??null,cache_write:p.cache_write??null,output:p.output??null,per_image:p.per_image??null};}
     }
     STATE.pe.orig[it.model]={
       manual:!!it.override,cleared:false,cur:null,base:base,
@@ -3121,7 +3242,7 @@ function peEff(o){
   // alias: an explicitly emptied input ('' once `cur` exists) means "delete
   // the alias" -- do NOT fall back to the stored one, or the user could never
   // clear it (issue #2). Same for an explicitly cleared multiplier.
-  return {prices:{input:fb('input'),cached:fb('cached'),cache_write:fb('cache_write'),output:fb('output')},
+  return {prices:{input:fb('input'),cached:fb('cached'),cache_write:fb('cache_write'),output:fb('output'),per_image:fb('per_image')},
           alias:(c.alias!==undefined&&c.alias!==null)?c.alias:b.alias,
           mult:(c.mult!==undefined&&c.mult!==null&&c.mult!=='')?c.mult:b.mult};
 }
@@ -3131,7 +3252,7 @@ function peRowHtml(k,o){
   // display falls back to the resolved (upstream) price per field, so the
   // inputs always show the full effective row instead of the sparse edit
   const dp={};
-  ['input','cached','cache_write','output'].forEach(f=>{
+  ['input','cached','cache_write','output','per_image'].forEach(f=>{
     dp[f]=(eff&&!eff.alias&&eff.prices[f]!==null&&eff.prices[f]!==undefined)?eff.prices[f]:((o.price||{})[f]);
   });
   const showPrice=eff&&eff.alias?null:dp;
@@ -3157,7 +3278,7 @@ function peRowHtml(k,o){
      ${(o.price||o.manual)?'<span class="tag matched">matched ✓</span>':'<span class="tag unpriced">no match</span>'}
      <br/><span class="small muted">used · ${fmt(o.requests,0)} reqs</span></td>
    <td class="small">${howTxt}</td>
-   ${['input','cached','cache_write','output'].map(f=>`<td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="${f}" value="${esc(numVal(f))}" ${dis} oninput="peEdit(this)"/></td>`).join('')}
+   ${['input','cached','cache_write','output','per_image'].map(f=>`<td><input class="pe-num" type="number" step="0.01" min="0" data-pk="${esc(k)}" data-f="${f}" value="${esc(numVal(f))}" ${dis} oninput="peEdit(this)"/></td>`).join('')}
    <td><input class="pe-alias" type="text" placeholder="alias key; empty + save = delete" data-pk="${esc(k)}" data-f="alias" value="${esc(cur.alias||'')}" ${adis} oninput="peEdit(this)"/></td>
    <td><input class="pe-mult" type="number" step="0.05" min="0" placeholder="1" data-pk="${esc(k)}" data-f="mult" value="${esc(cur.mult===''||cur.mult===null?'':cur.mult)}" ${adis} oninput="peEdit(this)"/></td>
    <td>${o.manual&&!o.cleared?`<button class="small" onclick="peClear('${esc(k)}')">clear</button>`:''}${o.cleared?`<button class="small" onclick="peUndo('${esc(k)}')">undo</button>`:''}</td>
@@ -3237,7 +3358,7 @@ function collectOverrides(){
         return;
       }
       const p={};
-      ['input','cached','cache_write','output'].forEach(f=>{
+      ['input','cached','cache_write','output','per_image'].forEach(f=>{
         if(b.prices[f]!==null&&b.prices[f]!==undefined)p[f]=b.prices[f];
       });
       if(!Object.keys(p).length){
